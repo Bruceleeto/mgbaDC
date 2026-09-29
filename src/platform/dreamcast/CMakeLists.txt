@@ -1,6 +1,7 @@
 add_executable(mgba-dreamcast main.c)
 include(kallistios)
-kos_add_romdisk(mgba-dreamcast "${CMAKE_SOURCE_DIR}/assets/dc")
+set(DC_ROMDISK_DIR "${CMAKE_SOURCE_DIR}/assets/dc" CACHE PATH "Directory packed into the romdisk")
+kos_add_romdisk(mgba-dreamcast "${DC_ROMDISK_DIR}")
 target_compile_definitions(mgba-dreamcast PRIVATE ${FEATURE_DEFINES} ${FUNCTION_DEFINES} ${OS_DEFINES})
 target_link_libraries(mgba-dreamcast ${BINARY_NAME})
 # Run guest code on the ARM -> SH-4 recompiler instead of the interpreter.

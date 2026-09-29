@@ -138,7 +138,7 @@ void GBAVideoAssociateRenderer(struct GBAVideo* video, struct GBAVideoRenderer* 
 	}
 }
 
-void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	struct GBAVideo* video = context;
 	video->event.callback = _startHblank;
 	mTimingSchedule(timing, &video->event, VIDEO_HDRAW_LENGTH - cyclesLate);
@@ -196,7 +196,7 @@ void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	}
 }
 
-void _startHblank(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) void _startHblank(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	struct GBAVideo* video = context;
 	video->event.callback = _startHdraw;
 	mTimingSchedule(timing, &video->event, VIDEO_HBLANK_LENGTH - cyclesLate);
@@ -345,6 +345,7 @@ void GBAVideoSerialize(const struct GBAVideo* video, struct GBASerializedState* 
 }
 
 void GBAVideoDeserialize(struct GBAVideo* video, const struct GBASerializedState* state) {
+	GBA_VIDEO_TOUCH(video->renderer);
 	memcpy(video->vram, state->vram, SIZE_VRAM);
 	uint16_t value;
 	int i;

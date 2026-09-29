@@ -31,6 +31,7 @@ void GBAVideoSoftwareRendererDrawBackgroundMode5(struct GBAVideoSoftwareRenderer
 int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* renderer, struct GBAObj* sprite, int index, int y);
 void GBAVideoSoftwareRendererPostprocessSprite(struct GBAVideoSoftwareRenderer* renderer, unsigned priority);
 
+int GBAVideoSoftwareRendererFastSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y);
 bool GBAVideoSoftwareRendererFastEligible(struct GBAVideoSoftwareRenderer* renderer);
 bool GBAVideoSoftwareRendererDrawFast(struct GBAVideoSoftwareRenderer* renderer, int y, int spriteLayers, color_t* out);
 

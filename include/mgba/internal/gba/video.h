@@ -171,6 +171,13 @@ DECL_BITS(GBAMosaicControl, BgV, 4, 4);
 DECL_BITS(GBAMosaicControl, ObjH, 8, 4);
 DECL_BITS(GBAMosaicControl, ObjV, 12, 4);
 
+#define GBA_VIDEO_TOUCH(RENDERER) \
+	do { \
+		if (UNLIKELY((RENDERER)->pendingLines)) { \
+			(RENDERER)->flushLines(RENDERER); \
+		} \
+	} while (0)
+
 struct GBAVideoRenderer {
 	void (*init)(struct GBAVideoRenderer* renderer);
 	void (*reset)(struct GBAVideoRenderer* renderer);
@@ -190,6 +197,16 @@ struct GBAVideoRenderer {
 	uint16_t* vram;
 	union GBAOAM* oam;
 	struct mCacheSet* cache;
+
+	// Set by renderers whose writeVRAM does the same thing for every address,
+	// so a block transfer can notify them once instead of per word
+	bool coarseVRAM;
+
+	// Scanlines the renderer has been asked for but is holding back to draw
+	// in one go. Whoever is about to change palette, VRAM or OAM has to have
+	// them drawn first; see GBA_VIDEO_TOUCH
+	int pendingLines;
+	void (*flushLines)(struct GBAVideoRenderer* renderer);
 
 	bool disableBG[4];
 	bool disableOBJ;

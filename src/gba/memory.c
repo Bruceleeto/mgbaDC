@@ -832,12 +832,15 @@ void GBAStore32(struct ARMCore* cpu, uint32_t address, int32_t value, int* cycle
 		STORE_IO;
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		STORE_PALETTE_RAM;
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		STORE_VRAM;
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		STORE_OAM;
 		break;
 	case REGION_CART0:
@@ -884,6 +887,7 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 		GBAIOWrite(gba, address & (OFFSET_MASK - 1), value);
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		LOAD_16(oldValue, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
 		if (oldValue != value) {
 			STORE_16(value, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
@@ -891,6 +895,7 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 		}
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		if ((address & 0x0001FFFF) >= SIZE_VRAM) {
 			if ((address & (SIZE_VRAM | 0x00014000)) == SIZE_VRAM && (GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3)) {
 				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Store16: 0x%08" PRIX32, address);
@@ -913,6 +918,7 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 		}
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		LOAD_16(oldValue, address & (SIZE_OAM - 2), gba->video.oam.raw);
 		if (value != oldValue) {
 			STORE_16(value, address & (SIZE_OAM - 2), gba->video.oam.raw);
@@ -1026,9 +1032,11 @@ void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCo
 		GBAIOWrite8(gba, address & OFFSET_MASK, value);
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		GBAStore16(cpu, address & ~1, ((uint8_t) value) | ((uint8_t) value << 8), cycleCounter);
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		if ((address & 0x0001FFFF) >= ((GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3) ? 0x00014000 : 0x00010000)) {
 			mLOG(GBA_MEM, GAME_ERROR, "Cannot Store8 to OBJ: 0x%08" PRIX32, address);
 			break;
@@ -1043,6 +1051,7 @@ void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCo
 		}
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		mLOG(GBA_MEM, GAME_ERROR, "Cannot Store8 to OAM: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART0:
@@ -1224,12 +1233,14 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch32: 0x%08" PRIX32, address);
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		LOAD_32(oldValue, address & (SIZE_PALETTE_RAM - 1), gba->video.palette);
 		STORE_32(value, address & (SIZE_PALETTE_RAM - 4), gba->video.palette);
 		gba->video.renderer->writePalette(gba->video.renderer, address & (SIZE_PALETTE_RAM - 4), value);
 		gba->video.renderer->writePalette(gba->video.renderer, (address & (SIZE_PALETTE_RAM - 4)) + 2, value >> 16);
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		if ((address & 0x0001FFFF) < SIZE_VRAM) {
 			LOAD_32(oldValue, address & 0x0001FFFC, gba->video.vram);
 			STORE_32(value, address & 0x0001FFFC, gba->video.vram);
@@ -1243,6 +1254,7 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 		}
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		LOAD_32(oldValue, address & (SIZE_OAM - 4), gba->video.oam.raw);
 		STORE_32(value, address & (SIZE_OAM - 4), gba->video.oam.raw);
 		gba->video.renderer->writeOAM(gba->video.renderer, (address & (SIZE_OAM - 4)) >> 1);
@@ -1298,11 +1310,13 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
 		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch16: 0x%08" PRIX32, address);
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		LOAD_16(oldValue, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
 		STORE_16(value, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
 		gba->video.renderer->writePalette(gba->video.renderer, address & (SIZE_PALETTE_RAM - 2), value);
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		if ((address & 0x0001FFFF) < SIZE_VRAM) {
 			LOAD_16(oldValue, address & 0x0001FFFE, gba->video.vram);
 			STORE_16(value, address & 0x0001FFFE, gba->video.vram);
@@ -1314,6 +1328,7 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
 		}
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		LOAD_16(oldValue, address & (SIZE_OAM - 2), gba->video.oam.raw);
 		STORE_16(value, address & (SIZE_OAM - 2), gba->video.oam.raw);
 		gba->video.renderer->writeOAM(gba->video.renderer, (address & (SIZE_OAM - 2)) >> 1);
@@ -1368,12 +1383,15 @@ void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old)
 		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART0:
@@ -1601,12 +1619,15 @@ uint32_t GBAStoreMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum 
 		STM_LOOP(STORE_IO);
 		break;
 	case REGION_PALETTE_RAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		STM_LOOP(STORE_PALETTE_RAM);
 		break;
 	case REGION_VRAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		STM_LOOP(STORE_VRAM);
 		break;
 	case REGION_OAM:
+		GBA_VIDEO_TOUCH(gba->video.renderer);
 		STM_LOOP(STORE_OAM);
 		break;
 	case REGION_CART0:

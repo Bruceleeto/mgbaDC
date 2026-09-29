@@ -77,6 +77,8 @@ struct Window {
 	struct WindowControl control;
 };
 
+#define GBA_VIDEO_SOFTWARE_DEFERRED_MAX 1024
+
 struct GBAVideoSoftwareRenderer {
 	struct GBAVideoRenderer d;
 
@@ -150,8 +152,68 @@ struct GBAVideoSoftwareRenderer {
 
 	// Draw simple lines back to front straight into outputBuffer
 	bool fastPath;
+
+	// Hold scanlines, and the register writes between them, back until the
+	// frame is done or video memory is about to change, and draw them all at
+	// once. Only for a renderer the core talks to directly.
+	bool deferLines;
+	int nDeferred;
+	struct GBAVideoSoftwareDeferred {
+		uint16_t address;
+		uint16_t value;
+	} deferred[GBA_VIDEO_SOFTWARE_DEFERRED_MAX];
 	uint32_t fastLines;
 	uint32_t slowLines;
+
+	// Filled in with the sprite layer: which 8 pixel blocks of it may hold
+	// something, and which may hold something of each priority
+	uint32_t spriteBlocks;
+	uint32_t spritePriorityBlocks[4];
+	// The blocks of the sprite layer that aren't known to be clear
+	uint32_t spriteLayerDirty;
+
+	// The sprites on each line, as indices into sprites and in the same
+	// order. Line y has spriteLines[spriteLineStart[y]] up to
+	// spriteLines[spriteLineStart[y + 1]]
+	uint16_t spriteLineStart[GBA_VIDEO_VERTICAL_PIXELS + 1];
+	uint8_t spriteLines[128 * GBA_VIDEO_VERTICAL_PIXELS];
+
+	// What the fast path needs of each of sprites, worked out when OAM or
+	// the registers behind fastSpriteKey change instead of on every line
+	bool fastSpritesValid;
+	struct GBAVideoSoftwareFastSpriteKey {
+		const color_t* palette[2];
+		uint32_t flags[2];
+		int16_t offsetX;
+		int16_t offsetY;
+		uint8_t force[2];
+		uint8_t mapping;
+		uint8_t bitmap;
+	} fastSpriteKey;
+	struct GBAVideoSoftwareFastSprite {
+		const color_t* palette;
+		uint32_t flags;
+		// Affine: the accumulators on the sprite's first line
+		int32_t xAccum;
+		int32_t yAccum;
+		int16_t a;
+		int16_t b;
+		int16_t c;
+		int16_t d;
+		int16_t y;
+		int16_t outX;
+		int16_t condition;
+		int16_t inX;
+		int16_t cycles;
+		uint16_t charBase;
+		uint16_t maskLo;
+		uint16_t maskHi;
+		uint8_t width;
+		uint8_t height;
+		uint8_t strideShift;
+		uint8_t priority;
+		uint8_t kind;
+	} fastSprites[128];
 };
 
 void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer);

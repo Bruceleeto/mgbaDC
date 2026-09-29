@@ -515,7 +515,7 @@ static inline int32_t _divSmall(int32_t n, int32_t d) {
 	return n / d;
 }
 
-void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
+ATTRIBUTE_HOT_GROUP(0) void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 	if (!audio->enable) {
 		return;
 	}
@@ -645,7 +645,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 	}
 }
 
-void GBAudioUpdateFrame(struct GBAudio* audio) {
+ATTRIBUTE_HOT_GROUP(0) void GBAudioUpdateFrame(struct GBAudio* audio) {
 	if (!audio->enable) {
 		return;
 	}

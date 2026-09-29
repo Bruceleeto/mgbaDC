@@ -67,6 +67,8 @@ static void _timedScanline1(struct GBAVideoRenderer* renderer, int y) {
 	++_active[1]->lines;
 }
 
+static bool deferFast = false;
+
 static struct GBAVideoSoftwareRenderer* _renderer(struct Harness* h) {
 	struct GBA* gba = h->core->board;
 	return (struct GBAVideoSoftwareRenderer*) gba->video.renderer;
@@ -97,6 +99,7 @@ static bool _init(struct Harness* h, int index, const char* rom, const char* sta
 	}
 	struct GBAVideoSoftwareRenderer* sw = _renderer(h);
 	sw->fastPath = fast;
+	sw->deferLines = fast && deferFast;
 	_active[index] = h;
 	h->drawScanline = sw->d.drawScanline;
 	sw->d.drawScanline = index ? _timedScanline1 : _timedScanline0;
@@ -194,7 +197,9 @@ static void _usage(void) {
 	        "  -e N           dump every N frames (default 60)\n"
 	        "  -m MODE        compare (default), fast, slow\n"
 	        "  -x N           stop comparing after N mismatched frames (default 5)\n"
-	        "  -r FRAME       print per-line video registers at FRAME\n");
+	        "  -r FRAME       print per-line video registers at FRAME\n"
+	        "  -D 1           fast renderer holds scanlines back and draws them in batches\n"
+	        "  -T FILE        write drawScanline ticks per frame to FILE\n");
 }
 
 int main(int argc, char** argv) {
@@ -211,6 +216,7 @@ int main(int argc, char** argv) {
 	const char* state = NULL;
 	int saveFrame = -1;
 	const char* saveFile = NULL;
+	const char* tickFile = NULL;
 	const char* script = NULL;
 	const char* dumpDir = NULL;
 	int dumpEvery = 60;
@@ -246,6 +252,10 @@ int main(int argc, char** argv) {
 			mode = val;
 		} else if (!strcmp(arg, "-r")) {
 			regFrame = atoi(val);
+		} else if (!strcmp(arg, "-D")) {
+			deferFast = atoi(val);
+		} else if (!strcmp(arg, "-T")) {
+			tickFile = val;
 		} else if (!strcmp(arg, "-x")) {
 			maxMismatch = atoi(val);
 		} else {
@@ -268,10 +278,15 @@ int main(int argc, char** argv) {
 	struct timespec t0, t1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	int frame;
+	FILE* tickLog = tickFile ? fopen(tickFile, "w") : NULL;
 	for (frame = 0; frame < frames; ++frame) {
 		uint32_t keys = _keysFor(script, frame);
 		a.core->setKeys(a.core, keys);
+		uint64_t ticksBefore = a.ticks;
 		a.core->runFrame(a.core);
+		if (tickLog) {
+			fprintf(tickLog, "%d %llu\n", frame, (unsigned long long) (a.ticks - ticksBefore));
+		}
 		if (compare) {
 			b.core->setKeys(b.core, keys);
 			b.core->runFrame(b.core);

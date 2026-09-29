@@ -25,6 +25,9 @@ static void GBAVideoSoftwareRendererWriteOAM(struct GBAVideoRenderer* renderer, 
 static void GBAVideoSoftwareRendererWritePalette(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value);
 static uint16_t GBAVideoSoftwareRendererWriteVideoRegister(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value);
 static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* renderer, int y);
+static void GBAVideoSoftwareRendererFlushLines(struct GBAVideoRenderer* renderer);
+static uint16_t _writeVideoRegisterNow(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value);
+static void _drawScanlineNow(struct GBAVideoRenderer* renderer, int y);
 static void GBAVideoSoftwareRendererFinishFrame(struct GBAVideoRenderer* renderer);
 static void GBAVideoSoftwareRendererGetPixels(struct GBAVideoRenderer* renderer, size_t* stride, const void** pixels);
 static void GBAVideoSoftwareRendererPutPixels(struct GBAVideoRenderer* renderer, size_t stride, const void* pixels);
@@ -40,7 +43,7 @@ static void GBAVideoSoftwareRendererWriteBLDCNT(struct GBAVideoSoftwareRenderer*
 static void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* renderer, int y, bool fillRow);
 static void _fillBackdrop(struct GBAVideoSoftwareRenderer* renderer);
 static void GBAVideoSoftwareRendererPostprocessBuffer(struct GBAVideoSoftwareRenderer* renderer);
-static int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y);
+static int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y, bool fast);
 
 static void _updatePalettes(struct GBAVideoSoftwareRenderer* renderer);
 static void _updateFlags(struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareBackground* bg);
@@ -54,6 +57,9 @@ void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer) {
 	renderer->d.deinit = GBAVideoSoftwareRendererDeinit;
 	renderer->d.writeVideoRegister = GBAVideoSoftwareRendererWriteVideoRegister;
 	renderer->d.writeVRAM = GBAVideoSoftwareRendererWriteVRAM;
+	renderer->d.coarseVRAM = true;
+	renderer->d.pendingLines = 0;
+	renderer->d.flushLines = GBAVideoSoftwareRendererFlushLines;
 	renderer->d.writeOAM = GBAVideoSoftwareRendererWriteOAM;
 	renderer->d.writePalette = GBAVideoSoftwareRendererWritePalette;
 	renderer->d.drawScanline = GBAVideoSoftwareRendererDrawScanline;
@@ -83,6 +89,12 @@ void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer) {
 
 	renderer->temporaryBuffer = 0;
 	renderer->fastPath = true;
+#ifdef _arch_dreamcast
+	renderer->deferLines = true;
+#else
+	renderer->deferLines = false;
+#endif
+	renderer->nDeferred = 0;
 	renderer->fastLines = 0;
 	renderer->slowLines = 0;
 }
@@ -105,6 +117,9 @@ static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
 static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	int i;
+
+	softwareRenderer->nDeferred = 0;
+	renderer->pendingLines = 0;
 
 	softwareRenderer->dispcnt = 0x0080;
 
@@ -130,6 +145,7 @@ static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 	softwareRenderer->objwin = (struct WindowControl) { .priority = 2 };
 	softwareRenderer->winout = (struct WindowControl) { .priority = 3 };
 	softwareRenderer->oamDirty = 1;
+	softwareRenderer->spriteLayerDirty = 0xFFFFFFFF;
 	softwareRenderer->oamMax = 0;
 
 	softwareRenderer->mosaic = 0;
@@ -157,10 +173,97 @@ static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 
 static void GBAVideoSoftwareRendererDeinit(struct GBAVideoRenderer* renderer) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	softwareRenderer->nDeferred = 0;
+	renderer->pendingLines = 0;
 	UNUSED(softwareRenderer);
 }
 
+// What a register reads back as, which is all the core needs to know right
+// away. Same masks as _writeVideoRegisterNow applies.
+static uint16_t _maskVideoRegister(uint32_t address, uint16_t value) {
+	switch (address) {
+	case REG_DISPCNT:
+		return value & 0xFFF7;
+	case REG_BG0CNT:
+	case REG_BG1CNT:
+		return value & 0xDFFF;
+	case REG_BG0HOFS:
+	case REG_BG0VOFS:
+	case REG_BG1HOFS:
+	case REG_BG1VOFS:
+	case REG_BG2HOFS:
+	case REG_BG2VOFS:
+	case REG_BG3HOFS:
+	case REG_BG3VOFS:
+		return value & 0x01FF;
+	case REG_BLDCNT:
+		return value & 0x3FFF;
+	case REG_BLDALPHA:
+		return value & 0x1F1F;
+	case REG_BLDY:
+		value &= 0x1F;
+		return value > 0x10 ? 0x10 : value;
+	case REG_WININ:
+	case REG_WINOUT:
+		return value & 0x3F3F;
+	default:
+		return value;
+	}
+}
+
+static void _defer(struct GBAVideoSoftwareRenderer* softwareRenderer, uint16_t address, uint16_t value) {
+	softwareRenderer->deferred[softwareRenderer->nDeferred].address = address;
+	softwareRenderer->deferred[softwareRenderer->nDeferred].value = value;
+	++softwareRenderer->nDeferred;
+}
+
+// No register is at an odd address
+#define DEFERRED_LINE 0xFFFF
+
+static void GBAVideoSoftwareRendererFlushLines(struct GBAVideoRenderer* renderer) {
+	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	int n = softwareRenderer->nDeferred;
+	softwareRenderer->nDeferred = 0;
+	renderer->pendingLines = 0;
+	int i;
+	for (i = 0; i < n; ++i) {
+		struct GBAVideoSoftwareDeferred* deferred = &softwareRenderer->deferred[i];
+		if (deferred->address == DEFERRED_LINE) {
+			_drawScanlineNow(renderer, deferred->value);
+		} else {
+			_writeVideoRegisterNow(renderer, deferred->address, deferred->value);
+		}
+	}
+}
+
 static uint16_t GBAVideoSoftwareRendererWriteVideoRegister(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value) {
+	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	if (renderer->pendingLines) {
+		// Has to wait its turn behind the lines that came before it
+		if (softwareRenderer->nDeferred < GBA_VIDEO_SOFTWARE_DEFERRED_MAX) {
+			value = _maskVideoRegister(address, value);
+			_defer(softwareRenderer, address, value);
+			return value;
+		}
+		GBAVideoSoftwareRendererFlushLines(renderer);
+	}
+	return _writeVideoRegisterNow(renderer, address, value);
+}
+
+static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* renderer, int y) {
+	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	if (!softwareRenderer->deferLines) {
+		_drawScanlineNow(renderer, y);
+		return;
+	}
+	if (softwareRenderer->nDeferred == GBA_VIDEO_SOFTWARE_DEFERRED_MAX) {
+		GBAVideoSoftwareRendererFlushLines(renderer);
+	}
+	_defer(softwareRenderer, DEFERRED_LINE, y);
+	++renderer->pendingLines;
+}
+
+static uint16_t _writeVideoRegisterNow(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	if (renderer->cache) {
 		GBAVideoCacheWriteVideoRegister(renderer->cache, address, value);
@@ -397,6 +500,7 @@ static uint16_t GBAVideoSoftwareRendererWriteVideoRegister(struct GBAVideoRender
 }
 
 static void GBAVideoSoftwareRendererWriteVRAM(struct GBAVideoRenderer* renderer, uint32_t address) {
+	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	if (renderer->cache) {
 		mCacheSetWriteVRAM(renderer->cache, address);
@@ -409,13 +513,16 @@ static void GBAVideoSoftwareRendererWriteVRAM(struct GBAVideoRenderer* renderer,
 }
 
 static void GBAVideoSoftwareRendererWriteOAM(struct GBAVideoRenderer* renderer, uint32_t oam) {
+	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	UNUSED(oam);
 	softwareRenderer->oamDirty = 1;
+	softwareRenderer->spriteLayerDirty = 0xFFFFFFFF;
 	memset(softwareRenderer->scanlineDirty, 0xFFFFFFFF, sizeof(softwareRenderer->scanlineDirty));
 }
 
 static void GBAVideoSoftwareRendererWritePalette(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value) {
+	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	color_t color = mColorFrom555(value);
 	softwareRenderer->normalPalette[address >> 1] = color;
@@ -511,7 +618,32 @@ static void _breakWindowInner(struct GBAVideoSoftwareRenderer* softwareRenderer,
 #endif
 }
 
-static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* renderer, int y) {
+// Brings the line's copy of the registers up to date. Returns whether it
+// had to change.
+static inline bool _updateIoCache(uint16_t* cache, const uint16_t* io) {
+	typedef uint32_t __attribute__((may_alias)) Word;
+	Word* out = (Word*) cache;
+	const Word* in = (const Word*) io;
+	uint32_t changed = 0;
+	size_t i;
+	for (i = 0; i < (REG_SOUND1CNT_LO >> 1) / 2; i += 4) {
+		uint32_t a = in[i];
+		uint32_t b = in[i + 1];
+		uint32_t c = in[i + 2];
+		uint32_t d = in[i + 3];
+		changed |= (a ^ out[i]) | (b ^ out[i + 1]) | (c ^ out[i + 2]) | (d ^ out[i + 3]);
+		out[i] = a;
+		out[i + 1] = b;
+		out[i + 2] = c;
+		out[i + 3] = d;
+	}
+	return changed;
+}
+
+static ATTRIBUTE_NOINLINE void _drawScanlineSlow(struct GBAVideoSoftwareRenderer* softwareRenderer, int y, int spriteLayers);
+static ATTRIBUTE_NOINLINE void _copyOut(struct GBAVideoSoftwareRenderer* softwareRenderer, color_t* row);
+
+ATTRIBUTE_HOT_GROUP(3) static void _drawScanlineNow(struct GBAVideoRenderer* renderer, int y) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 
 	if (y == GBA_VIDEO_VERTICAL_PIXELS - 1) {
@@ -521,8 +653,7 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	}
 
 	bool dirty = softwareRenderer->scanlineDirty[y >> 5] & (1U << (y & 0x1F));
-	if (memcmp(softwareRenderer->nextIo, softwareRenderer->cache[y].io, sizeof(softwareRenderer->nextIo))) {
-		memcpy(softwareRenderer->cache[y].io, softwareRenderer->nextIo, sizeof(softwareRenderer->nextIo));
+	if (_updateIoCache(softwareRenderer->cache[y].io, softwareRenderer->nextIo)) {
 		dirty = true;
 	}
 
@@ -572,7 +703,7 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	mPROFILE_STOP(profilePre);
 	softwareRenderer->spriteCyclesRemaining = GBARegisterDISPCNTIsHblankIntervalFree(softwareRenderer->dispcnt) ? OBJ_HBLANK_FREE_LENGTH : OBJ_LENGTH;
 	mPROFILE_START(profileSprites, "sprites draw");
-	int spriteLayers = GBAVideoSoftwareRendererPreprocessSpriteLayer(softwareRenderer, y);
+	int spriteLayers = GBAVideoSoftwareRendererPreprocessSpriteLayer(softwareRenderer, y, fastEligible);
 	mPROFILE_STOP(profileSprites);
 
 	bool fast = false;
@@ -586,10 +717,46 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	}
 	if (fast) {
 		++softwareRenderer->fastLines;
-		goto finish;
+	} else {
+		++softwareRenderer->slowLines;
+		_drawScanlineSlow(softwareRenderer, y, spriteLayers);
 	}
-	++softwareRenderer->slowLines;
 
+	if (GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) != 0) {
+		if (softwareRenderer->bg[2].enabled == ENABLED_MAX) {
+			softwareRenderer->bg[2].sx += softwareRenderer->bg[2].dmx;
+			softwareRenderer->bg[2].sy += softwareRenderer->bg[2].dmy;
+		}
+		if (softwareRenderer->bg[3].enabled == ENABLED_MAX) {
+			softwareRenderer->bg[3].sx += softwareRenderer->bg[3].dmx;
+			softwareRenderer->bg[3].sy += softwareRenderer->bg[3].dmy;
+		}
+	}
+
+	if (softwareRenderer->bg[0].enabled != 0 && softwareRenderer->bg[0].enabled < ENABLED_MAX) {
+		++softwareRenderer->bg[0].enabled;
+		DIRTY_SCANLINE(softwareRenderer, y);
+	}
+	if (softwareRenderer->bg[1].enabled != 0 && softwareRenderer->bg[1].enabled < ENABLED_MAX) {
+		++softwareRenderer->bg[1].enabled;
+		DIRTY_SCANLINE(softwareRenderer, y);
+	}
+	if (softwareRenderer->bg[2].enabled != 0 && softwareRenderer->bg[2].enabled < ENABLED_MAX) {
+		++softwareRenderer->bg[2].enabled;
+		DIRTY_SCANLINE(softwareRenderer, y);
+	}
+	if (softwareRenderer->bg[3].enabled != 0 && softwareRenderer->bg[3].enabled < ENABLED_MAX) {
+		++softwareRenderer->bg[3].enabled;
+		DIRTY_SCANLINE(softwareRenderer, y);
+	}
+
+	if (!fast) {
+		_copyOut(softwareRenderer, row);
+	}
+}
+
+// The line as the regular renderer draws it, into softwareRenderer->row
+static void _drawScanlineSlow(struct GBAVideoSoftwareRenderer* softwareRenderer, int y, int spriteLayers) {
 	int w;
 	unsigned priority;
 	softwareRenderer->end = 0;
@@ -701,40 +868,9 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	mPROFILE_START(profilePost, "postprocess");
 	GBAVideoSoftwareRendererPostprocessBuffer(softwareRenderer);
 	mPROFILE_STOP(profilePost);
+}
 
-finish:
-	if (GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) != 0) {
-		if (softwareRenderer->bg[2].enabled == ENABLED_MAX) {
-			softwareRenderer->bg[2].sx += softwareRenderer->bg[2].dmx;
-			softwareRenderer->bg[2].sy += softwareRenderer->bg[2].dmy;
-		}
-		if (softwareRenderer->bg[3].enabled == ENABLED_MAX) {
-			softwareRenderer->bg[3].sx += softwareRenderer->bg[3].dmx;
-			softwareRenderer->bg[3].sy += softwareRenderer->bg[3].dmy;
-		}
-	}
-
-	if (softwareRenderer->bg[0].enabled != 0 && softwareRenderer->bg[0].enabled < ENABLED_MAX) {
-		++softwareRenderer->bg[0].enabled;
-		DIRTY_SCANLINE(softwareRenderer, y);
-	}
-	if (softwareRenderer->bg[1].enabled != 0 && softwareRenderer->bg[1].enabled < ENABLED_MAX) {
-		++softwareRenderer->bg[1].enabled;
-		DIRTY_SCANLINE(softwareRenderer, y);
-	}
-	if (softwareRenderer->bg[2].enabled != 0 && softwareRenderer->bg[2].enabled < ENABLED_MAX) {
-		++softwareRenderer->bg[2].enabled;
-		DIRTY_SCANLINE(softwareRenderer, y);
-	}
-	if (softwareRenderer->bg[3].enabled != 0 && softwareRenderer->bg[3].enabled < ENABLED_MAX) {
-		++softwareRenderer->bg[3].enabled;
-		DIRTY_SCANLINE(softwareRenderer, y);
-	}
-
-	if (fast) {
-		return;
-	}
-
+static void _copyOut(struct GBAVideoSoftwareRenderer* softwareRenderer, color_t* row) {
 	mPROFILE_START(profileCopy, "copy out");
 	int x;
 	if (softwareRenderer->greenswap) {
@@ -765,6 +901,7 @@ finish:
 }
 
 static void GBAVideoSoftwareRendererFinishFrame(struct GBAVideoRenderer* renderer) {
+	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 
 	softwareRenderer->nextY = 0;
@@ -792,12 +929,14 @@ static void GBAVideoSoftwareRendererFinishFrame(struct GBAVideoRenderer* rendere
 }
 
 static void GBAVideoSoftwareRendererGetPixels(struct GBAVideoRenderer* renderer, size_t* stride, const void** pixels) {
+	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	*stride = softwareRenderer->outputBufferStride;
 	*pixels = softwareRenderer->outputBuffer;
 }
 
 static void GBAVideoSoftwareRendererPutPixels(struct GBAVideoRenderer* renderer, size_t stride, const void* pixels) {
+	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 
 	const color_t* colorPixels = pixels;
@@ -899,11 +1038,31 @@ static void GBAVideoSoftwareRendererWriteBLDCNT(struct GBAVideoSoftwareRenderer*
 
 void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* softwareRenderer, int y, bool fillRow) {
 	int x;
-	for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; x += 4) {
-		softwareRenderer->spriteLayer[x] = FLAG_UNWRITTEN;
-		softwareRenderer->spriteLayer[x + 1] = FLAG_UNWRITTEN;
-		softwareRenderer->spriteLayer[x + 2] = FLAG_UNWRITTEN;
-		softwareRenderer->spriteLayer[x + 3] = FLAG_UNWRITTEN;
+	uint32_t dirty = softwareRenderer->spriteLayerDirty;
+	// Anything but the fast path's sprites may write all over it
+	softwareRenderer->spriteLayerDirty = 0xFFFFFFFF;
+	if (dirty == 0xFFFFFFFF) {
+		for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; x += 4) {
+			softwareRenderer->spriteLayer[x] = FLAG_UNWRITTEN;
+			softwareRenderer->spriteLayer[x + 1] = FLAG_UNWRITTEN;
+			softwareRenderer->spriteLayer[x + 2] = FLAG_UNWRITTEN;
+			softwareRenderer->spriteLayer[x + 3] = FLAG_UNWRITTEN;
+		}
+	} else {
+		uint32_t* layer = softwareRenderer->spriteLayer;
+		for (; dirty; dirty >>= 1, layer += 8) {
+			if (!(dirty & 1)) {
+				continue;
+			}
+			layer[0] = FLAG_UNWRITTEN;
+			layer[1] = FLAG_UNWRITTEN;
+			layer[2] = FLAG_UNWRITTEN;
+			layer[3] = FLAG_UNWRITTEN;
+			layer[4] = FLAG_UNWRITTEN;
+			layer[5] = FLAG_UNWRITTEN;
+			layer[6] = FLAG_UNWRITTEN;
+			layer[7] = FLAG_UNWRITTEN;
+		}
 	}
 
 	softwareRenderer->windows[0].endX = GBA_VIDEO_HORIZONTAL_PIXELS;
@@ -1030,26 +1189,81 @@ void GBAVideoSoftwareRendererPostprocessBuffer(struct GBAVideoSoftwareRenderer* 
 	}
 }
 
-int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y) {
+// The lines a sprite is on: from its top down, and from the top of the screen
+// if it wraps around
+static void _spriteLineRanges(const struct GBAVideoRendererSprite* sprite, int* start, int* end, int* wrapEnd) {
+	*start = sprite->y < 0 ? 0 : sprite->y;
+	*end = sprite->endY > GBA_VIDEO_VERTICAL_PIXELS ? GBA_VIDEO_VERTICAL_PIXELS : sprite->endY;
+	*wrapEnd = sprite->endY - 256;
+	if (*wrapEnd > sprite->y) {
+		*wrapEnd = sprite->y;
+	}
+	if (*wrapEnd > *end) {
+		*wrapEnd = *end;
+	}
+}
+
+static void _listSpriteLines(struct GBAVideoSoftwareRenderer* renderer) {
+	uint16_t* lineStart = renderer->spriteLineStart;
+	memset(renderer->spriteLineStart, 0, sizeof(renderer->spriteLineStart));
+	int i;
+	int y;
+	int start, end, wrapEnd;
+	for (i = 0; i < renderer->oamMax; ++i) {
+		_spriteLineRanges(&renderer->sprites[i], &start, &end, &wrapEnd);
+		for (y = 0; y < wrapEnd; ++y) {
+			++lineStart[y];
+		}
+		for (y = start; y < end; ++y) {
+			++lineStart[y];
+		}
+	}
+	int total = 0;
+	for (y = 0; y < GBA_VIDEO_VERTICAL_PIXELS; ++y) {
+		int count = lineStart[y];
+		lineStart[y] = total;
+		total += count;
+	}
+	lineStart[GBA_VIDEO_VERTICAL_PIXELS] = total;
+	for (i = 0; i < renderer->oamMax; ++i) {
+		_spriteLineRanges(&renderer->sprites[i], &start, &end, &wrapEnd);
+		for (y = 0; y < wrapEnd; ++y) {
+			renderer->spriteLines[lineStart[y]++] = i;
+		}
+		for (y = start; y < end; ++y) {
+			renderer->spriteLines[lineStart[y]++] = i;
+		}
+	}
+	// Each start is now where the next line starts
+	memmove(&lineStart[1], &lineStart[0], sizeof(lineStart[0]) * (GBA_VIDEO_VERTICAL_PIXELS - 1));
+	lineStart[0] = 0;
+}
+
+int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y, bool fast) {
 	int w;
 	int spriteLayers = 0;
+	renderer->spriteBlocks = 0;
 	if (GBARegisterDISPCNTIsObjEnable(renderer->dispcnt) && !renderer->d.disableOBJ) {
 		if (renderer->oamDirty) {
 			mPROFILE_START(profileOam, "OAM rebuild");
 			renderer->oamMax = GBAVideoRendererCleanOAM(renderer->d.oam->obj, renderer->sprites, renderer->objOffsetY);
+			_listSpriteLines(renderer);
 			mPROFILE_STOP(profileOam);
 			renderer->oamDirty = false;
+			renderer->fastSpritesValid = false;
 		}
+		if (fast) {
+			return GBAVideoSoftwareRendererFastSpriteLayer(renderer, y);
+		}
+		memset(renderer->spritePriorityBlocks, 0xFF, sizeof(renderer->spritePriorityBlocks));
 		int mosaicV = GBAMosaicControlGetObjV(renderer->mosaic) + 1;
 		int mosaicY = y - (y % mosaicV);
 		int i;
-		for (i = 0; i < renderer->oamMax; ++i) {
-			struct GBAVideoRendererSprite* sprite = &renderer->sprites[i];
+		int last = renderer->spriteLineStart[y + 1];
+		for (i = renderer->spriteLineStart[y]; i < last; ++i) {
+			struct GBAVideoRendererSprite* sprite = &renderer->sprites[renderer->spriteLines[i]];
 			int localY = y;
 			renderer->end = 0;
-			if ((y < sprite->y && (sprite->endY - 256 < 0 || y >= sprite->endY - 256)) || y >= sprite->endY) {
-				continue;
-			}
 			if (GBAObjAttributesAIsMosaic(sprite->obj.a) && mosaicV > 1) {
 				localY = mosaicY;
 				if (localY < sprite->y && sprite->y < GBA_VIDEO_VERTICAL_PIXELS) {
@@ -1085,6 +1299,9 @@ int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRendere
 				break;
 			}
 		}
+	} else {
+		memset(renderer->spritePriorityBlocks, fast ? 0 : 0xFF, sizeof(renderer->spritePriorityBlocks));
+		renderer->spriteLayerDirty = 0;
 	}
 	return spriteLayers;
 }

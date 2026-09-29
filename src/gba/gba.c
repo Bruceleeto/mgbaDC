@@ -290,7 +290,7 @@ void GBASkipBIOS(struct GBA* gba) {
 	}
 }
 
-static void GBAProcessEvents(struct ARMCore* cpu) {
+ATTRIBUTE_HOT_GROUP(1) static void GBAProcessEvents(struct ARMCore* cpu) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 
 	gba->bus = cpu->prefetch[1];
@@ -547,17 +547,17 @@ void GBAApplyPatch(struct GBA* gba, struct Patch* patch) {
 	gba->romCrc32 = doCrc32(gba->memory.rom, gba->memory.romSize);
 }
 
-void GBARaiseIRQ(struct GBA* gba, enum GBAIRQ irq, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) void GBARaiseIRQ(struct GBA* gba, enum GBAIRQ irq, uint32_t cyclesLate) {
 	gba->memory.io[REG_IF >> 1] |= 1 << irq;
 	GBATestIRQ(gba, cyclesLate);
 }
 
-void GBATestIRQNoDelay(struct ARMCore* cpu) {
+ATTRIBUTE_HOT_GROUP(1) void GBATestIRQNoDelay(struct ARMCore* cpu) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	GBATestIRQ(gba, 0);
 }
 
-void GBATestIRQ(struct GBA* gba, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) void GBATestIRQ(struct GBA* gba, uint32_t cyclesLate) {
 	if (gba->memory.io[REG_IE >> 1] & gba->memory.io[REG_IF >> 1]) {
 		if (!mTimingIsScheduled(&gba->timing, &gba->irqEvent)) {
 			mTimingSchedule(&gba->timing, &gba->irqEvent, GBA_IRQ_DELAY - cyclesLate);

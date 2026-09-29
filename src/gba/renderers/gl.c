@@ -650,6 +650,9 @@ void GBAVideoGLRendererCreate(struct GBAVideoGLRenderer* renderer) {
 	renderer->d.deinit = GBAVideoGLRendererDeinit;
 	renderer->d.writeVideoRegister = GBAVideoGLRendererWriteVideoRegister;
 	renderer->d.writeVRAM = GBAVideoGLRendererWriteVRAM;
+	renderer->d.coarseVRAM = false;
+	renderer->d.pendingLines = 0;
+	renderer->d.flushLines = NULL;
 	renderer->d.writeOAM = GBAVideoGLRendererWriteOAM;
 	renderer->d.writePalette = GBAVideoGLRendererWritePalette;
 	renderer->d.drawScanline = GBAVideoGLRendererDrawScanline;

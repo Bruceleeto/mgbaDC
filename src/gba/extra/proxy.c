@@ -32,6 +32,9 @@ void GBAVideoProxyRendererCreate(struct GBAVideoProxyRenderer* renderer, struct 
 	renderer->d.deinit = GBAVideoProxyRendererDeinit;
 	renderer->d.writeVideoRegister = GBAVideoProxyRendererWriteVideoRegister;
 	renderer->d.writeVRAM = GBAVideoProxyRendererWriteVRAM;
+	renderer->d.coarseVRAM = false;
+	renderer->d.pendingLines = 0;
+	renderer->d.flushLines = NULL;
 	renderer->d.writeOAM = GBAVideoProxyRendererWriteOAM;
 	renderer->d.writePalette = GBAVideoProxyRendererWritePalette;
 	renderer->d.drawScanline = GBAVideoProxyRendererDrawScanline;

@@ -34,6 +34,9 @@
 #include <mgba-util/patch.h>
 #include <mgba-util/vfs.h>
 #include <errno.h>
+#ifdef _arch_dreamcast
+#include <malloc.h>
+#endif
 
 static const struct mCoreChannelInfo _GBAVideoLayers[] = {
 	{ GBA_LAYER_BG0, "bg0", "Background 0", NULL },
@@ -181,6 +184,7 @@ struct GBACore {
 	struct mDebuggerPlatform* debuggerPlatform;
 	struct mCheatDevice* cheatDevice;
 	struct GBAAudioMixer* audioMixer;
+	void* allocation;
 };
 
 static bool _GBACoreInit(struct mCore* core) {
@@ -262,7 +266,7 @@ static void _GBACoreDeinit(struct mCore* core) {
 	}
 	free(gbacore->audioMixer);
 	mCoreConfigFreeOpts(&core->opts);
-	free(core);
+	free(gbacore->allocation);
 }
 
 static enum mPlatform _GBACorePlatform(const struct mCore* core) {
@@ -1368,7 +1372,18 @@ static void _GBACoreEndVideoLog(struct mCore* core) {
 #endif
 
 struct mCore* GBACoreCreate(void) {
-	struct GBACore* gbacore = malloc(sizeof(*gbacore));
+#ifdef _arch_dreamcast
+	// The data cache is 16 KB direct mapped, and the stack sits in the top
+	// part of it. Put the rows and palettes the renderer works with at the
+	// bottom, so that they never push each other or the stack out.
+	size_t hot = offsetof(struct GBACore, renderer.row);
+	void* allocation = memalign(0x4000, sizeof(struct GBACore) + 0x4000);
+	struct GBACore* gbacore = (struct GBACore*) ((uint8_t*) allocation + (-hot & 0x3FFF));
+#else
+	void* allocation = malloc(sizeof(struct GBACore));
+	struct GBACore* gbacore = allocation;
+#endif
+	gbacore->allocation = allocation;
 	struct mCore* core = &gbacore->d;
 	memset(&core->opts, 0, sizeof(core->opts));
 	core->cpu = NULL;

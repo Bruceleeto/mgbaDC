@@ -380,7 +380,7 @@ static void _fifoDMA(struct GBAAudio* audio, struct GBAAudioFIFO* channel, int n
 	}
 }
 
-void GBAAudioSampleFIFO(struct GBAAudio* audio, int fifoId, int32_t cycles) {
+ATTRIBUTE_HOT_GROUP(0) void GBAAudioSampleFIFO(struct GBAAudio* audio, int fifoId, int32_t cycles) {
 	struct GBAAudioFIFO* channel;
 	if (fifoId == 0) {
 		channel = &audio->chA;
@@ -454,7 +454,7 @@ static void _consumeHistory(struct GBAAudioFIFO* channel, int used) {
 }
 
 // Mixes every sample due before timestamp into currentSamples
-void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
+ATTRIBUTE_HOT_GROUP(0) void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
 	int32_t interval = audio->sampleInterval;
 	int32_t when = audio->lastSample;
 	if (timestamp - when < interval) {
@@ -474,14 +474,33 @@ void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
 	int shiftA = !audio->volumeChA;
 	int shiftB = !audio->volumeChB;
 
+	// With nothing playing on the PSG, running it changes nothing and it
+	// puts out the same sample all the way
+	struct GBAudio* psg = &audio->psg;
+	bool psgIdle = !psg->p;
+	if (psg->enable) {
+		psgIdle = psgIdle && !(psg->playingCh1 && psg->ch1.envelope.dead != 2) && !(psg->playingCh2 && psg->ch2.envelope.dead != 2);
+		psgIdle = psgIdle && !psg->playingCh3 && !psg->playingCh4;
+		psgIdle = psgIdle && timestamp - psg->ch1.lastUpdate <= 0x40000000 && timestamp - psg->ch2.lastUpdate <= 0x40000000;
+	}
+	int16_t idleLeft = 0;
+	int16_t idleRight = 0;
+	if (psgIdle) {
+		GBAudioSamplePSG(psg, &idleLeft, &idleRight);
+		idleLeft >>= psgShift;
+		idleRight >>= psgShift;
+	}
+
 	int sample;
 	for (sample = audio->sampleIndex; timestamp - when >= interval && sample < GBA_AUDIO_BATCH_SAMPLES; ++sample, when += interval) {
-		int16_t sampleLeft = 0;
-		int16_t sampleRight = 0;
-		GBAudioRun(&audio->psg, when, 0xF);
-		GBAudioSamplePSG(&audio->psg, &sampleLeft, &sampleRight);
-		sampleLeft >>= psgShift;
-		sampleRight >>= psgShift;
+		int16_t sampleLeft = idleLeft;
+		int16_t sampleRight = idleRight;
+		if (!psgIdle) {
+			GBAudioRun(psg, when, 0xF);
+			GBAudioSamplePSG(psg, &sampleLeft, &sampleRight);
+			sampleLeft >>= psgShift;
+			sampleRight >>= psgShift;
+		}
 
 		if (audio->mixer) {
 			audio->mixer->step(audio->mixer);
@@ -527,7 +546,7 @@ void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
 	mPROFILE_STOP(profileMix);
 }
 
-static void _sample(struct mTiming* timing, void* user, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(0) static void _sample(struct mTiming* timing, void* user, uint32_t cyclesLate) {
 	struct GBAAudio* audio = user;
 	GBAAudioSample(audio, mTimingCurrentTime(&audio->p->timing) - cyclesLate);
 

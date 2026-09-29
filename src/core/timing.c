@@ -185,7 +185,7 @@ void mTimingInterrupt(struct mTiming* timing) {
 	timing->root = NULL;
 }
 
-void mTimingSchedule(struct mTiming* timing, struct mTimingEvent* event, int32_t when) {
+ATTRIBUTE_HOT_GROUP(1) void mTimingSchedule(struct mTiming* timing, struct mTimingEvent* event, int32_t when) {
 	int32_t nextEvent = when + *timing->relativeCycles;
 	event->when = nextEvent + timing->masterCycles;
 	if (nextEvent < *timing->nextEvent) {
@@ -214,7 +214,7 @@ void mTimingScheduleAbsolute(struct mTiming* timing, struct mTimingEvent* event,
 	mTimingSchedule(timing, event, when - mTimingCurrentTime(timing));
 }
 
-void mTimingDeschedule(struct mTiming* timing, struct mTimingEvent* event) {
+ATTRIBUTE_HOT_GROUP(1) void mTimingDeschedule(struct mTiming* timing, struct mTimingEvent* event) {
 	if (timing->reroot) {
 		timing->root = timing->reroot;
 		timing->reroot = NULL;
@@ -245,7 +245,7 @@ bool mTimingIsScheduled(const struct mTiming* timing, const struct mTimingEvent*
 	return false;
 }
 
-int32_t mTimingTick(struct mTiming* timing, int32_t cycles) {
+ATTRIBUTE_HOT_GROUP(1) int32_t mTimingTick(struct mTiming* timing, int32_t cycles) {
 	timing->masterCycles += cycles;
 	uint32_t masterCycles = timing->masterCycles;
 	while (timing->root) {

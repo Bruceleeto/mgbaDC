@@ -63,6 +63,7 @@ static void _RegisterRamReset(struct GBA* gba) {
 	uint32_t registers = gba->cpu->gprs[0];
 	struct ARMCore* cpu = gba->cpu;
 	cpu->memory.store16(cpu, BASE_IO | REG_DISPCNT, 0x0080, 0);
+	GBA_VIDEO_TOUCH(gba->video.renderer);
 	if (registers & 0x01) {
 		memset(gba->memory.wram, 0, SIZE_WORKING_RAM);
 	}

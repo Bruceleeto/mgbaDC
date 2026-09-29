@@ -3,11 +3,14 @@
 #include <mgba/core/blip_buf.h>
 #include <mgba/core/log.h>
 #include <mgba/core/profile.h>
+#include <mgba/core/serialize.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/input.h>
 #ifdef DC_JIT
 #include <mgba/internal/arm/jit.h>
 #endif
+
+#include <mgba-util/vfs.h>
 
 #include <kos.h>
 #include <dc/pvr.h>
@@ -244,6 +247,14 @@ int main(int argc, char** argv) {
 	}
 #endif
 	core->reset(core);
+	/* Benchmarking: start from a savestate when the media carries one. */
+	char statePath[32];
+	snprintf(statePath, sizeof(statePath), "%s/test.ss", root);
+	struct VFile* stateFile = VFileOpen(statePath, O_RDONLY);
+	if (stateFile) {
+		if (mCoreLoadStateNamed(core, stateFile, 0)) printf("mgba-dc: started from %s\n", statePath);
+		stateFile->close(stateFile);
+	}
 	blip_set_rates(core->getAudioChannel(core, 0), core->frequency(core), SAMPLE_RATE);
 	blip_set_rates(core->getAudioChannel(core, 1), core->frequency(core), SAMPLE_RATE);
 	if (core->platform(core) == mPLATFORM_GBA) {

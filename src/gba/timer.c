@@ -12,7 +12,7 @@
 
 #define REG_TMCNT_LO(X) (REG_TM0CNT_LO + ((X) << 2))
 
-static void GBATimerUpdate(struct GBA* gba, int timerId, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) static void GBATimerUpdate(struct GBA* gba, int timerId, uint32_t cyclesLate) {
 	struct GBATimer* timer = &gba->timers[timerId];
 	if (GBATimerFlagsIsCountUp(timer->flags)) {
 		gba->memory.io[REG_TMCNT_LO(timerId) >> 1] = timer->reload;
@@ -47,12 +47,12 @@ static void GBATimerUpdate(struct GBA* gba, int timerId, uint32_t cyclesLate) {
 	}
 }
 
-static void GBATimerUpdate0(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) static void GBATimerUpdate0(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	UNUSED(timing);
 	GBATimerUpdate(context, 0, cyclesLate);
 }
 
-static void GBATimerUpdate1(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) static void GBATimerUpdate1(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	UNUSED(timing);
 	GBATimerUpdate(context, 1, cyclesLate);
 }
@@ -87,7 +87,7 @@ void GBATimerInit(struct GBA* gba) {
 	gba->timers[3].event.priority = 0x23;
 }
 
-void GBATimerUpdateRegister(struct GBA* gba, int timer, int32_t cyclesLate) {
+ATTRIBUTE_HOT_GROUP(1) void GBATimerUpdateRegister(struct GBA* gba, int timer, int32_t cyclesLate) {
 	struct GBATimer* currentTimer = &gba->timers[timer];
 	if (!GBATimerFlagsIsEnable(currentTimer->flags) || GBATimerFlagsIsCountUp(currentTimer->flags)) {
 		return;

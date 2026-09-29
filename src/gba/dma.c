@@ -386,6 +386,213 @@ static bool _canBatch(struct GBA* gba, int number, struct GBADMA* info) {
 	return true;
 }
 
+// A run of sequential units from plain memory into RAM or video memory, done as
+// one loop. Covers exactly the units _canBatch would let through one by one:
+// n is capped at the first unit another event would come before, and at the
+// end of either memory block. Returns how many units it ran, 0 if this
+// transfer isn't the simple kind.
+static int32_t _bulk(struct GBA* gba, int number, struct GBADMA* info) {
+	struct GBAMemory* memory = &gba->memory;
+	struct mTiming* timing = &gba->timing;
+	struct GBAVideoRenderer* renderer = gba->video.renderer;
+	uint32_t width = 2 << GBADMARegisterGetWidth(info->reg);
+	uint32_t source = info->nextSource;
+	uint32_t dest = info->nextDest;
+	uint32_t sourceRegion = source >> BASE_OFFSET;
+	uint32_t destRegion = dest >> BASE_OFFSET;
+	if (timing->reroot || !source) {
+		return 0;
+	}
+	int i;
+	for (i = 0; i < 4; ++i) {
+		if (i != number && GBADMARegisterIsEnable(memory->dma[i].reg) && memory->dma[i].nextCount) {
+			return 0;
+		}
+	}
+
+	const void* sourceBase;
+	uint32_t sourceOffset;
+	uint32_t sourceSize;
+	switch (sourceRegion) {
+	case REGION_WORKING_RAM:
+		sourceBase = memory->wram;
+		sourceOffset = source & (SIZE_WORKING_RAM - width);
+		sourceSize = SIZE_WORKING_RAM;
+		break;
+	case REGION_WORKING_IRAM:
+		sourceBase = memory->iwram;
+		sourceOffset = source & (SIZE_WORKING_IRAM - width);
+		sourceSize = SIZE_WORKING_IRAM;
+		break;
+	case REGION_CART0:
+	case REGION_CART0_EX:
+	case REGION_CART1:
+	case REGION_CART1_EX:
+	case REGION_CART2:
+		sourceBase = memory->rom;
+		sourceOffset = source & (SIZE_CART0 - width);
+		sourceSize = memory->romSize & -width;
+		break;
+	default:
+		return 0;
+	}
+	void* destBase;
+	uint32_t destOffset;
+	uint32_t destSize;
+	bool plain = false;
+	switch (destRegion) {
+	case REGION_WORKING_RAM:
+		destBase = memory->wram;
+		destOffset = dest & (SIZE_WORKING_RAM - width);
+		destSize = SIZE_WORKING_RAM;
+		plain = true;
+		break;
+	case REGION_WORKING_IRAM:
+		destBase = memory->iwram;
+		destOffset = dest & (SIZE_WORKING_IRAM - width);
+		destSize = SIZE_WORKING_IRAM;
+		plain = true;
+		break;
+	case REGION_PALETTE_RAM:
+		destBase = gba->video.palette;
+		destOffset = dest & (SIZE_PALETTE_RAM - width);
+		destSize = SIZE_PALETTE_RAM;
+		break;
+	case REGION_VRAM:
+		destBase = gba->video.vram;
+		destOffset = dest & (0x00020000 - width);
+		destSize = SIZE_VRAM;
+		break;
+	case REGION_OAM:
+		destBase = gba->video.oam.raw;
+		destOffset = dest & (SIZE_OAM - width);
+		destSize = SIZE_OAM;
+		break;
+	default:
+		return 0;
+	}
+
+	int sourceStep;
+	if (source >= BASE_CART0 && source < BASE_CART_SRAM && GBADMARegisterGetSrcControl(info->reg) < 3) {
+		sourceStep = width;
+	} else {
+		sourceStep = DMA_OFFSET[GBADMARegisterGetSrcControl(info->reg)] * width;
+	}
+	int destStep = DMA_OFFSET[GBADMARegisterGetDestControl(info->reg)] * width;
+
+	int32_t n = info->nextCount;
+	if (sourceOffset >= sourceSize || destOffset >= destSize) {
+		return 0;
+	}
+	int32_t room;
+	if (sourceStep) {
+		room = sourceStep > 0 ? (sourceSize - sourceOffset) / width : sourceOffset / width + 1;
+		if (room < n) {
+			n = room;
+		}
+	}
+	if (destStep) {
+		room = destStep > 0 ? (destSize - destOffset) / width : destOffset / width + 1;
+		if (room < n) {
+			n = room;
+		}
+	}
+	int32_t cycles = 2;
+	if (width == 4) {
+		cycles += memory->waitstatesSeq32[sourceRegion] + memory->waitstatesSeq32[destRegion];
+	} else {
+		cycles += memory->waitstatesSeq16[sourceRegion] + memory->waitstatesSeq16[destRegion];
+	}
+	struct mTimingEvent* next = timing->root;
+	if (next == &memory->dmaEvent) {
+		next = next->next;
+	}
+	if (next) {
+		int32_t until = next->when - info->when;
+		room = until <= 0 ? 1 : (until + cycles - 1) / cycles;
+		if (room < n) {
+			n = room;
+		}
+	}
+	if (n < 2) {
+		return 0;
+	}
+
+	gba->cpuBlocked = true;
+	uint32_t value = 0;
+	bool changed = false;
+	uint32_t last = 0;
+	int32_t left;
+	if (plain && width == 4) {
+		for (left = n; left; --left, sourceOffset += sourceStep, destOffset += destStep) {
+			LOAD_32(value, sourceOffset, sourceBase);
+			STORE_32(value, destOffset, destBase);
+		}
+	} else if (plain) {
+		for (left = n; left; --left, sourceOffset += sourceStep, destOffset += destStep) {
+			LOAD_16(value, sourceOffset, sourceBase);
+			STORE_16(value, destOffset, destBase);
+		}
+		value = (value & 0xFFFF) | (value << 16);
+	} else if (width == 4) {
+		for (left = n; left; --left, sourceOffset += sourceStep, destOffset += destStep) {
+			uint32_t oldValue;
+			LOAD_32(value, sourceOffset, sourceBase);
+			LOAD_32(oldValue, destOffset, destBase);
+			if (oldValue == value) {
+				continue;
+			}
+			STORE_32(value, destOffset, destBase);
+			if (destRegion == REGION_PALETTE_RAM) {
+				renderer->writePalette(renderer, destOffset + 2, value >> 16);
+				renderer->writePalette(renderer, destOffset, value);
+			} else if (destRegion == REGION_OAM) {
+				renderer->writeOAM(renderer, destOffset >> 1);
+				renderer->writeOAM(renderer, (destOffset >> 1) + 1);
+			} else if (renderer->coarseVRAM && !renderer->cache) {
+				changed = true;
+				last = destOffset;
+			} else {
+				renderer->writeVRAM(renderer, destOffset + 2);
+				renderer->writeVRAM(renderer, destOffset);
+			}
+		}
+	} else {
+		for (left = n; left; --left, sourceOffset += sourceStep, destOffset += destStep) {
+			uint16_t oldValue;
+			LOAD_16(value, sourceOffset, sourceBase);
+			LOAD_16(oldValue, destOffset, destBase);
+			if (oldValue == (uint16_t) value) {
+				continue;
+			}
+			STORE_16(value, destOffset, destBase);
+			if (destRegion == REGION_PALETTE_RAM) {
+				renderer->writePalette(renderer, destOffset, value);
+			} else if (destRegion == REGION_OAM) {
+				renderer->writeOAM(renderer, destOffset >> 1);
+			} else if (renderer->coarseVRAM && !renderer->cache) {
+				changed = true;
+				last = destOffset;
+			} else {
+				renderer->writeVRAM(renderer, destOffset);
+			}
+		}
+		value = (value & 0xFFFF) | (value << 16);
+	}
+	if (changed) {
+		renderer->writeVRAM(renderer, last);
+	}
+	memory->dmaTransferRegister = value;
+	gba->bus = value;
+	gba->performingDMA = 0;
+
+	info->when += cycles * n;
+	info->nextCount -= n;
+	info->nextSource = source + sourceStep * n;
+	info->nextDest = dest + destStep * n;
+	return n;
+}
+
 void GBADMAService(struct GBA* gba, int number, struct GBADMA* info) {
 	struct GBAMemory* memory = &gba->memory;
 	struct ARMCore* cpu = gba->cpu;
@@ -396,6 +603,17 @@ void GBADMAService(struct GBA* gba, int number, struct GBADMA* info) {
 	uint32_t sourceRegion;
 	uint32_t destRegion;
 	do {
+		if ((info->nextDest >> BASE_OFFSET) >= REGION_PALETTE_RAM && (info->nextDest >> BASE_OFFSET) <= REGION_OAM) {
+			GBA_VIDEO_TOUCH(gba->video.renderer);
+		}
+		if (info->count != info->nextCount) {
+			sourceRegion = info->nextSource >> BASE_OFFSET;
+			destRegion = info->nextDest >> BASE_OFFSET;
+			if (_bulk(gba, number, info)) {
+				wordsRemaining = info->nextCount;
+				continue;
+			}
+		}
 		width = 2 << GBADMARegisterGetWidth(info->reg);
 		wordsRemaining = info->nextCount;
 		source = info->nextSource;
