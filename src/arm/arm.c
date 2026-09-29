@@ -197,31 +197,45 @@ static const uint16_t conditionLut[16] = {
 	0x0000 // NV
 };
 
+/* Do every load before any store: stores through cpu may alias the fields
+ * loaded afterwards, which would otherwise serialize them behind the stores. */
 static inline void ARMStep(struct ARMCore* cpu) {
 	uint32_t opcode = cpu->prefetch[0];
-	cpu->prefetch[0] = cpu->prefetch[1];
-	cpu->gprs[ARM_PC] += WORD_SIZE_ARM;
-	LOAD_32(cpu->prefetch[1], cpu->gprs[ARM_PC] & cpu->memory.activeMask, cpu->memory.activeRegion);
+	uint32_t next = cpu->prefetch[1];
+	uint32_t pc = cpu->gprs[ARM_PC] + WORD_SIZE_ARM;
+	uint32_t mask = cpu->memory.activeMask;
+	const uint32_t* region = cpu->memory.activeRegion;
+	unsigned flags = cpu->cpsr.flags >> 4;
+	ARMInstruction instruction = _armTable[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0x00F)];
+	uint32_t fetched;
+	LOAD_32(fetched, pc & mask, region);
+	cpu->prefetch[0] = next;
+	cpu->gprs[ARM_PC] = pc;
+	cpu->prefetch[1] = fetched;
 
 	unsigned condition = opcode >> 28;
 	if (condition != 0xE) {
-		unsigned flags = cpu->cpsr.flags >> 4;
 		bool conditionMet = conditionLut[condition] & (1 << flags);
 		if (!conditionMet) {
 			cpu->cycles += ARM_PREFETCH_CYCLES;
 			return;
 		}
 	}
-	ARMInstruction instruction = _armTable[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0x00F)];
 	instruction(cpu, opcode);
 }
 
 static inline void ThumbStep(struct ARMCore* cpu) {
 	uint32_t opcode = cpu->prefetch[0];
-	cpu->prefetch[0] = cpu->prefetch[1];
-	cpu->gprs[ARM_PC] += WORD_SIZE_THUMB;
-	LOAD_16(cpu->prefetch[1], cpu->gprs[ARM_PC] & cpu->memory.activeMask, cpu->memory.activeRegion);
+	uint32_t next = cpu->prefetch[1];
+	uint32_t pc = cpu->gprs[ARM_PC] + WORD_SIZE_THUMB;
+	uint32_t mask = cpu->memory.activeMask;
+	const uint32_t* region = cpu->memory.activeRegion;
 	ThumbInstruction instruction = _thumbTable[opcode >> 6];
+	uint32_t fetched;
+	LOAD_16(fetched, pc & mask, region);
+	cpu->prefetch[0] = next;
+	cpu->gprs[ARM_PC] = pc;
+	cpu->prefetch[1] = fetched;
 	instruction(cpu, opcode);
 }
 
