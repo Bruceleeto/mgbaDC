@@ -45,6 +45,8 @@ endif()
 
 set(SDL_VERSION "${SDL_VERSION}" PARENT_SCOPE)
 add_definitions(-DBUILD_SDL)
+# With no ROM on the command line, run the first .gba in assets/ (the Dreamcast romdisk)
+add_definitions(-DM_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets")
 
 find_feature(USE_PIXMAN "pixman-1")
 if(USE_PIXMAN)

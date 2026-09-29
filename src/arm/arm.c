@@ -8,6 +8,7 @@
 #include <mgba/internal/arm/isa-arm.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
+#include <mgba/core/profile.h>
 
 void ARMSetPrivilegeMode(struct ARMCore* cpu, enum PrivilegeMode mode) {
 	if (mode == cpu->privilegeMode) {
@@ -244,8 +245,10 @@ void ARMRun(struct ARMCore* cpu) {
 		cpu->irqh.processEvents(cpu);
 	}
 	if (cpu->executionMode == MODE_THUMB) {
+		mPROFILE_COUNT(mProfileThumbInstructions);
 		ThumbStep(cpu);
 	} else {
+		mPROFILE_COUNT(mProfileArmInstructions);
 		ARMStep(cpu);
 	}
 }
@@ -253,10 +256,12 @@ void ARMRun(struct ARMCore* cpu) {
 void ARMRunLoop(struct ARMCore* cpu) {
 	if (cpu->executionMode == MODE_THUMB) {
 		while (cpu->cycles < cpu->nextEvent) {
+			mPROFILE_COUNT(mProfileThumbInstructions);
 			ThumbStep(cpu);
 		}
 	} else {
 		while (cpu->cycles < cpu->nextEvent) {
+			mPROFILE_COUNT(mProfileArmInstructions);
 			ARMStep(cpu);
 		}
 	}

@@ -18,6 +18,8 @@ CXX_GUARD_START
 
 #define GBA_AUDIO_FIFO_SIZE 8
 #define GBA_MAX_SAMPLES 16
+#define GBA_AUDIO_FIFO_HISTORY 64
+#define GBA_AUDIO_BATCH_SAMPLES 256
 
 #define MP2K_MAGIC 0x68736D53
 #define MP2K_MAX_SOUND_CHANNELS 12
@@ -36,7 +38,10 @@ struct GBAAudioFIFO {
 	uint32_t internalSample;
 	int internalRemaining;
 	int dmaSource;
-	int8_t samples[GBA_MAX_SAMPLES];
+	int8_t sample;
+	int historySize;
+	int32_t historyWhen[GBA_AUDIO_FIFO_HISTORY];
+	int8_t historyValue[GBA_AUDIO_FIFO_HISTORY];
 };
 
 DECL_BITFIELD(GBARegisterSOUNDCNT_HI, uint16_t);
@@ -88,7 +93,7 @@ struct GBAAudio {
 
 	int32_t lastSample;
 	int sampleIndex;
-	struct mStereoSample currentSamples[GBA_MAX_SAMPLES];
+	struct mStereoSample currentSamples[GBA_AUDIO_BATCH_SAMPLES];
 
 	bool forceDisableChA;
 	bool forceDisableChB;

@@ -42,6 +42,8 @@ struct mProfileScope {
 extern uint32_t (*mProfileClock)(void);
 extern uint32_t (*mProfileEvents)(void);
 extern struct mProfileEntry* mProfileCurrent;
+extern uint32_t mProfileArmInstructions;
+extern uint32_t mProfileThumbInstructions;
 
 struct mProfileEntry* mProfileLookup(const char* name, struct mProfileEntry* parent);
 
@@ -81,9 +83,11 @@ static inline void mProfileEnd(struct mProfileScope* scope) {
 	struct mProfileScope VAR; \
 	mProfileBegin(&VAR, NAME, &VAR ## Cache)
 #define mPROFILE_STOP(VAR) mProfileEnd(&VAR)
+#define mPROFILE_COUNT(VAR) ++(VAR)
 #else
 #define mPROFILE_START(VAR, NAME)
 #define mPROFILE_STOP(VAR) do {} while (0)
+#define mPROFILE_COUNT(VAR) do {} while (0)
 #endif
 
 CXX_GUARD_END

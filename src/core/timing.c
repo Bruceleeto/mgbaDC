@@ -15,6 +15,8 @@ static uint32_t _noCounter(void) {
 uint32_t (*mProfileClock)(void) = _noCounter;
 uint32_t (*mProfileEvents)(void) = _noCounter;
 struct mProfileEntry* mProfileCurrent;
+uint32_t mProfileArmInstructions;
+uint32_t mProfileThumbInstructions;
 
 static struct mProfileEntry _profileEntries[mPROFILE_MAX_ENTRIES];
 static unsigned _profileNumEntries;
@@ -47,6 +49,8 @@ void mProfileReset(void) {
 	_profileOverflow.ticks = 0;
 	_profileOverflow.events = 0;
 	_profileOverflow.count = 0;
+	mProfileArmInstructions = 0;
+	mProfileThumbInstructions = 0;
 }
 
 /* Cost of one empty begin/end pair, in ticks. Nested pairs are included in
@@ -136,6 +140,12 @@ void mProfilePrint(double coreMs, unsigned frames, double ticksPerMs, const char
 		scopes += _profileEntries[i].count;
 	}
 	printf("  %-34s %7.2f ms\n", "outside sections (CPU etc.)", coreMs - topTicks / ticksPerMs / frames);
+	uint32_t instructions = mProfileArmInstructions + mProfileThumbInstructions;
+	if (instructions) {
+		printf("  %-34s %7.0fk ARM %7.0fk Thumb per frame (%.0f%% Thumb)\n", "instructions",
+		       mProfileArmInstructions / 1000.0 / frames, mProfileThumbInstructions / 1000.0 / frames,
+		       mProfileThumbInstructions * 100.0 / instructions);
+	}
 	_profilePrintChildren(NULL, 0, frames, ticksPerMs, eventsLabel);
 	if (_profileOverflow.count) {
 		_profilePrintLine(0, _profileOverflow.name, _profileOverflow.ticks, _profileOverflow.events,

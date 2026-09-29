@@ -51,6 +51,28 @@ static void _loadState(struct mCoreThread* thread) {
 	mCoreLoadStateNamed(thread->core, _state, SAVESTATE_RTC);
 }
 
+#ifdef M_ASSETS_DIR
+static char* _findAssetRom(void) {
+	struct VDir* dir = VDirOpen(M_ASSETS_DIR);
+	if (!dir) {
+		return NULL;
+	}
+	char* fname = NULL;
+	struct VDirEntry* entry;
+	while (!fname && (entry = dir->listNext(dir))) {
+		const char* name = entry->name(entry);
+		size_t len = strlen(name);
+		if (entry->type(entry) != VFS_DIRECTORY && len > 4 && !strcasecmp(&name[len - 4], ".gba")) {
+			size_t size = strlen(M_ASSETS_DIR) + len + 2;
+			fname = malloc(size);
+			snprintf(fname, size, "%s/%s", M_ASSETS_DIR, name);
+		}
+	}
+	dir->close(dir);
+	return fname;
+}
+#endif
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
 	AttachConsole(ATTACH_PARENT_PROCESS);
@@ -75,6 +97,11 @@ int main(int argc, char** argv) {
 
 	mSubParserGraphicsInit(&subparser, &graphicsOpts);
 	bool parsed = mArgumentsParse(&args, argc, argv, &subparser, 1);
+#ifdef M_ASSETS_DIR
+	if (parsed && !args.fname) {
+		args.fname = _findAssetRom();
+	}
+#endif
 	if (!args.fname && !args.showVersion) {
 		parsed = false;
 	}
