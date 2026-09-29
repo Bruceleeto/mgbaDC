@@ -15,7 +15,7 @@
 #include <mgba/internal/gba/audio.h>
 #endif
 
-#ifdef __3DS__
+#if defined(__3DS__) || defined(BLIP_FAST)
 #define blip_add_delta blip_add_delta_fast
 #endif
 

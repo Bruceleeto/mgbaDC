@@ -31,7 +31,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" OR CMAKE_SYSTEM_NAME STREQUAL "
 	endforeach()
 	set(BUILD_STATIC ON CACHE BOOL "Build a static library" FORCE)
 	set(BUILD_LTO ON CACHE BOOL "Build with link-time optimization" FORCE)
-	add_definitions(-D_GNU_SOURCE -DCOLOR_16_BIT -DCOLOR_5_6_5)
+	add_definitions(-D_GNU_SOURCE -DCOLOR_16_BIT -DCOLOR_5_6_5 -DBLIP_FAST)
 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		set(BUILD_SDL ON CACHE BOOL "Build SDL frontend" FORCE)
 		set(SDL_VERSION "2" CACHE STRING "Version of SDL to use" FORCE)

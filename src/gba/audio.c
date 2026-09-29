@@ -16,7 +16,7 @@
 
 #define MP2K_LOCK_MAX 8
 
-#ifdef __3DS__
+#if defined(__3DS__) || defined(BLIP_FAST)
 #define blip_add_delta blip_add_delta_fast
 #endif
 

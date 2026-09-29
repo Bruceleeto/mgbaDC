@@ -22,9 +22,15 @@ Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA */
 	#include "blargg_test.h"
 #endif
 
+/* BLIP_FAST uses 32-bit fixed point, avoiding 64-bit multiplies on 32-bit
+CPUs. Resample ratios are then accurate to 20 bits, plenty for emulation. */
+#ifdef BLIP_FAST
+	typedef unsigned fixed_t;
+	enum { pre_shift = 0 };
+
 /* Equivalent to ULONG_MAX >= 0xFFFFFFFF00000000.
 Avoids constants that don't fit in 32 bits. */
-#if ULONG_MAX/0xFFFFFFFF > 0xFFFFFFFF
+#elif ULONG_MAX/0xFFFFFFFF > 0xFFFFFFFF
 	typedef unsigned long fixed_t;
 	enum { pre_shift = 32 };
 
@@ -160,7 +166,13 @@ void blip_clear( blip_t* m )
 	with the slight loss of showing an error in half the time. Since for
 	a 64-bit factor this is years, the halving isn't a problem. */
 	
+#ifdef BLIP_FAST
+	/* factor is rounded up, and an exact integer ratio then keeps every
+	delta on a sample boundary, so the fast path passes samples unfiltered. */
+	m->offset     = 0;
+#else
 	m->offset     = m->factor / 2;
+#endif
 	m->avail      = 0;
 	m->integrator = 0;
 	memset( SAMPLES( m ), 0, (m->size + buf_extra) * sizeof (buf_t) );
