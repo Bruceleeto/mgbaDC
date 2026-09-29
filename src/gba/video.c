@@ -5,6 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/gba/video.h>
 
+#include <mgba/core/profile.h>
 #include <mgba/core/sync.h>
 #include <mgba/core/cache-set.h>
 #include <mgba/internal/arm/macros.h>
@@ -172,7 +173,9 @@ void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	case GBA_VIDEO_VERTICAL_PIXELS:
 		video->p->memory.io[REG_DISPSTAT >> 1] = GBARegisterDISPSTATFillInVblank(dispstat);
 		if (video->frameskipCounter <= 0) {
+			mPROFILE_START(profileFinish, "finishFrame");
 			video->renderer->finishFrame(video->renderer);
+			mPROFILE_STOP(profileFinish);
 		}
 		GBADMARunVblank(video->p, -cyclesLate);
 		if (GBARegisterDISPSTATIsVblankIRQ(dispstat)) {
@@ -202,7 +205,9 @@ void _startHblank(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	GBARegisterDISPSTAT dispstat = video->p->memory.io[REG_DISPSTAT >> 1];
 	dispstat = GBARegisterDISPSTATFillInHblank(dispstat);
 	if (video->vcount < GBA_VIDEO_VERTICAL_PIXELS && video->frameskipCounter <= 0) {
+		mPROFILE_START(profileScanline, "drawScanline");
 		video->renderer->drawScanline(video->renderer, video->vcount);
+		mPROFILE_STOP(profileScanline);
 	}
 
 	if (video->vcount < GBA_VIDEO_VERTICAL_PIXELS) {

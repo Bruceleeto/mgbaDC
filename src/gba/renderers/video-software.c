@@ -5,6 +5,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include "gba/renderers/software-private.h"
 
+#include <mgba/core/profile.h>
+
 #include <mgba/core/cache-set.h>
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/gba/io.h>
@@ -534,6 +536,8 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	softwareRenderer->cache[y].scale[1][1] = softwareRenderer->bg[3].sy;
 
 	if (!dirty) {
+		mPROFILE_START(profileClean, "clean line (skipped)");
+		mPROFILE_STOP(profileClean);
 		if (GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) != 0) {
 			if (softwareRenderer->bg[2].enabled == ENABLED_MAX) {
 				softwareRenderer->bg[2].sx += softwareRenderer->bg[2].dmx;
@@ -558,9 +562,13 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 		return;
 	}
 
+	mPROFILE_START(profilePre, "preprocess");
 	GBAVideoSoftwareRendererPreprocessBuffer(softwareRenderer, y);
+	mPROFILE_STOP(profilePre);
 	softwareRenderer->spriteCyclesRemaining = GBARegisterDISPCNTIsHblankIntervalFree(softwareRenderer->dispcnt) ? OBJ_HBLANK_FREE_LENGTH : OBJ_LENGTH;
+	mPROFILE_START(profileSprites, "sprites draw");
 	int spriteLayers = GBAVideoSoftwareRendererPreprocessSpriteLayer(softwareRenderer, y);
+	mPROFILE_STOP(profileSprites);
 
 	int w;
 	unsigned priority;
@@ -605,8 +613,11 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 
 		for (priority = 0; priority < 4; ++priority) {
 			if (spriteLayers & (1 << priority)) {
+				mPROFILE_START(profileComposite, "sprites composite");
 				GBAVideoSoftwareRendererPostprocessSprite(softwareRenderer, priority);
+				mPROFILE_STOP(profileComposite);
 			}
+			mPROFILE_START(profileBackgrounds, "backgrounds");
 			if (TEST_LAYER_ENABLED(0) && GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) < 2) {
 				GBAVideoSoftwareRendererDrawBackgroundMode0(softwareRenderer, &softwareRenderer->bg[0], y);
 			}
@@ -620,17 +631,33 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 					break;
 				case 1:
 				case 2:
+				{
+					mPROFILE_START(profileMode2, "bg mode2 affine");
 					GBAVideoSoftwareRendererDrawBackgroundMode2(softwareRenderer, &softwareRenderer->bg[2], y);
+					mPROFILE_STOP(profileMode2);
 					break;
+				}
 				case 3:
+				{
+					mPROFILE_START(profileMode3, "bg mode3 bitmap");
 					GBAVideoSoftwareRendererDrawBackgroundMode3(softwareRenderer, &softwareRenderer->bg[2], y);
+					mPROFILE_STOP(profileMode3);
 					break;
+				}
 				case 4:
+				{
+					mPROFILE_START(profileMode4, "bg mode4 bitmap");
 					GBAVideoSoftwareRendererDrawBackgroundMode4(softwareRenderer, &softwareRenderer->bg[2], y);
+					mPROFILE_STOP(profileMode4);
 					break;
+				}
 				case 5:
+				{
+					mPROFILE_START(profileMode5, "bg mode5 bitmap");
 					GBAVideoSoftwareRendererDrawBackgroundMode5(softwareRenderer, &softwareRenderer->bg[2], y);
+					mPROFILE_STOP(profileMode5);
 					break;
+				}
 				}
 			}
 			if (TEST_LAYER_ENABLED(3)) {
@@ -639,14 +666,21 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 					GBAVideoSoftwareRendererDrawBackgroundMode0(softwareRenderer, &softwareRenderer->bg[3], y);
 					break;
 				case 2:
+				{
+					mPROFILE_START(profileMode2, "bg mode2 affine");
 					GBAVideoSoftwareRendererDrawBackgroundMode2(softwareRenderer, &softwareRenderer->bg[3], y);
+					mPROFILE_STOP(profileMode2);
 					break;
 				}
+				}
 			}
+			mPROFILE_STOP(profileBackgrounds);
 		}
 	}
 
+	mPROFILE_START(profilePost, "postprocess");
 	GBAVideoSoftwareRendererPostprocessBuffer(softwareRenderer);
+	mPROFILE_STOP(profilePost);
 
 	if (GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) != 0) {
 		if (softwareRenderer->bg[2].enabled == ENABLED_MAX) {
@@ -676,6 +710,7 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 		DIRTY_SCANLINE(softwareRenderer, y);
 	}
 
+	mPROFILE_START(profileCopy, "copy out");
 	int x;
 	if (softwareRenderer->greenswap) {
 		for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; x += 4) {
@@ -701,6 +736,7 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 		memcpy(row, softwareRenderer->row, GBA_VIDEO_HORIZONTAL_PIXELS * sizeof(*row));
 #endif
 	}
+	mPROFILE_STOP(profileCopy);
 }
 
 static void GBAVideoSoftwareRendererFinishFrame(struct GBAVideoRenderer* renderer) {
@@ -869,7 +905,9 @@ void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* s
 	}
 
 	if (softwareRenderer->blendDirty) {
+		mPROFILE_START(profilePalettes, "palette recompute");
 		_updatePalettes(softwareRenderer);
+		mPROFILE_STOP(profilePalettes);
 		softwareRenderer->blendDirty = false;
 	}
 	softwareRenderer->forceTarget1 = false;
@@ -966,7 +1004,9 @@ int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRendere
 	int spriteLayers = 0;
 	if (GBARegisterDISPCNTIsObjEnable(renderer->dispcnt) && !renderer->d.disableOBJ) {
 		if (renderer->oamDirty) {
+			mPROFILE_START(profileOam, "OAM rebuild");
 			renderer->oamMax = GBAVideoRendererCleanOAM(renderer->d.oam->obj, renderer->sprites, renderer->objOffsetY);
+			mPROFILE_STOP(profileOam);
 			renderer->oamDirty = false;
 		}
 		int mosaicV = GBAMosaicControlGetObjV(renderer->mosaic) + 1;
@@ -997,7 +1037,16 @@ int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRendere
 					continue;
 				}
 
+#ifdef M_PROFILE
+				static const char* const spriteKinds[4] = {
+					"sprite 4bpp", "sprite 8bpp", "sprite affine 4bpp", "sprite affine 8bpp"
+				};
+				const char* spriteKind = spriteKinds[(GBAObjAttributesAIs256Color(sprite->obj.a) ? 1 : 0) |
+				                                     (GBAObjAttributesAIsTransformed(sprite->obj.a) ? 2 : 0)];
+#endif
+				mPROFILE_START(profileSprite, spriteKind);
 				int drawn = GBAVideoSoftwareRendererPreprocessSprite(renderer, &sprite->obj, sprite->index, localY);
+				mPROFILE_STOP(profileSprite);
 				spriteLayers |= drawn << GBAObjAttributesCGetPriority(sprite->obj.c);
 			}
 			renderer->spriteCyclesRemaining -= sprite->cycles;

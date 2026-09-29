@@ -5,6 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include "gba/renderers/software-private.h"
 
+#include <mgba/core/profile.h>
 #include <mgba/internal/gba/gba.h>
 
 #define BACKGROUND_TEXT_SELECT_CHARACTER \
@@ -582,8 +583,17 @@ void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer
 		background->yCache = inY >> 3;
 	}
 
+#ifdef M_PROFILE
+	bool profileMosaic = background->mosaic && GBAMosaicControlGetBgH(renderer->mosaic);
+#endif
 #define CALL_BACKGROUND_MODE_0(BPP, BLEND, OBJWIN) \
-	_drawBackgroundMode0_ ## BPP ## _ ## BLEND ## _ ## OBJWIN(renderer, background, inX, inY, length, yBase, mainPalette)
+	do { \
+		mPROFILE_START(profileBackground, profileMosaic ? \
+			"bg mode0 " #BPP "col " #BLEND " " #OBJWIN " mosaic" : \
+			"bg mode0 " #BPP "col " #BLEND " " #OBJWIN); \
+		_drawBackgroundMode0_ ## BPP ## _ ## BLEND ## _ ## OBJWIN(renderer, background, inX, inY, length, yBase, mainPalette); \
+		mPROFILE_STOP(profileBackground); \
+	} while (0)
 
 	if (!objwinSlowPath) {
 		if (!(flags & FLAG_TARGET_2)) {

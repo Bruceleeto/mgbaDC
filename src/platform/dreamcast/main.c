@@ -2,12 +2,16 @@
 #include <mgba/core/core.h>
 #include <mgba/core/blip_buf.h>
 #include <mgba/core/log.h>
+#include <mgba/core/profile.h>
 #include <mgba/internal/gba/input.h>
 
 #include <kos.h>
 #include <dc/pvr.h>
 #include <dc/maple/controller.h>
 #include <dc/sound/stream.h>
+#ifdef M_PROFILE
+#include <dc/perfctr.h>
+#endif
 
 #define TEXTURE_SIZE 256
 #define SAMPLE_RATE 32768
@@ -36,6 +40,19 @@ static void logMessage(struct mLogger* logger, int category, enum mLogLevel leve
 }
 
 static struct mLogger logger = { .log = logMessage };
+
+#ifdef M_PROFILE
+#define PROFILE_CYCLES_PER_MS 200000.0
+
+/* Low words of performance counters PRFC0 and PRFC1 (SH7750 PMCTR1L/PMCTR2L). */
+static uint32_t profileCycles(void) {
+	return *(volatile uint32_t*) 0xFF100008;
+}
+
+static uint32_t profileStallCycles(void) {
+	return *(volatile uint32_t*) 0xFF100010;
+}
+#endif
 
 static void* audioCallback(snd_stream_hnd_t handle, int requested, int* received) {
 	(void) handle;
@@ -180,6 +197,7 @@ int main(int argc, char** argv) {
 	mCoreInitConfig(core, "dreamcast");
 	mCoreConfigSetDefaultIntValue(&core->config, "volume", 0x100);
 	mCoreConfigSetDefaultIntValue(&core->config, "useBios", 1);
+	mCoreConfigSetDefaultValue(&core->config, "idleOptimization", "detect");
 	char biosPath[32];
 	snprintf(biosPath, sizeof(biosPath), "%s/gba_bios.bin", root);
 	mCoreConfigSetDefaultValue(&core->config, "bios", biosPath);
@@ -224,6 +242,23 @@ int main(int argc, char** argv) {
 	if (sound == SND_STREAM_INVALID) goto cleanup;
 	snd_stream_start(sound, SAMPLE_RATE, 1);
 	printf("mgba-dc: native PVR/Maple/AICA frontend, ROM: %s\n", path);
+#ifdef M_PROFILE
+	/* PRFC0 counts CPU cycles for KOS's ns timer; the low word alone is fine
+	 * for the profiler's short, wrapping intervals. PRFC1 alternates between
+	 * instruction- and data-cache miss stall cycles, one per report. */
+	if (!perf_cntr_timer_enabled()) perf_cntr_timer_enable();
+	static const struct {
+		perf_cntr_event_t mode;
+		const char* label;
+	} profileStalls[] = {
+		{ PMCR_PIPELINE_FREEZE_BY_ICACHE_MISS_MODE, "I$ stall" },
+		{ PMCR_PIPELINE_FREEZE_BY_DCACHE_MISS_MODE, "D$ stall" },
+	};
+	unsigned profileStall = 0;
+	perf_cntr_start(PRFC1, profileStalls[profileStall].mode, PMCR_COUNT_CPU_CYCLES);
+	mProfileClock = profileCycles;
+	mProfileEvents = profileStallCycles;
+#endif
 	uint64_t profileStart = timer_us_gettime64();
 	uint64_t profileInput = 0, profileCore = 0, profileAudio = 0;
 	unsigned profileFrames = 0;
@@ -248,6 +283,15 @@ int main(int argc, char** argv) {
 			       profileFrames * 1000000.0 / (now - profileStart),
 			       profileInput / divisor, profileCore / divisor, profileAudio / divisor,
 			       profileWait / divisor, profileUpload / divisor, profileSubmit / divisor);
+#ifdef M_PROFILE
+			printf("  -- %s column: %% of each section's cycles stalled on %s misses --\n",
+			       profileStalls[profileStall].label,
+			       profileStall ? "data cache" : "instruction cache");
+			mProfilePrint(profileCore / divisor, profileFrames, PROFILE_CYCLES_PER_MS,
+			              profileStalls[profileStall].label);
+			profileStall = (profileStall + 1) % (sizeof(profileStalls) / sizeof(profileStalls[0]));
+			perf_cntr_start(PRFC1, profileStalls[profileStall].mode, PMCR_COUNT_CPU_CYCLES);
+#endif
 			profileStart = timer_us_gettime64();
 			profileFrames = 0;
 			profileInput = profileCore = profileAudio = 0;
