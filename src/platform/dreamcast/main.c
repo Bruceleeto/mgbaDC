@@ -22,6 +22,7 @@ static color_t pixels[TEXTURE_SIZE * TEXTURE_SIZE] __attribute__((aligned(32)));
 static int16_t audioRing[AUDIO_FRAMES][2];
 static int16_t audioOutput[AUDIO_FRAMES][2] __attribute__((aligned(32)));
 static unsigned audioRead, audioWrite, audioCount;
+static uint64_t profileWait, profileUpload, profileSubmit;
 
 static void logMessage(struct mLogger* logger, int category, enum mLogLevel level,
                        const char* format, va_list args) {
@@ -110,8 +111,13 @@ static void present(pvr_ptr_t texture, const pvr_poly_hdr_t* header,
                     unsigned width, unsigned height) {
 	/* Finish the preceding render before overwriting its texture. The padded
 	 * stride lets KOS upload directly with store queues, without swizzling. */
+	uint64_t start = timer_us_gettime64();
 	pvr_wait_ready();
+	uint64_t ready = timer_us_gettime64();
 	pvr_txr_load(pixels, texture, TEXTURE_SIZE * height * sizeof(color_t));
+	uint64_t uploaded = timer_us_gettime64();
+	profileWait += ready - start;
+	profileUpload += uploaded - ready;
 	pvr_scene_begin();
 	pvr_list_begin(PVR_LIST_OP_POLY);
 	pvr_prim(header, sizeof(*header));
@@ -140,6 +146,7 @@ static void present(pvr_ptr_t texture, const pvr_poly_hdr_t* header,
 	pvr_prim(&vertex, sizeof(vertex));
 	pvr_list_finish();
 	pvr_scene_finish();
+	profileSubmit += timer_us_gettime64() - uploaded;
 }
 
 int main(int argc, char** argv) {
@@ -217,11 +224,35 @@ int main(int argc, char** argv) {
 	if (sound == SND_STREAM_INVALID) goto cleanup;
 	snd_stream_start(sound, SAMPLE_RATE, 1);
 	printf("mgba-dc: native PVR/Maple/AICA frontend, ROM: %s\n", path);
-	while (updateInput(core)) {
+	uint64_t profileStart = timer_us_gettime64();
+	uint64_t profileInput = 0, profileCore = 0, profileAudio = 0;
+	unsigned profileFrames = 0;
+	while (true) {
+		uint64_t start = timer_us_gettime64();
+		if (!updateInput(core)) break;
+		uint64_t inputDone = timer_us_gettime64();
 		core->runFrame(core);
+		uint64_t coreDone = timer_us_gettime64();
 		collectAudio(core);
 		snd_stream_poll(sound);
+		uint64_t audioDone = timer_us_gettime64();
 		present(texture, &header, width, height);
+		uint64_t now = timer_us_gettime64();
+		profileInput += inputDone - start;
+		profileCore += coreDone - inputDone;
+		profileAudio += audioDone - coreDone;
+		++profileFrames;
+		if (now - profileStart >= 1000000) {
+			double divisor = profileFrames * 1000.0;
+			printf("FPS %.1f | ms/frame: input %.2f core %.2f audio %.2f PVR-wait %.2f upload %.2f submit %.2f\n",
+			       profileFrames * 1000000.0 / (now - profileStart),
+			       profileInput / divisor, profileCore / divisor, profileAudio / divisor,
+			       profileWait / divisor, profileUpload / divisor, profileSubmit / divisor);
+			profileStart = timer_us_gettime64();
+			profileFrames = 0;
+			profileInput = profileCore = profileAudio = 0;
+			profileWait = profileUpload = profileSubmit = 0;
+		}
 	}
 	result = 0;
 cleanup:
