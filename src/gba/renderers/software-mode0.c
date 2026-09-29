@@ -494,6 +494,47 @@
 		return; \
 	}
 
+/* Each blend/objwin/depth combination is its own function. Combined, they are
+ * far larger than small instruction caches (e.g. 8KiB on SH-4), but only one
+ * runs per background line. */
+#define DEFINE_BACKGROUND_MODE_0(BPP, BLEND, OBJWIN) \
+	static ATTRIBUTE_NOINLINE void _drawBackgroundMode0_ ## BPP ## _ ## BLEND ## _ ## OBJWIN( \
+		struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareBackground* background, \
+		int inX, int inY, int length, unsigned yBase, color_t* mainPalette) { \
+		uint16_t mapData; \
+		int localX; \
+		int localY; \
+		unsigned xBase; \
+		uint32_t flags = background->flags; \
+		uint32_t objwinFlags = background->objwinFlags; \
+		uint32_t screenBase; \
+		uint32_t charBase; \
+		color_t* palette = mainPalette; \
+		PREPARE_OBJWIN; \
+		UNUSED(objwinSlowPath); \
+		UNUSED(objwinOnly); \
+		UNUSED(objwinFlags); \
+		int outX = renderer->start; \
+		uint32_t tileData; \
+		uint32_t current; \
+		int pixelData; \
+		int paletteData; \
+		UNUSED(paletteData); \
+		int tileX = 0; \
+		int tileEnd = ((length + inX) >> 3) - (inX >> 3); \
+		uint16_t* vram = renderer->d.vram; \
+		DRAW_BACKGROUND_MODE_0(BPP, BLEND, OBJWIN); \
+	}
+
+DEFINE_BACKGROUND_MODE_0(16, NoBlend, NO_OBJWIN)
+DEFINE_BACKGROUND_MODE_0(256, NoBlend, NO_OBJWIN)
+DEFINE_BACKGROUND_MODE_0(16, Blend, NO_OBJWIN)
+DEFINE_BACKGROUND_MODE_0(256, Blend, NO_OBJWIN)
+DEFINE_BACKGROUND_MODE_0(16, NoBlend, OBJWIN)
+DEFINE_BACKGROUND_MODE_0(256, NoBlend, OBJWIN)
+DEFINE_BACKGROUND_MODE_0(16, Blend, OBJWIN)
+DEFINE_BACKGROUND_MODE_0(256, Blend, OBJWIN)
+
 void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareBackground* background, int y) {
 	int inX = (renderer->start + background->x - background->offsetX) & 0x1FF;
 	int length = renderer->end - renderer->start;
@@ -513,16 +554,11 @@ void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer
 	yBase = (background->screenBase >> 1) + (yBase << 2);
 
 	int localX;
-	int localY;
-
 	unsigned xBase;
-
+	uint32_t screenBase;
 	uint32_t flags = background->flags;
-	uint32_t objwinFlags = background->objwinFlags;
 	bool variant = background->variant;
 
-	uint32_t screenBase;
-	uint32_t charBase;
 	color_t* mainPalette = renderer->normalPalette;
 	if (renderer->d.highlightAmount && background->highlight) {
 		mainPalette = renderer->highlightPalette;
@@ -533,20 +569,11 @@ void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer
 			mainPalette = renderer->highlightVariantPalette;
 		}
 	}
-	color_t* palette = mainPalette;
-	PREPARE_OBJWIN;
-
-	int outX = renderer->start;
-
-	uint32_t tileData;
-	uint32_t current;
-	int pixelData;
-	int paletteData;
-	int tileX;
-	int tileEnd = ((length + inX) >> 3) - (inX >> 3);
+	bool objwinSlowPath = GBARegisterDISPCNTIsObjwinEnable(renderer->dispcnt);
 	uint16_t* vram = renderer->d.vram;
 
 	if (background->yCache != inY >> 3) {
+		int tileX;
 		localX = 0;
 		for (tileX = 0; tileX < 64; ++tileX, localX += 8) {
 			BACKGROUND_TEXT_SELECT_CHARACTER;
@@ -555,34 +582,37 @@ void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer
 		background->yCache = inY >> 3;
 	}
 
-	tileX = 0;
+#define CALL_BACKGROUND_MODE_0(BPP, BLEND, OBJWIN) \
+	_drawBackgroundMode0_ ## BPP ## _ ## BLEND ## _ ## OBJWIN(renderer, background, inX, inY, length, yBase, mainPalette)
+
 	if (!objwinSlowPath) {
 		if (!(flags & FLAG_TARGET_2)) {
 			if (!background->multipalette) {
-				DRAW_BACKGROUND_MODE_0(16, NoBlend, NO_OBJWIN);
+				CALL_BACKGROUND_MODE_0(16, NoBlend, NO_OBJWIN);
 			} else {
-				DRAW_BACKGROUND_MODE_0(256, NoBlend, NO_OBJWIN);
+				CALL_BACKGROUND_MODE_0(256, NoBlend, NO_OBJWIN);
 			}
 		} else {
 			if (!background->multipalette) {
-				DRAW_BACKGROUND_MODE_0(16, Blend, NO_OBJWIN);
+				CALL_BACKGROUND_MODE_0(16, Blend, NO_OBJWIN);
 			} else {
-				DRAW_BACKGROUND_MODE_0(256, Blend, NO_OBJWIN);
+				CALL_BACKGROUND_MODE_0(256, Blend, NO_OBJWIN);
 			}
 		}
 	} else {
 		if (!(flags & FLAG_TARGET_2)) {
 			if (!background->multipalette) {
-				DRAW_BACKGROUND_MODE_0(16, NoBlend, OBJWIN);
+				CALL_BACKGROUND_MODE_0(16, NoBlend, OBJWIN);
 			} else {
-				DRAW_BACKGROUND_MODE_0(256, NoBlend, OBJWIN);
+				CALL_BACKGROUND_MODE_0(256, NoBlend, OBJWIN);
 			}
 		} else {
 			if (!background->multipalette) {
-				DRAW_BACKGROUND_MODE_0(16, Blend, OBJWIN);
+				CALL_BACKGROUND_MODE_0(16, Blend, OBJWIN);
 			} else {
-				DRAW_BACKGROUND_MODE_0(256, Blend, OBJWIN);
+				CALL_BACKGROUND_MODE_0(256, Blend, OBJWIN);
 			}
 		}
 	}
+#undef CALL_BACKGROUND_MODE_0
 }
