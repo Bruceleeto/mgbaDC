@@ -328,6 +328,16 @@ int main(int argc, char** argv) {
 			       (unsigned) jitStats.blocksCompiled, (unsigned) jitStats.guestInsnsCompiled,
 			       (unsigned) jitStats.codeBytes, (unsigned) jitStats.flushes,
 			       (unsigned) jitStats.invalidations, (unsigned) jitStats.fallbackSteps);
+#ifdef M_ARM_JIT_FASTMEM
+			{
+				extern uint32_t fastmem_count;
+				static uint32_t lastFaults;
+				printf("  fastmem: %u faults/frame\n", (unsigned) ((fastmem_count - lastFaults) / profileFrames));
+				lastFaults = fastmem_count;
+			}
+#else
+			printf("  fastmem: off\n");
+#endif
 #endif
 #ifdef M_PROFILE
 			printf("  -- %s column: %% of each section's cycles stalled on %s misses --\n",

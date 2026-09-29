@@ -10,6 +10,7 @@
  * ARMJITRun deals with the exit so the cpu is left exactly between two
  * instructions, as the interpreter would leave it. */
 #include "jit-private.h"
+#include <stdio.h>
 
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/gba/gba.h>
@@ -105,8 +106,17 @@ bool ARMJITInit(struct ARMCore* cpu) {
 		ARMJITHostMap(jit, gba->memory.rom, SIZE_CART0);
 	}
 #endif
+#ifdef JIT_FASTMEM
+	jit->fastmem = ARMJITFastmemInit(jit);
+#endif
+#ifndef __sh__
+	jit->fastmem = getenv("JIT_FASTMEM") != NULL;
+#endif
 	ARMJITEmitStubs(jit);
 	jit->codeBase = jit->codeUsed;
+#ifdef JIT_FASTMEM
+	ARMJITFastmemInstall(jit);
+#endif
 	jit->timingKey = ARMJITTimingKey(cpu);
 	ARMJITUpdateMemory(jit);
 
@@ -131,6 +141,9 @@ void ARMJITDeinit(struct ARMCore* cpu) {
 	cpu->memory.store32 = jit->store32;
 	cpu->memory.store16 = jit->store16;
 	cpu->memory.store8 = jit->store8;
+#ifdef JIT_FASTMEM
+	ARMJITFastmemDeinit(jit);
+#endif
 	cpu->memory.storeMultiple = jit->storeMultiple;
 	int i, j;
 	for (i = 0; i < 16; ++i) {
@@ -173,6 +186,9 @@ void ARMJITFlush(struct ARMCore* cpu) {
 	jit->nBlocks = 0;
 	jit->codeUsed = jit->codeBase;
 	++jit->stats.flushes;
+#ifdef JIT_FASTMEM
+	ARMJITFastmemUnprotect(jit);
+#endif
 }
 
 void ARMJITGetStats(struct ARMCore* cpu, struct ARMJITStats* stats) {
@@ -289,6 +305,9 @@ static void _link(struct ARMJIT* jit, struct JITBlock* block) {
 		block->next[i] = jit->chunks[block->chunk[i]];
 		jit->chunks[block->chunk[i]] = block;
 	}
+#ifdef JIT_FASTMEM
+	ARMJITFastmemProtect(jit, block->pc, block->end);
+#endif
 }
 
 static void _hashInsert(struct ARMJIT* jit, const struct JITBlock* block) {

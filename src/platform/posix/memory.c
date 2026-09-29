@@ -26,7 +26,24 @@ void mappedMemoryFree(void* memory, size_t size) {
 	munmap(memory, size);
 }
 #else
+#ifdef __DREAMCAST__
+#include <malloc.h>
+#endif
+
 void* anonymousMemoryMap(size_t size) {
+#ifdef __DREAMCAST__
+	// Aligned as a guest region is, so the JIT can map it with large pages
+	// (src/arm/jit/fastmem.c)
+	size_t align = size >= 0x100000 ? 0x100000 : size >= 0x10000 ? 0x10000 : 0;
+	if (align) {
+		size = (size + align - 1) & ~(align - 1);
+		void* memory = memalign(align, size);
+		if (memory) {
+			memset(memory, 0, size);
+		}
+		return memory;
+	}
+#endif
 	return calloc(1, size);
 }
 

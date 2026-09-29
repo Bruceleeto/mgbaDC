@@ -131,6 +131,10 @@ static void GBAInit(void* cpu, struct mCPUComponent* component) {
 	gba->irqEvent.priority = 0;
 }
 
+#ifdef __DREAMCAST__
+static void* dcRom;
+#endif
+
 void GBAUnloadROM(struct GBA* gba) {
 	GBAMemoryClearAGBPrint(gba);
 	if (gba->memory.rom && !gba->isPristine) {
@@ -145,6 +149,12 @@ void GBAUnloadROM(struct GBA* gba) {
 	if (gba->romVf) {
 #ifndef FIXED_ROM_BUFFER
 		if (gba->isPristine && gba->memory.rom) {
+#ifdef __DREAMCAST__
+			if (gba->memory.rom == dcRom) {
+				mappedMemoryFree(dcRom, gba->pristineRomSize);
+				dcRom = NULL;
+			} else
+#endif
 			gba->romVf->unmap(gba->romVf, gba->memory.rom, gba->pristineRomSize);
 		}
 #endif
@@ -437,7 +447,16 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 		memcpy(&gba->memory.rom[0x80000], gba->memory.rom, 0x00100000);
 		memcpy(&gba->memory.rom[0xC0000], gba->memory.rom, 0x00100000);
 	} else {
+#ifdef __DREAMCAST__
+		// On a 1 MiB boundary, so the JIT can map it (src/arm/jit/fastmem.c)
+		dcRom = anonymousMemoryMap(gba->pristineRomSize);
+		if (dcRom) {
+			vf->read(vf, dcRom, gba->pristineRomSize);
+		}
+		gba->memory.rom = dcRom;
+#else
 		gba->memory.rom = vf->map(vf, gba->pristineRomSize, MAP_READ);
+#endif
 		gba->memory.romSize = gba->pristineRomSize;
 	}
 	if (!gba->memory.rom) {

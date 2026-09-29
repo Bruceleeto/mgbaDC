@@ -1095,6 +1095,7 @@ void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* s
 		softwareRenderer->blendDirty = false;
 	}
 	softwareRenderer->forceTarget1 = false;
+	softwareRenderer->fastSpritesDirect = false;
 
 	if (fillRow) {
 		_fillBackdrop(softwareRenderer);

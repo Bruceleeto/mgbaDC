@@ -178,9 +178,24 @@ struct ARMJIT {
 	uint32_t (*storeMultiple)(struct ARMCore*, uint32_t baseAddress, int mask, enum LSMDirection direction,
 	                          int* cycleCounter);
 
+	/* Memory accesses go straight to guest addresses (fastmem.c) */
+	bool fastmem;
+
 	struct ARMJITStats stats;
 	struct ARMJITHost* host;
 };
+
+/* fastmem.c */
+#if defined(__sh__) && defined(__DREAMCAST__) && defined(M_ARM_JIT_FASTMEM)
+#define JIT_FASTMEM
+bool ARMJITFastmemInit(struct ARMJIT* jit);
+void ARMJITFastmemInstall(struct ARMJIT* jit);
+void ARMJITFastmemDeinit(struct ARMJIT* jit);
+void ARMJITFastmemUpdate(struct ARMJIT* jit);
+void ARMJITFastmemProtect(struct ARMJIT* jit, uint32_t start, uint32_t end);
+void ARMJITFastmemUnprotect(struct ARMJIT* jit);
+uint32_t ARMJITFastmemFaults(void);
+#endif
 
 /* jit-emit.c */
 struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint32_t pc, bool thumb,

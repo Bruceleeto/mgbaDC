@@ -214,6 +214,19 @@ struct GBAVideoSoftwareRenderer {
 		uint8_t priority;
 		uint8_t kind;
 	} fastSprites[128];
+
+	// The sprites of a line that go straight into the output row, in OAM
+	// order
+	bool fastSpritesDirect;
+	int nFastLine;
+	struct GBAVideoSoftwareFastLine {
+		// yBase for a regular sprite
+		int32_t xAccum;
+		int32_t yAccum;
+		int16_t outX;
+		uint8_t index;
+		uint8_t priority;
+	} fastLine[128];
 };
 
 void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer);

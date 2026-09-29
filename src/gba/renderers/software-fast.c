@@ -613,6 +613,132 @@ ATTRIBUTE_HOT_GROUP(2) static ATTRIBUTE_NOINLINE void _spriteAffine256(struct GB
 	}
 }
 
+#ifdef COLOR_16_BIT
+// The same sprites straight into the output row. Under: only where the row
+// is still empty, for the front to back pass.
+FAST_INLINE void _directNormal(struct GBAVideoSoftwareRenderer* renderer, const struct GBAVideoSoftwareFastSprite* sprite, unsigned yBase, color_t* top, uint32_t skip, bool under, bool bpp8) {
+	const int group = bpp8 ? 4 : 8;
+	const int bits = bpp8 ? 8 : 4;
+	const uint16_t* vramBase = &renderer->d.vram[BASE_TILE >> 1];
+	const color_t* palette = sprite->palette;
+	unsigned charBase = sprite->charBase;
+	unsigned maskLo = sprite->maskLo;
+	int outX = sprite->outX;
+	int condition = sprite->condition;
+	int inX = sprite->inX;
+	bool flip = sprite->kind & FAST_SPRITE_HFLIP;
+	while (outX < condition) {
+		uint32_t word = _spriteWord(vramBase, yBase, charBase, maskLo, inX, bpp8);
+		int sub = inX & (group - 1);
+		if (flip) {
+			word = __builtin_bswap32(word);
+			if (!bpp8) {
+				word = ((word & 0x0F0F0F0F) << 4) | ((word >> 4) & 0x0F0F0F0F);
+			}
+			sub = group - 1 - sub;
+		}
+		int n = group - sub;
+		if (n > condition - outX) {
+			n = condition - outX;
+		}
+		word >>= sub * bits;
+		color_t* pixel = &top[outX];
+		uint32_t here = _spriteBlocks(outX, outX + n);
+		outX += n;
+		inX += flip ? -n : n;
+		if (!word || (under && !(here & ~skip))) {
+			continue;
+		}
+		for (; n; --n, ++pixel) {
+			unsigned p = word & ((1 << bits) - 1);
+			word >>= bits;
+			if (p && (!under || (*pixel & MIX_EMPTY))) {
+				*pixel = palette[p];
+			}
+		}
+	}
+}
+
+FAST_INLINE void _directAffine(struct GBAVideoSoftwareRenderer* renderer, const struct GBAVideoSoftwareFastSprite* sprite, int xAccum, int yAccum, int outX, color_t* top, bool under, bool bpp8) {
+	const uint16_t* vramBase = &renderer->d.vram[BASE_TILE >> 1];
+	const color_t* palette = sprite->palette;
+	unsigned charBase = sprite->charBase;
+	unsigned maskLo = sprite->maskLo;
+	unsigned maskHi = sprite->maskHi;
+	unsigned strideShift = sprite->strideShift;
+	int condition = sprite->condition;
+	int dx = sprite->a;
+	int dy = sprite->c;
+	unsigned widthMask = ~(sprite->width - 1);
+	unsigned heightMask = ~(sprite->height - 1);
+	for (; outX < condition; ++outX) {
+		xAccum += dx;
+		yAccum += dy;
+		int localX = xAccum >> 8;
+		int localY = yAccum >> 8;
+		if ((localX & widthMask) | (localY & heightMask)) {
+			break;
+		}
+		if (under && !(top[outX] & MIX_EMPTY)) {
+			continue;
+		}
+		unsigned p;
+		if (bpp8) {
+			unsigned yBase = ((localY & ~0x7) << strideShift) + (localY & 0x7) * 8 + maskHi;
+			unsigned xBase = (localX & ~0x7) * 8 + (localX & 6);
+			LOAD_16(p, (yBase + ((xBase + charBase) & maskLo)) & 0x7FFE, vramBase);
+			p = (p >> ((localX & 1) << 3)) & 0xFF;
+		} else {
+			unsigned yBase = ((localY & ~0x7) << strideShift) + (localY & 0x7) * 4 + maskHi;
+			unsigned xBase = (localX & ~0x7) * 4 + ((localX >> 1) & 2);
+			LOAD_16(p, (yBase + ((xBase + charBase) & maskLo)) & 0x7FFE, vramBase);
+			p = (p >> ((localX & 3) << 2)) & 0xF;
+		}
+		if (p) {
+			top[outX] = palette[p];
+		}
+	}
+}
+
+FAST_INLINE void _directSprite(struct GBAVideoSoftwareRenderer* renderer, const struct GBAVideoSoftwareFastLine* line, color_t* top, uint32_t skip, bool under) {
+	const struct GBAVideoSoftwareFastSprite* sprite = &renderer->fastSprites[line->index];
+	unsigned kind = sprite->kind;
+	if (kind & FAST_SPRITE_AFFINE) {
+		if (kind & FAST_SPRITE_8BPP) {
+			_directAffine(renderer, sprite, line->xAccum, line->yAccum, line->outX, top, under, true);
+		} else {
+			_directAffine(renderer, sprite, line->xAccum, line->yAccum, line->outX, top, under, false);
+		}
+	} else if (kind & FAST_SPRITE_8BPP) {
+		_directNormal(renderer, sprite, line->xAccum, top, skip, under, true);
+	} else {
+		_directNormal(renderer, sprite, line->xAccum, top, skip, under, false);
+	}
+}
+
+// Back to front: the first sprite in OAM goes last
+static ATTRIBUTE_NOINLINE void _directSpritesOver(struct GBAVideoSoftwareRenderer* renderer, color_t* top, unsigned priority) {
+	const struct GBAVideoSoftwareFastLine* first = renderer->fastLine;
+	const struct GBAVideoSoftwareFastLine* line = &first[renderer->nFastLine];
+	while (line > first) {
+		--line;
+		if (line->priority == priority) {
+			_directSprite(renderer, line, top, 0, false);
+		}
+	}
+}
+
+static ATTRIBUTE_NOINLINE void _directSpritesUnder(struct GBAVideoSoftwareRenderer* renderer, color_t* top, unsigned priority, uint32_t skip) {
+	const struct GBAVideoSoftwareFastLine* line = renderer->fastLine;
+	const struct GBAVideoSoftwareFastLine* last = &line[renderer->nFastLine];
+	for (; line < last; ++line) {
+		if (line->priority == priority) {
+			_directSprite(renderer, line, top, skip, true);
+		}
+	}
+}
+#endif
+
 // What GBAVideoSoftwareRendererPreprocessSprite works out from the registers
 // for every sprite
 FAST_INLINE void _spriteKey(struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareFastSpriteKey* key) {
@@ -821,6 +947,166 @@ FAST_INLINE bool _spriteAffineLine(const struct GBAVideoSoftwareFastSprite* spri
 	return outX >= 0 && outX < sprite->condition;
 }
 
+// Whether a BG is one of the line's layers
+FAST_INLINE bool _bgListed(const struct GBAVideoSoftwareRenderer* renderer, int mode, int i, bool* affine) {
+	const struct GBAVideoSoftwareBackground* bg = &renderer->bg[i];
+	if (bg->enabled != ENABLED_MAX || renderer->d.disableBG[i]) {
+		return false;
+	}
+	if (mode == 0) {
+		*affine = false;
+	} else if (mode == 1) {
+		if (i == 3) {
+			return false;
+		}
+		*affine = i == 2;
+	} else {
+		if (i < 2) {
+			return false;
+		}
+		*affine = true;
+	}
+	return true;
+}
+
+// Whether the fast path draws this line, and if it has to blend
+FAST_INLINE bool _plan(const struct GBAVideoSoftwareRenderer* renderer, bool forceTarget1, bool* blendOut) {
+	bool variantFx = renderer->blendEffect == BLEND_BRIGHTEN || renderer->blendEffect == BLEND_DARKEN;
+	if (forceTarget1 && variantFx) {
+		return false;
+	}
+	bool alpha = renderer->blendEffect == BLEND_ALPHA;
+	bool blend = forceTarget1;
+	if (alpha || forceTarget1) {
+		// Sprites can be target 1 through alpha or semi-transparency
+		bool objT1 = forceTarget1 || (alpha && renderer->target1Obj);
+		if (objT1 && renderer->target2Obj) {
+			return false;
+		}
+		blend = blend || objT1;
+		int i;
+		for (i = 0; i < 4; ++i) {
+			const struct GBAVideoSoftwareBackground* bg = &renderer->bg[i];
+			if (bg->enabled != ENABLED_MAX) {
+				continue;
+			}
+			if (alpha && bg->target1) {
+				if (bg->target2) {
+					return false;
+				}
+				blend = true;
+			}
+		}
+	}
+	*blendOut = blend;
+	return true;
+}
+
+#ifdef COLOR_16_BIT
+// Sprites can go straight into the row when drawing them a priority at a
+// time gives what the sprite layer would: no sprite in front of one that's
+// earlier in OAM, none that blend, and none behind a layer that does.
+static ATTRIBUTE_NOINLINE bool _spritesDirect(struct GBAVideoSoftwareRenderer* renderer, int y, int* spriteLayersOut) {
+	bool blend;
+	if (!_plan(renderer, false, &blend)) {
+		return false;
+	}
+	int frontT1 = 3;
+	if (blend) {
+		if (renderer->target1Obj || ((uintptr_t) &renderer->outputBuffer[renderer->outputBufferStride * y] & 3)) {
+			return false;
+		}
+		int mode = GBARegisterDISPCNTGetMode(renderer->dispcnt);
+		frontT1 = -1;
+		int i;
+		for (i = 0; i < 4; ++i) {
+			bool affine;
+			if (!_bgListed(renderer, mode, i, &affine) || !renderer->bg[i].target1) {
+				continue;
+			}
+			if (frontT1 < 0 || (int) renderer->bg[i].priority < frontT1) {
+				frontT1 = renderer->bg[i].priority;
+			}
+		}
+		if (frontT1 < 0) {
+			return false;
+		}
+	}
+
+	int spriteLayers = 0;
+	uint32_t priorityBlocks[4] = { 0, 0, 0, 0 };
+	int cycles = renderer->spriteCyclesRemaining;
+	struct GBAVideoSoftwareFastLine* out = renderer->fastLine;
+	const uint8_t* line = &renderer->spriteLines[renderer->spriteLineStart[y]];
+	const uint8_t* last = &renderer->spriteLines[renderer->spriteLineStart[y + 1]];
+	for (; line < last; ++line) {
+		const struct GBAVideoSoftwareFastSprite* sprite = &renderer->fastSprites[*line];
+		unsigned kind = sprite->kind;
+		unsigned priority = sprite->priority;
+		if (kind & (FAST_SPRITE_SLOW | FAST_SPRITE_FORCE)) {
+			return false;
+		}
+		if (!(kind & FAST_SPRITE_NONE)) {
+			if (sprite->flags & FLAG_TARGET_1) {
+				return false;
+			}
+			uint32_t here = 0;
+			if (kind & FAST_SPRITE_EMPTY) {
+				spriteLayers |= 1 << priority;
+			} else if (kind & FAST_SPRITE_AFFINE) {
+				int outX;
+				int xAccum;
+				int yAccum;
+				if (_spriteAffineLine(sprite, y, &outX, &xAccum, &yAccum)) {
+					here = _spriteBlocks(outX, sprite->condition);
+					out->xAccum = xAccum;
+					out->yAccum = yAccum;
+					out->outX = outX;
+				}
+			} else {
+				int inY = y - sprite->y;
+				if (kind & FAST_SPRITE_VFLIP) {
+					inY = sprite->height - inY - 1;
+				}
+				out->xAccum = ((inY & ~0x7) << sprite->strideShift) + (inY & 0x7) * (kind & FAST_SPRITE_8BPP ? 8 : 4) + sprite->maskHi;
+				here = _spriteBlocks(sprite->outX, sprite->condition);
+			}
+			if (here) {
+				uint32_t behind = priorityBlocks[3];
+				if (priority < 2) {
+					behind |= priorityBlocks[2];
+				}
+				if (priority < 1) {
+					behind |= priorityBlocks[1];
+				}
+				if (here & behind) {
+					return false;
+				}
+				priorityBlocks[priority] |= here;
+				spriteLayers |= 1 << priority;
+				out->index = *line;
+				out->priority = priority;
+				++out;
+			}
+		}
+		cycles -= sprite->cycles;
+		if (cycles <= 0) {
+			break;
+		}
+	}
+	if (spriteLayers >> (frontT1 + 1)) {
+		return false;
+	}
+	renderer->spriteCyclesRemaining = cycles;
+	renderer->nFastLine = out - renderer->fastLine;
+	renderer->fastSpritesDirect = true;
+	renderer->spriteBlocks = 0;
+	renderer->spriteLayerDirty = 0;
+	*spriteLayersOut = spriteLayers;
+	return true;
+}
+#endif
+
 // GBAVideoSoftwareRendererPreprocessSpriteLayer for a line the fast path may
 // take
 ATTRIBUTE_HOT_GROUP(2) ATTRIBUTE_NOINLINE int GBAVideoSoftwareRendererFastSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y) {
@@ -836,6 +1122,11 @@ ATTRIBUTE_HOT_GROUP(2) ATTRIBUTE_NOINLINE int GBAVideoSoftwareRendererFastSprite
 	}
 
 	int spriteLayers = 0;
+#ifdef COLOR_16_BIT
+	if (_spritesDirect(renderer, y, &spriteLayers)) {
+		return spriteLayers;
+	}
+#endif
 	uint32_t blocks = 0;
 	uint32_t priorityBlocks[4] = { 0, 0, 0, 0 };
 	int cycles = renderer->spriteCyclesRemaining;
@@ -1093,7 +1384,9 @@ static void _paintFront(struct GBAVideoSoftwareRenderer* renderer, int y, const 
 		}
 		if (layer->bg < 0) {
 			mPROFILE_START(profileSprites, "fast sprites composite");
-			if (first) {
+			if (renderer->fastSpritesDirect) {
+				_directSpritesUnder(renderer, row->top, layer->priority, row->skip);
+			} else if (first) {
 				_drawSpritesNoBlend(renderer, row, layer->priority);
 			} else {
 				_drawSpritesUnder(renderer, row, layer->priority);
@@ -1136,6 +1429,11 @@ static void _paintLayers(struct GBAVideoSoftwareRenderer* renderer, int y, const
 	for (; nLayers; --nLayers, ++layer) {
 		if (layer->bg < 0) {
 			mPROFILE_START(profileSprites, "fast sprites composite");
+#ifdef COLOR_16_BIT
+			if (renderer->fastSpritesDirect) {
+				_directSpritesOver(renderer, row->top, layer->priority);
+			} else
+#endif
 			if (blend) {
 				_drawSpritesBlend(renderer, row, layer->priority);
 			} else {
@@ -1193,22 +1491,9 @@ static void _paint(struct GBAVideoSoftwareRenderer* renderer, int y, int spriteL
 		int i;
 		for (i = 3; i >= 0; --i) {
 			struct GBAVideoSoftwareBackground* bg = &renderer->bg[i];
-			if (bg->enabled != ENABLED_MAX || renderer->d.disableBG[i] || (int) bg->priority != priority) {
-				continue;
-			}
 			bool affine;
-			if (mode == 0) {
-				affine = false;
-			} else if (mode == 1) {
-				if (i == 3) {
-					continue;
-				}
-				affine = i == 2;
-			} else {
-				if (i < 2) {
-					continue;
-				}
-				affine = true;
+			if ((int) bg->priority != priority || !_bgListed(renderer, mode, i, &affine)) {
+				continue;
 			}
 			layers[nLayers].bg = i;
 			layers[nLayers].priority = priority;
@@ -1295,8 +1580,8 @@ bool GBAVideoSoftwareRendererFastEligible(struct GBAVideoSoftwareRenderer* rende
 // Called after the sprite layer is built. Returns false if the line needs the
 // regular path after all.
 ATTRIBUTE_HOT_GROUP(3) ATTRIBUTE_NOINLINE bool GBAVideoSoftwareRendererDrawFast(struct GBAVideoSoftwareRenderer* renderer, int y, int spriteLayers, color_t* out) {
-	bool variantFx = renderer->blendEffect == BLEND_BRIGHTEN || renderer->blendEffect == BLEND_DARKEN;
-	if (renderer->forceTarget1 && variantFx) {
+	bool blend;
+	if (!_plan(renderer, renderer->forceTarget1, &blend)) {
 		return false;
 	}
 	uint8_t attrs[GBA_VIDEO_HORIZONTAL_PIXELS];
@@ -1305,29 +1590,6 @@ ATTRIBUTE_HOT_GROUP(3) ATTRIBUTE_NOINLINE bool GBAVideoSoftwareRendererDrawFast(
 	row.attr = attrs;
 	row.blda = renderer->blda;
 	row.bldb = renderer->bldb;
-	bool alpha = renderer->blendEffect == BLEND_ALPHA;
-	bool blend = renderer->forceTarget1;
-	if (alpha || renderer->forceTarget1) {
-		// Sprites can be target 1 through alpha or semi-transparency
-		bool objT1 = renderer->forceTarget1 || (alpha && renderer->target1Obj);
-		if (objT1 && renderer->target2Obj) {
-			return false;
-		}
-		blend = blend || objT1;
-		int i;
-		for (i = 0; i < 4; ++i) {
-			struct GBAVideoSoftwareBackground* bg = &renderer->bg[i];
-			if (bg->enabled != ENABLED_MAX) {
-				continue;
-			}
-			if (alpha && bg->target1) {
-				if (bg->target2) {
-					return false;
-				}
-				blend = true;
-			}
-		}
-	}
 	_paint(renderer, y, spriteLayers, &row, blend);
 	return true;
 }

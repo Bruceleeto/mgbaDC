@@ -46,6 +46,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" OR CMAKE_SYSTEM_NAME STREQUAL "
 	if(M_ARM_JIT)
 		add_definitions(-DM_ARM_JIT)
 	endif()
+	# Dreamcast only. Needs the MMU's exceptions, which Flycast doesn't
+	# raise: turn it off for a build that is to run there.
+	option(M_ARM_JIT_FASTMEM "Guest memory through the SH-4's MMU" ON)
+	if(M_ARM_JIT AND M_ARM_JIT_FASTMEM)
+		add_definitions(-DM_ARM_JIT_FASTMEM)
+	endif()
 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		set(BUILD_SDL ON CACHE BOOL "Build SDL frontend" FORCE)
 		set(SDL_VERSION "2" CACHE STRING "Version of SDL to use" FORCE)

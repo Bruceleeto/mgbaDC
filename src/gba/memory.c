@@ -1698,7 +1698,14 @@ void GBAAdjustWaitstates(struct GBA* gba, uint16_t parameters) {
 	memory->waitstatesSeq32[REGION_CART1] = memory->waitstatesSeq32[REGION_CART1_EX] = 2 * memory->waitstatesSeq16[REGION_CART1] + 1;
 	memory->waitstatesSeq32[REGION_CART2] = memory->waitstatesSeq32[REGION_CART2_EX] = 2 * memory->waitstatesSeq16[REGION_CART2] + 1;
 
+#ifdef GBA_EXACT_PREFETCH
 	memory->prefetch = prefetch;
+#else
+	// The prefetch buffer model runs on every access from ROM code. Without
+	// it those pay their full wait, which is what gpSP-style timing does.
+	UNUSED(prefetch);
+	memory->prefetch = false;
+#endif
 
 	cpu->memory.activeSeqCycles32 = memory->waitstatesSeq32[memory->activeRegion];
 	cpu->memory.activeSeqCycles16 = memory->waitstatesSeq16[memory->activeRegion];

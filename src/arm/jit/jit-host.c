@@ -32,7 +32,65 @@ struct ARMJITHost {
 		uint32_t size;
 	} maps[HOST_MAPS];
 	int nMaps;
+	/* JIT_PROFILE=file: SH-4 instructions run per halfword of the buffer */
+	uint32_t* prof;
+	const char* profPath;
 };
+
+static void _profFetch(struct sh4_state* s, uint32_t pc) {
+	struct ARMJIT* jit = s->user;
+	uint32_t off = pc - s->code_at;
+	if (off < s->code_size) {
+		++jit->host->prof[off >> 1];
+	}
+}
+
+static uint64_t _profSum(struct ARMJIT* jit, uint32_t from, uint32_t to) {
+	uint64_t n = 0;
+	uint32_t i;
+	for (i = from >> 1; i < to >> 1; ++i) {
+		n += jit->host->prof[i];
+	}
+	return n;
+}
+
+static void _profDump(struct ARMJIT* jit) {
+	struct ARMJITHost* host = jit->host;
+	FILE* f = fopen(host->profPath, "w");
+	if (!f) {
+		return;
+	}
+	uint64_t total = _profSum(jit, 0, jit->codeSize);
+	fprintf(f, "total %llu stubs %llu code_at %08X\n", (unsigned long long) total,
+	        (unsigned long long) _profSum(jit, 0, jit->codeBase), (uint32_t) (uintptr_t) jit->code);
+	uint32_t i;
+	for (i = 0; i < jit->nBlocks; ++i) {
+		const struct JITBlock* b = &jit->blocks[i];
+		if (b->dead || !b->code) {
+			continue;
+		}
+		uint32_t off = b->code - jit->code;
+		uint64_t n = _profSum(jit, off, off + b->codeSize);
+		if (n) {
+			fprintf(f, "block %08X %c insns %u bytes %u off %u run %llu entry %u\n", b->pc, b->thumb ? 'T' : 'A',
+			        b->nInsns, b->codeSize, off, (unsigned long long) n, host->prof[off >> 1]);
+		}
+	}
+	fclose(f);
+	char path[512];
+	snprintf(path, sizeof(path), "%s.bin", host->profPath);
+	f = fopen(path, "wb");
+	if (f) {
+		fwrite(jit->code, 1, jit->codeUsed, f);
+		fclose(f);
+	}
+	snprintf(path, sizeof(path), "%s.cnt", host->profPath);
+	f = fopen(path, "wb");
+	if (f) {
+		fwrite(host->prof, 4, jit->codeUsed >> 1, f);
+		fclose(f);
+	}
+}
 
 void ARMJITHostMap(struct ARMJIT* jit, const void* p, uint32_t size) {
 	struct ARMJITHost* host = jit->host;
@@ -136,10 +194,19 @@ bool ARMJITHostInit(struct ARMJIT* jit) {
 	s->xlat = _xlat;
 	s->user = jit;
 	jit->host = host;
+	host->profPath = getenv("JIT_PROFILE");
+	if (host->profPath) {
+		host->prof = calloc(jit->codeSize >> 1, sizeof(*host->prof));
+		s->on_fetch = _profFetch;
+	}
 	return true;
 }
 
 void ARMJITHostDeinit(struct ARMJIT* jit) {
+	if (jit->host->prof) {
+		_profDump(jit);
+		free(jit->host->prof);
+	}
 	free(jit->host);
 	jit->host = NULL;
 }
@@ -156,7 +223,39 @@ uint32_t ARMJITHostRun(struct ARMJIT* jit, const void* code) {
 	s->pr = HOST_RETURN;
 	s->ret_at = HOST_RETURN;
 	s->pc = (uint32_t) (uintptr_t) jit->enter;
-	sh4_run(s, HOST_BUDGET);
+	if (jit->fastmem) {
+		/* What fastmem.c's exception entry does, with nothing mapped:
+		 * every access in a block becomes a call of its stub. */
+		static const int8_t ops[8] = {
+			JIT_MEM_STORE8, JIT_MEM_STORE16, JIT_MEM_STORE32, -1,
+			JIT_MEM_LOADS8, JIT_MEM_LOADS16, JIT_MEM_LOAD32, -1
+		};
+		uint32_t lo = s->code_at + jit->codeBase;
+		s->steps = 0;
+		while (!s->stopped && !s->fault) {
+			if (s->steps >= (1u << 24)) {
+				sh4_fault(s, "step budget exhausted", 0);
+				break;
+			}
+			if (s->pc >= lo && s->pc - s->code_at < s->code_size) {
+				uint16_t insn = sh4_fetch(s, s->pc);
+				if ((insn >= 0x6040 && insn <= 0x6042) || (insn >= 0x2450 && insn <= 0x2452)) {
+					int op = ops[(insn & 3) | ((insn >> 12) & 4)];
+					if (op < 0) {
+						sh4_fault(s, "fastmem: not an access", insn);
+						break;
+					}
+					++s->depth;
+					s->pr = s->pc + 2;
+					s->pc = (uint32_t) (uintptr_t) jit->memStubs[0][op];
+					continue;
+				}
+			}
+			sh4_step(s);
+		}
+	} else {
+		sh4_run(s, HOST_BUDGET);
+	}
 	if (s->fault) {
 		fprintf(stderr, "JIT host: %s\n", s->fault_msg);
 		abort();

@@ -11,6 +11,8 @@ if(M_ARM_JIT)
 	list(APPEND SOURCE_FILES jit/jit.c jit/jit-emit.c)
 	if(NOT CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$")
 		list(APPEND SOURCE_FILES jit/jit-host.c)
+	elseif(M_ARM_JIT_FASTMEM)
+		list(APPEND SOURCE_FILES jit/fastmem.c)
 	endif()
 endif()
 

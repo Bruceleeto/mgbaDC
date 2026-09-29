@@ -553,9 +553,52 @@ static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd) {
 	if (store && rd >= 0) {
 		_ld(e, rd, 5);
 	}
-	sh4_emit_mov_l_load_disp(&e->cg, R_STUBS, 1, e->stall * JIT_MEM_OPS + op);
-	sh4_emit_jsr(&e->cg, 1);
-	sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+	if (e->jit->fastmem) {
+		/* The access itself, at the guest's address (fastmem.c). r8 keeps
+		 * it out of the host's half of the address space; what isn't
+		 * mapped faults into the stub, which returns after the access.
+		 * Not in a delay slot, and only these six instructions. */
+		sh4_emit_and(&e->cg, R_STUBS, 4);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+		switch (op) {
+		case JIT_MEM_LOAD32:
+			sh4_emit_mov_l_load(&e->cg, 4, 0);
+			break;
+		case JIT_MEM_LOAD16:
+			sh4_emit_mov_w_load(&e->cg, 4, 0);
+			sh4_emit_extu_w(&e->cg, 0, 0);
+			break;
+		case JIT_MEM_LOADS16:
+			sh4_emit_mov_w_load(&e->cg, 4, 0);
+			break;
+		case JIT_MEM_LOAD8:
+			sh4_emit_mov_b_load(&e->cg, 4, 0);
+			sh4_emit_extu_b(&e->cg, 0, 0);
+			break;
+		case JIT_MEM_LOADS8:
+			sh4_emit_mov_b_load(&e->cg, 4, 0);
+			break;
+		case JIT_MEM_STORE32:
+			sh4_emit_mov_l_store(&e->cg, 5, 4);
+			break;
+		case JIT_MEM_STORE16:
+			sh4_emit_mov_w_store(&e->cg, 5, 4);
+			break;
+		case JIT_MEM_STORE8:
+			sh4_emit_mov_b_store(&e->cg, 5, 4);
+			break;
+		default:
+			break;
+		}
+#ifdef __sh__
+		/* The wait of a region without any */
+		e->pending += store ? 1 : 2;
+#endif
+	} else {
+		sh4_emit_mov_l_load_disp(&e->cg, R_STUBS, 1, e->stall * JIT_MEM_OPS + op);
+		sh4_emit_jsr(&e->cg, 1);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+	}
 	if (!store) {
 		_st(e, 0, rd);
 	}
@@ -1035,6 +1078,9 @@ void ARMJITUpdateMemory(struct ARMJIT* jit) {
 	md[JIT_MD_EWRAM_STM] = memory->waitstatesSeq32[REGION_WORKING_RAM] - memory->waitstatesNonseq32[REGION_WORKING_RAM];
 	md[JIT_MD_EWRAM_LDM] = md[JIT_MD_EWRAM_STM] + 1;
 	md[JIT_MD_EWRAM_WORD] = 1 + memory->waitstatesSeq32[REGION_WORKING_RAM];
+#ifdef JIT_FASTMEM
+	ARMJITFastmemUpdate(jit);
+#endif
 }
 
 /* Once, at the start of the code buffer:
@@ -1065,7 +1111,7 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 	sh4_emit_mov_l_store_dec(&e.cg, 1, 15);
 	sh4_emit_ldc_gbr(&e.cg, 4);
 	sh4_emit_mov_reg(&e.cg, 4, R_CPU);
-	_lit(&e, (uint32_t) (uintptr_t) jit->memStubs, R_STUBS);
+	_lit(&e, jit->fastmem ? 0x0FFFFFFF : (uint32_t) (uintptr_t) jit->memStubs, R_STUBS);
 	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_CYCLES);
 	sh4_emit_mov_reg(&e.cg, 0, R_CYCLES);
 	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_NEXT_EVENT);
