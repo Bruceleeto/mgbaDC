@@ -36,6 +36,16 @@ if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" OR CMAKE_SYSTEM_NAME STREQUAL "
 	if(M_PROFILE)
 		add_definitions(-DM_PROFILE)
 	endif()
+	# ARM -> SH-4 recompiler. Off target it runs under an SH-4 interpreter,
+	# which needs 32-bit host pointers (configure with -m32).
+	if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+		option(M_ARM_JIT "ARM to SH-4 recompiler" ON)
+	else()
+		set(M_ARM_JIT OFF CACHE BOOL "ARM to SH-4 recompiler" FORCE)
+	endif()
+	if(M_ARM_JIT)
+		add_definitions(-DM_ARM_JIT)
+	endif()
 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		set(BUILD_SDL ON CACHE BOOL "Build SDL frontend" FORCE)
 		set(SDL_VERSION "2" CACHE STRING "Version of SDL to use" FORCE)

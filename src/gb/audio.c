@@ -500,6 +500,21 @@ void _updateFrame(struct mTiming* timing, void* user, uint32_t cyclesLate) {
 #endif
 }
 
+/* n / d for the small quotients GBAudioRun sees once per mixed sample: SH-4
+ * has no divide instruction, and the library call costs more than a few
+ * subtractions. */
+static inline int32_t _divSmall(int32_t n, int32_t d) {
+	if (n < 4 * d) {
+		int32_t q = 0;
+		while (n >= d) {
+			n -= d;
+			++q;
+		}
+		return q;
+	}
+	return n / d;
+}
+
 void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 	if (!audio->enable) {
 		return;
@@ -512,7 +527,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 		int period = 4 * (2048 - audio->ch1.control.frequency) * audio->timingFactor;
 		int32_t diff = timestamp - audio->ch1.lastUpdate;
 		if (diff >= period) {
-			diff /= period;
+			diff = _divSmall(diff, period);
 			audio->ch1.index = (audio->ch1.index + diff) & 7;
 			audio->ch1.lastUpdate += diff * period;
 			_updateSquareSample(&audio->ch1);
@@ -522,7 +537,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 		int period = 4 * (2048 - audio->ch2.control.frequency) * audio->timingFactor;
 		int32_t diff = timestamp - audio->ch2.lastUpdate;
 		if (diff >= period) {
-			diff /= period;
+			diff = _divSmall(diff, period);
 			audio->ch2.index = (audio->ch2.index + diff) & 7;
 			audio->ch2.lastUpdate += diff * period;
 			_updateSquareSample(&audio->ch2);
@@ -532,7 +547,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 		int cycles = 2 * (2048 - audio->ch3.rate) * audio->timingFactor;
 		int32_t diff = timestamp - audio->ch3.nextUpdate;
 		if (diff >= 0) {
-			diff = (diff / cycles) + 1;
+			diff = _divSmall(diff, cycles) + 1;
 			int volume;
 			switch (audio->ch3.volume) {
 			case 0:

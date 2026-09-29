@@ -3,7 +3,11 @@
 #include <mgba/core/blip_buf.h>
 #include <mgba/core/log.h>
 #include <mgba/core/profile.h>
+#include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/input.h>
+#ifdef DC_JIT
+#include <mgba/internal/arm/jit.h>
+#endif
 
 #include <kos.h>
 #include <dc/pvr.h>
@@ -70,6 +74,26 @@ static void* audioCallback(snd_stream_hnd_t handle, int requested, int* received
 	return audioOutput;
 }
 
+static void pushAudio(int16_t left, int16_t right) {
+	if (audioCount == AUDIO_FRAMES) {
+		audioRead = (audioRead + 1) % AUDIO_FRAMES;
+		--audioCount;
+	}
+	audioRing[audioWrite][0] = left;
+	audioRing[audioWrite][1] = right;
+	audioWrite = (audioWrite + 1) % AUDIO_FRAMES;
+	++audioCount;
+}
+
+/* The core mixes at SAMPLE_RATE unless the game changes SOUNDBIAS's
+ * resolution: then its samples come through blip_buf instead. */
+static void directAudio(void* context, const struct mStereoSample* samples, int count) {
+	(void) context;
+	for (int i = 0; i < count; ++i) {
+		pushAudio(samples[i].left, samples[i].right);
+	}
+}
+
 static void collectAudio(struct mCore* core) {
 	struct blip_t* left = core->getAudioChannel(core, 0);
 	struct blip_t* right = core->getAudioChannel(core, 1);
@@ -88,14 +112,7 @@ static void collectAudio(struct mCore* core) {
 		blip_read_samples(left, &samples[0][0], count, 1);
 		blip_read_samples(right, &samples[0][1], count, 1);
 		for (int i = 0; i < count; ++i) {
-			if (audioCount == AUDIO_FRAMES) {
-				audioRead = (audioRead + 1) % AUDIO_FRAMES;
-				--audioCount;
-			}
-			audioRing[audioWrite][0] = samples[i][0];
-			audioRing[audioWrite][1] = samples[i][1];
-			audioWrite = (audioWrite + 1) % AUDIO_FRAMES;
-			++audioCount;
+			pushAudio(samples[i][0], samples[i][1]);
 		}
 	}
 }
@@ -221,9 +238,19 @@ int main(int argc, char** argv) {
 	}
 	core->setVideoBuffer(core, pixels, TEXTURE_SIZE);
 	core->setAudioBufferSize(core, 2048);
+#ifdef DC_JIT
+	if (!ARMJITInit(core->cpu)) {
+		printf("mgba-dc: JIT init failed, using the interpreter\n");
+	}
+#endif
 	core->reset(core);
 	blip_set_rates(core->getAudioChannel(core, 0), core->frequency(core), SAMPLE_RATE);
 	blip_set_rates(core->getAudioChannel(core, 1), core->frequency(core), SAMPLE_RATE);
+	if (core->platform(core) == mPLATFORM_GBA) {
+		struct GBAAudio* gbaAudio = &((struct GBA*) core->board)->audio;
+		gbaAudio->directOutput = directAudio;
+		gbaAudio->directInterval = GBA_ARM7TDMI_FREQUENCY / SAMPLE_RATE;
+	}
 	vid_set_mode(DM_640x480, PM_RGB565);
 	if (pvr_init_defaults() < 0) goto cleanup;
 	videoInitialized = true;
@@ -283,6 +310,14 @@ int main(int argc, char** argv) {
 			       profileFrames * 1000000.0 / (now - profileStart),
 			       profileInput / divisor, profileCore / divisor, profileAudio / divisor,
 			       profileWait / divisor, profileUpload / divisor, profileSubmit / divisor);
+#ifdef DC_JIT
+			struct ARMJITStats jitStats;
+			ARMJITGetStats(core->cpu, &jitStats);
+			printf("  JIT: %u blocks, %u insns, %u code bytes, %u flushes, %u invalidations, %u fallback steps\n",
+			       (unsigned) jitStats.blocksCompiled, (unsigned) jitStats.guestInsnsCompiled,
+			       (unsigned) jitStats.codeBytes, (unsigned) jitStats.flushes,
+			       (unsigned) jitStats.invalidations, (unsigned) jitStats.fallbackSteps);
+#endif
 #ifdef M_PROFILE
 			printf("  -- %s column: %% of each section's cycles stalled on %s misses --\n",
 			       profileStalls[profileStall].label,

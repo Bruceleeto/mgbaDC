@@ -8,6 +8,9 @@
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/gba/bios.h>
 #include <mgba/internal/gba/io.h>
+#ifdef M_ARM_JIT
+#include <mgba/internal/arm/jit.h>
+#endif
 
 #include <mgba-util/memory.h>
 #include <mgba-util/vfs.h>
@@ -210,6 +213,11 @@ bool GBADeserialize(struct GBA* gba, const struct GBASerializedState* state) {
 	if (gba->memory.matrix.size) {
 		GBAMatrixDeserialize(gba, state);
 	}
+
+#ifdef M_ARM_JIT
+	/* RAM was replaced wholesale, code in it included. */
+	ARMJITFlush(gba->cpu);
+#endif
 
 	mTimingInterrupt(&gba->timing);
 

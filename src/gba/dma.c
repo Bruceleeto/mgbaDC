@@ -5,6 +5,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/gba/dma.h>
 
+#include <mgba/internal/arm/macros.h>
+
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/io.h>
 
@@ -240,80 +242,240 @@ void GBADMAUpdate(struct GBA* gba) {
 	}
 }
 
+// The common shapes, RAM or ROM into palette, VRAM or OAM, done inline: the
+// same loads, stores and renderer notifications GBALoad/GBAStore would do,
+// without two calls through the memory handlers per unit.
+static bool _fastLoad(struct GBAMemory* memory, uint32_t address, uint32_t width, uint32_t* value) {
+	switch (address >> BASE_OFFSET) {
+	case REGION_WORKING_RAM:
+		if (width == 4) {
+			LOAD_32(*value, address & (SIZE_WORKING_RAM - 4), memory->wram);
+		} else {
+			LOAD_16(*value, address & (SIZE_WORKING_RAM - 2), memory->wram);
+		}
+		return true;
+	case REGION_WORKING_IRAM:
+		if (width == 4) {
+			LOAD_32(*value, address & (SIZE_WORKING_IRAM - 4), memory->iwram);
+		} else {
+			LOAD_16(*value, address & (SIZE_WORKING_IRAM - 2), memory->iwram);
+		}
+		return true;
+	case REGION_CART0:
+	case REGION_CART0_EX:
+	case REGION_CART1:
+	case REGION_CART1_EX:
+	case REGION_CART2:
+		if ((address & (SIZE_CART0 - 1)) >= memory->romSize) {
+			return false;
+		}
+		if (width == 4) {
+			LOAD_32(*value, address & (SIZE_CART0 - 4), memory->rom);
+		} else {
+			LOAD_16(*value, address & (SIZE_CART0 - 2), memory->rom);
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool _fastStoreOK(uint32_t address) {
+	switch (address >> BASE_OFFSET) {
+	case REGION_PALETTE_RAM:
+	case REGION_OAM:
+		return true;
+	case REGION_VRAM:
+		return (address & 0x0001FFFF) < SIZE_VRAM;
+	default:
+		return false;
+	}
+}
+
+static void _fastStore(struct GBA* gba, uint32_t address, uint32_t width, uint32_t value) {
+	struct GBAVideoRenderer* renderer = gba->video.renderer;
+	if (width == 4) {
+		uint32_t oldValue;
+		switch (address >> BASE_OFFSET) {
+		case REGION_PALETTE_RAM:
+			LOAD_32(oldValue, address & (SIZE_PALETTE_RAM - 4), gba->video.palette);
+			if (oldValue != value) {
+				STORE_32(value, address & (SIZE_PALETTE_RAM - 4), gba->video.palette);
+				renderer->writePalette(renderer, (address & (SIZE_PALETTE_RAM - 4)) + 2, value >> 16);
+				renderer->writePalette(renderer, address & (SIZE_PALETTE_RAM - 4), value);
+			}
+			break;
+		case REGION_VRAM:
+			LOAD_32(oldValue, address & 0x0001FFFC, gba->video.vram);
+			if (oldValue != value) {
+				STORE_32(value, address & 0x0001FFFC, gba->video.vram);
+				renderer->writeVRAM(renderer, (address & 0x0001FFFC) + 2);
+				renderer->writeVRAM(renderer, address & 0x0001FFFC);
+			}
+			break;
+		case REGION_OAM:
+			LOAD_32(oldValue, address & (SIZE_OAM - 4), gba->video.oam.raw);
+			if (oldValue != value) {
+				STORE_32(value, address & (SIZE_OAM - 4), gba->video.oam.raw);
+				renderer->writeOAM(renderer, (address & (SIZE_OAM - 4)) >> 1);
+				renderer->writeOAM(renderer, ((address & (SIZE_OAM - 4)) >> 1) + 1);
+			}
+			break;
+		}
+	} else {
+		uint16_t oldValue;
+		uint16_t half = value;
+		switch (address >> BASE_OFFSET) {
+		case REGION_PALETTE_RAM:
+			LOAD_16(oldValue, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
+			if (oldValue != half) {
+				STORE_16(half, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
+				renderer->writePalette(renderer, address & (SIZE_PALETTE_RAM - 2), half);
+			}
+			break;
+		case REGION_VRAM:
+			LOAD_16(oldValue, address & 0x0001FFFE, gba->video.vram);
+			if (oldValue != half) {
+				STORE_16(half, address & 0x0001FFFE, gba->video.vram);
+				renderer->writeVRAM(renderer, address & 0x0001FFFE);
+			}
+			break;
+		case REGION_OAM:
+			LOAD_16(oldValue, address & (SIZE_OAM - 2), gba->video.oam.raw);
+			if (oldValue != half) {
+				STORE_16(half, address & (SIZE_OAM - 2), gba->video.oam.raw);
+				renderer->writeOAM(renderer, (address & (SIZE_OAM - 2)) >> 1);
+			}
+			break;
+		}
+	}
+}
+
+// Units of a DMA are separate events, but while the CPU is blocked nothing
+// else runs between them except other events. If none is due before the next
+// unit would be, and the transfer only moves memory (no IO, no save chips, so
+// nothing that looks at the time), running that unit now is indistinguishable
+// from running it later, and saves an event dispatch per unit.
+static bool _batchRegion(uint32_t region) {
+	return region >= REGION_WORKING_RAM && region <= REGION_CART2 && region != REGION_IO;
+}
+
+static bool _canBatch(struct GBA* gba, int number, struct GBADMA* info) {
+	struct mTiming* timing = &gba->timing;
+	if (timing->reroot) {
+		return false;
+	}
+	struct mTimingEvent* next = timing->root;
+	if (next == &gba->memory.dmaEvent) {
+		next = next->next;
+	}
+	if (next && (int32_t) (next->when - info->when) <= 0) {
+		return false;
+	}
+	uint32_t sourceRegion = info->nextSource >> BASE_OFFSET;
+	uint32_t destRegion = info->nextDest >> BASE_OFFSET;
+	if (!info->nextSource || !_batchRegion(sourceRegion) || !_batchRegion(destRegion) || destRegion >= REGION_CART0) {
+		return false;
+	}
+	int i;
+	for (i = 0; i < 4; ++i) {
+		if (i != number && GBADMARegisterIsEnable(gba->memory.dma[i].reg) && gba->memory.dma[i].nextCount) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void GBADMAService(struct GBA* gba, int number, struct GBADMA* info) {
 	struct GBAMemory* memory = &gba->memory;
 	struct ARMCore* cpu = gba->cpu;
-	uint32_t width = 2 << GBADMARegisterGetWidth(info->reg);
-	int32_t wordsRemaining = info->nextCount;
-	uint32_t source = info->nextSource;
-	uint32_t dest = info->nextDest;
-	uint32_t sourceRegion = source >> BASE_OFFSET;
-	uint32_t destRegion = dest >> BASE_OFFSET;
-	int32_t cycles = 2;
+	uint32_t width;
+	int32_t wordsRemaining;
+	uint32_t source;
+	uint32_t dest;
+	uint32_t sourceRegion;
+	uint32_t destRegion;
+	do {
+		width = 2 << GBADMARegisterGetWidth(info->reg);
+		wordsRemaining = info->nextCount;
+		source = info->nextSource;
+		dest = info->nextDest;
+		sourceRegion = source >> BASE_OFFSET;
+		destRegion = dest >> BASE_OFFSET;
+		int32_t cycles = 2;
 
-	gba->cpuBlocked = true;
-	if (info->count == info->nextCount) {
-		if (width == 4) {
-			cycles += memory->waitstatesNonseq32[sourceRegion] + memory->waitstatesNonseq32[destRegion];
+		gba->cpuBlocked = true;
+		if (info->count == info->nextCount) {
+			if (width == 4) {
+				cycles += memory->waitstatesNonseq32[sourceRegion] + memory->waitstatesNonseq32[destRegion];
+			} else {
+				cycles += memory->waitstatesNonseq16[sourceRegion] + memory->waitstatesNonseq16[destRegion];
+			}
 		} else {
-			cycles += memory->waitstatesNonseq16[sourceRegion] + memory->waitstatesNonseq16[destRegion];
+			if (width == 4) {
+				cycles += memory->waitstatesSeq32[sourceRegion] + memory->waitstatesSeq32[destRegion];
+			} else {
+				cycles += memory->waitstatesSeq16[sourceRegion] + memory->waitstatesSeq16[destRegion];
+			}
 		}
-	} else {
-		if (width == 4) {
-			cycles += memory->waitstatesSeq32[sourceRegion] + memory->waitstatesSeq32[destRegion];
-		} else {
-			cycles += memory->waitstatesSeq16[sourceRegion] + memory->waitstatesSeq16[destRegion];
-		}
-	}
-	info->when += cycles;
+		info->when += cycles;
 
-	gba->performingDMA = 1 | (number << 1);
-	if (width == 4) {
+		gba->performingDMA = 1 | (number << 1);
+		uint32_t value;
+		if (source && _fastStoreOK(dest) && _fastLoad(memory, source, width, &value)) {
+			if (width == 2) {
+				value = (value & 0xFFFF) | (value << 16);
+			}
+			memory->dmaTransferRegister = value;
+			gba->bus = value;
+			_fastStore(gba, dest, width, value);
+		} else if (width == 4) {
+			if (source) {
+				memory->dmaTransferRegister = cpu->memory.load32(cpu, source, 0);
+			}
+			gba->bus = memory->dmaTransferRegister;
+			cpu->memory.store32(cpu, dest, memory->dmaTransferRegister, 0);
+		} else {
+			if (sourceRegion == REGION_CART2_EX && (memory->savedata.type == SAVEDATA_EEPROM || memory->savedata.type == SAVEDATA_EEPROM512)) {
+				memory->dmaTransferRegister = GBASavedataReadEEPROM(&memory->savedata);
+				memory->dmaTransferRegister |= memory->dmaTransferRegister << 16;
+			} else if (source) {
+				memory->dmaTransferRegister = cpu->memory.load16(cpu, source, 0);
+				memory->dmaTransferRegister |= memory->dmaTransferRegister << 16;
+			}
+			if (destRegion == REGION_CART2_EX) {
+				if (memory->savedata.type == SAVEDATA_AUTODETECT) {
+					mLOG(GBA_MEM, INFO, "Detected EEPROM savegame");
+					GBASavedataInitEEPROM(&memory->savedata);
+				}
+				if (memory->savedata.type == SAVEDATA_EEPROM512 || memory->savedata.type == SAVEDATA_EEPROM) {
+					GBASavedataWriteEEPROM(&memory->savedata, memory->dmaTransferRegister, wordsRemaining);
+				}
+			} else {
+				cpu->memory.store16(cpu, dest, memory->dmaTransferRegister, 0);
+
+			}
+			gba->bus = memory->dmaTransferRegister;
+		}
+
+		int sourceOffset;
+		if (info->nextSource >= BASE_CART0 && info->nextSource < BASE_CART_SRAM && GBADMARegisterGetSrcControl(info->reg) < 3) {
+			sourceOffset = width;
+		} else {
+			sourceOffset = DMA_OFFSET[GBADMARegisterGetSrcControl(info->reg)] * width;
+		}
+		int destOffset = DMA_OFFSET[GBADMARegisterGetDestControl(info->reg)] * width;
 		if (source) {
-			memory->dmaTransferRegister = cpu->memory.load32(cpu, source, 0);
+			source += sourceOffset;
 		}
-		gba->bus = memory->dmaTransferRegister;
-		cpu->memory.store32(cpu, dest, memory->dmaTransferRegister, 0);
-	} else {
-		if (sourceRegion == REGION_CART2_EX && (memory->savedata.type == SAVEDATA_EEPROM || memory->savedata.type == SAVEDATA_EEPROM512)) {
-			memory->dmaTransferRegister = GBASavedataReadEEPROM(&memory->savedata);
-			memory->dmaTransferRegister |= memory->dmaTransferRegister << 16;
-		} else if (source) {
-			memory->dmaTransferRegister = cpu->memory.load16(cpu, source, 0);
-			memory->dmaTransferRegister |= memory->dmaTransferRegister << 16;
-		}
-		if (destRegion == REGION_CART2_EX) {
-			if (memory->savedata.type == SAVEDATA_AUTODETECT) {
-				mLOG(GBA_MEM, INFO, "Detected EEPROM savegame");
-				GBASavedataInitEEPROM(&memory->savedata);
-			}
-			if (memory->savedata.type == SAVEDATA_EEPROM512 || memory->savedata.type == SAVEDATA_EEPROM) {
-				GBASavedataWriteEEPROM(&memory->savedata, memory->dmaTransferRegister, wordsRemaining);
-			}
-		} else {
-			cpu->memory.store16(cpu, dest, memory->dmaTransferRegister, 0);
+		dest += destOffset;
+		--wordsRemaining;
+		gba->performingDMA = 0;
 
-		}
-		gba->bus = memory->dmaTransferRegister;
-	}
-
-	int sourceOffset;
-	if (info->nextSource >= BASE_CART0 && info->nextSource < BASE_CART_SRAM && GBADMARegisterGetSrcControl(info->reg) < 3) {
-		sourceOffset = width;
-	} else {
-		sourceOffset = DMA_OFFSET[GBADMARegisterGetSrcControl(info->reg)] * width;
-	}
-	int destOffset = DMA_OFFSET[GBADMARegisterGetDestControl(info->reg)] * width;
-	if (source) {
-		source += sourceOffset;
-	}
-	dest += destOffset;
-	--wordsRemaining;
-	gba->performingDMA = 0;
-
-	info->nextCount = wordsRemaining;
-	info->nextSource = source;
-	info->nextDest = dest;
+		info->nextCount = wordsRemaining;
+		info->nextSource = source;
+		info->nextDest = dest;
+	} while (wordsRemaining && _canBatch(gba, number, info));
 
 	int i;
 	for (i = 0; i < 4; ++i) {

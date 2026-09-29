@@ -184,6 +184,10 @@ struct ARMCore {
 
 	size_t numComponents;
 	struct mCPUComponent** components;
+
+	/* Set by ARMJITInit: ARMRunLoop runs the recompiler instead. Always
+	 * present so the layout doesn't depend on the build. */
+	struct ARMJIT* jit;
 };
 #undef ARM_REGISTER_FILE
 

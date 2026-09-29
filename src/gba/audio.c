@@ -7,6 +7,7 @@
 
 #include <mgba/internal/arm/macros.h>
 #include <mgba/core/blip_buf.h>
+#include <mgba/core/profile.h>
 #include <mgba/core/sync.h>
 #include <mgba/internal/gba/dma.h>
 #include <mgba/internal/gba/gba.h>
@@ -268,6 +269,10 @@ void GBAAudioWriteSOUNDBIAS(struct GBAAudio* audio, uint16_t value) {
 	audio->soundbias = value;
 	int32_t oldSampleInterval = audio->sampleInterval;
 	audio->sampleInterval = 0x200 >> GBARegisterSOUNDBIASGetResolution(value);
+	if (audio->directOutput && audio->sampleInterval < audio->directInterval) {
+		/* Mixing finer than the frontend plays only to throw it away */
+		audio->sampleInterval = audio->directInterval;
+	}
 	if (oldSampleInterval != audio->sampleInterval) {
 		if (audio->p->stream && audio->p->stream->audioRateChanged) {
 			audio->p->stream->audioRateChanged(audio->p->stream, GBA_ARM7TDMI_FREQUENCY / audio->sampleInterval);
@@ -455,6 +460,7 @@ void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
 	if (timestamp - when < interval) {
 		return;
 	}
+	mPROFILE_START(profileMix, "audio mix");
 
 	struct GBAAudioFIFO* chA = &audio->chA;
 	struct GBAAudioFIFO* chB = &audio->chB;
@@ -518,6 +524,7 @@ void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
 	_consumeHistory(chB, usedB);
 	audio->sampleIndex = sample;
 	audio->lastSample = when;
+	mPROFILE_STOP(profileMix);
 }
 
 static void _sample(struct mTiming* timing, void* user, uint32_t cyclesLate) {
@@ -526,6 +533,14 @@ static void _sample(struct mTiming* timing, void* user, uint32_t cyclesLate) {
 
 	int samples = audio->sampleIndex;
 	audio->sampleIndex = 0;
+	mPROFILE_START(profileOutput, "audio output");
+
+	if (audio->directOutput && audio->sampleInterval == audio->directInterval) {
+		audio->directOutput(audio->directContext, audio->currentSamples, samples);
+		mPROFILE_STOP(profileOutput);
+		mTimingSchedule(timing, &audio->sampleEvent, FLUSH_INTERVAL - cyclesLate);
+		return;
+	}
 
 	mCoreSyncLockAudio(audio->p->sync);
 	unsigned produced;
@@ -560,6 +575,7 @@ static void _sample(struct mTiming* timing, void* user, uint32_t cyclesLate) {
 	if (wait && audio->p->stream && audio->p->stream->postAudioBuffer) {
 		audio->p->stream->postAudioBuffer(audio->p->stream, audio->psg.left, audio->psg.right);
 	}
+	mPROFILE_STOP(profileOutput);
 
 	mTimingSchedule(timing, &audio->sampleEvent, FLUSH_INTERVAL - cyclesLate);
 }

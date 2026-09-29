@@ -5,6 +5,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/gba/timer.h>
 
+#include <mgba/core/profile.h>
+
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/io.h>
 
@@ -23,6 +25,7 @@ static void GBATimerUpdate(struct GBA* gba, int timerId, uint32_t cyclesLate) {
 	}
 
 	if (gba->audio.enable && timerId < 2) {
+		mPROFILE_START(profileFifo, "FIFO");
 		if ((gba->audio.chALeft || gba->audio.chARight) && gba->audio.chATimer == timerId) {
 			GBAAudioSampleFIFO(&gba->audio, 0, cyclesLate);
 		}
@@ -30,6 +33,7 @@ static void GBATimerUpdate(struct GBA* gba, int timerId, uint32_t cyclesLate) {
 		if ((gba->audio.chBLeft || gba->audio.chBRight) && gba->audio.chBTimer == timerId) {
 			GBAAudioSampleFIFO(&gba->audio, 1, cyclesLate);
 		}
+		mPROFILE_STOP(profileFifo);
 	}
 
 	if (timerId < 3) {

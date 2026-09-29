@@ -100,6 +100,13 @@ struct GBAAudio {
 	int masterVolume;
 
 	struct mTimingEvent sampleEvent;
+
+	/* If set, batches mixed at directInterval cycles per sample go here
+	 * instead of through the blip buffers (a frontend whose output rate is
+	 * the mixing rate has nothing to resample). */
+	void (*directOutput)(void* context, const struct mStereoSample* samples, int count);
+	void* directContext;
+	int32_t directInterval;
 };
 
 struct GBAMP2kADSR {

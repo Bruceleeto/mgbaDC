@@ -9,6 +9,9 @@
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
 #include <mgba/core/profile.h>
+#ifdef M_ARM_JIT
+#include <mgba/internal/arm/jit.h>
+#endif
 
 void ARMSetPrivilegeMode(struct ARMCore* cpu, enum PrivilegeMode mode) {
 	if (mode == cpu->privilegeMode) {
@@ -56,6 +59,9 @@ void ARMInit(struct ARMCore* cpu) {
 }
 
 void ARMDeinit(struct ARMCore* cpu) {
+#ifdef M_ARM_JIT
+	ARMJITDeinit(cpu);
+#endif
 	if (cpu->master->deinit) {
 		cpu->master->deinit(cpu->master);
 	}
@@ -118,6 +124,9 @@ void ARMReset(struct ARMCore* cpu) {
 	cpu->nextEvent = 0;
 	cpu->halted = 0;
 
+#ifdef M_ARM_JIT
+	ARMJITFlush(cpu);
+#endif
 	cpu->irqh.reset(cpu);
 }
 
@@ -253,7 +262,23 @@ void ARMRun(struct ARMCore* cpu) {
 	}
 }
 
+#ifdef M_ARM_JIT
+void ARMRunInstruction(struct ARMCore* cpu) {
+	if (cpu->executionMode == MODE_THUMB) {
+		ThumbStep(cpu);
+	} else {
+		ARMStep(cpu);
+	}
+}
+#endif
+
 void ARMRunLoop(struct ARMCore* cpu) {
+#ifdef M_ARM_JIT
+	if (cpu->jit) {
+		ARMJITRunLoop(cpu);
+		return;
+	}
+#endif
 	if (cpu->executionMode == MODE_THUMB) {
 		while (cpu->cycles < cpu->nextEvent) {
 			mPROFILE_COUNT(mProfileThumbInstructions);
