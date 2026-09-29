@@ -173,7 +173,7 @@ bool GBLoadROM(struct GB* gb, struct VFile* vf) {
 			gb->pristineRomSize = gb->gbx.romSize;
 		} else {
 			// TODO: Should we make a temporary buffer?
-			mLOG(GB, WARN, "GBX file size %d is larger than real file size %d", gb->gbx.romSize, fileSize - 0x40);
+			mLOG(GB, WARN, "GBX file size %" PRIu32 " is larger than real file size %" PRIu32, gb->gbx.romSize, fileSize - 0x40);
 			gb->pristineRomSize = fileSize - 0x40;
 		}
 	}

@@ -33,7 +33,7 @@ uint16_t GBASIOJOYWriteRegister(struct GBASIODriver* sio, uint32_t address, uint
 		mLOG(GBA_SIO, DEBUG, "JOY write: TRANS_HI <- %04X", value);
 		break;
 	default:
-		mLOG(GBA_SIO, DEBUG, "JOY write: Unknown reg %03X <- %04X", address, value);
+		mLOG(GBA_SIO, DEBUG, "JOY write: Unknown reg %03" PRIX32 " <- %04X", address, value);
 		// Fall through
 	case REG_RCNT:
 		break;

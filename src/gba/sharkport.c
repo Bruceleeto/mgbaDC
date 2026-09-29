@@ -207,7 +207,7 @@ bool GBASavedataExportSharkPort(const struct GBA* gba, struct VFile* vf) {
 	if (vf->write(vf, &buffer.i, 4) < 4) {
 		return false;
 	}
-	if (vf->write(vf, SHARKPORT_HEADER, size) < size) {
+	if (vf->write(vf, SHARKPORT_HEADER, size) != (ssize_t) size) {
 		return false;
 	}
 
@@ -231,7 +231,7 @@ bool GBASavedataExportSharkPort(const struct GBA* gba, struct VFile* vf) {
 	struct tm* tm = localtime(&t);
 	size = strftime(&buffer.c[4], sizeof(buffer.c) - 4, "%m/%d/%Y %I:%M:%S %p", tm);
 	STORE_32(size, 0, &buffer.i);
-	if (vf->write(vf, buffer.c, size + 4) < size + 4) {
+	if (vf->write(vf, buffer.c, size + 4) != (ssize_t) (size + 4)) {
 		return false;
 	}
 
@@ -282,7 +282,7 @@ bool GBASavedataExportSharkPort(const struct GBA* gba, struct VFile* vf) {
 			checksum += byte << (checksum % 24);
 			vf->write(vf, &byte, 1);
 		}
-	} else if (vf->write(vf, gba->memory.savedata.data, size) < size) {
+	} else if (vf->write(vf, gba->memory.savedata.data, size) != (ssize_t) size) {
 		return false;
 	} else {
 		for (i = 0; i < size; ++i) {

@@ -89,17 +89,17 @@ bool GBADeserialize(struct GBA* gba, const struct GBASerializedState* state) {
 	uint32_t ucheck;
 	LOAD_32(ucheck, 0, &state->versionMagic);
 	if (ucheck > GBASavestateMagic + GBASavestateVersion) {
-		mLOG(GBA_STATE, WARN, "Invalid or too new savestate: expected %08X, got %08X", GBASavestateMagic + GBASavestateVersion, ucheck);
+		mLOG(GBA_STATE, WARN, "Invalid or too new savestate: expected %08" PRIX32 ", got %08" PRIX32, GBASavestateMagic + GBASavestateVersion, ucheck);
 		error = true;
 	} else if (ucheck < GBASavestateMagic) {
-		mLOG(GBA_STATE, WARN, "Invalid savestate: expected %08X, got %08X", GBASavestateMagic + GBASavestateVersion, ucheck);
+		mLOG(GBA_STATE, WARN, "Invalid savestate: expected %08" PRIX32 ", got %08" PRIX32, GBASavestateMagic + GBASavestateVersion, ucheck);
 		error = true;
 	} else if (ucheck < GBASavestateMagic + GBASavestateVersion) {
-		mLOG(GBA_STATE, WARN, "Old savestate: expected %08X, got %08X, continuing anyway", GBASavestateMagic + GBASavestateVersion, ucheck);
+		mLOG(GBA_STATE, WARN, "Old savestate: expected %08" PRIX32 ", got %08" PRIX32 ", continuing anyway", GBASavestateMagic + GBASavestateVersion, ucheck);
 	}
 	LOAD_32(ucheck, 0, &state->biosChecksum);
 	if (ucheck != gba->biosChecksum) {
-		mLOG(GBA_STATE, WARN, "Savestate created using a different version of the BIOS: expected %08X, got %08X", gba->biosChecksum, ucheck);
+		mLOG(GBA_STATE, WARN, "Savestate created using a different version of the BIOS: expected %08" PRIX32 ", got %08" PRIX32, gba->biosChecksum, ucheck);
 		uint32_t pc;
 		LOAD_32(pc, ARM_PC * sizeof(state->cpu.gprs[0]), state->cpu.gprs);
 		if ((ucheck == GBA_BIOS_CHECKSUM || gba->biosChecksum == GBA_BIOS_CHECKSUM) && pc < SIZE_BIOS && pc >= 0x20) {

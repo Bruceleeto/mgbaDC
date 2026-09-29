@@ -393,7 +393,7 @@ bool mCheatParseLibretroFile(struct mCheatDevice* device, struct VFile* vf) {
 
 				char* end;
 				unsigned long nCheats = strtoul(eq, &end, 10);
-				if (end[0] != '\0' && !isspace(end[0])) {
+				if (end[0] != '\0' && !isspace((unsigned char) end[0])) {
 					return false;
 				}
 
@@ -541,7 +541,7 @@ bool mCheatParseEZFChtFile(struct mCheatDevice* device, struct VFile* vf) {
 					if (hexval > 0xFF) {
 						return false;
 					}
-					snprintf(miniline, sizeof(miniline) - 1, "%08X:%02X", gameptr, hexval);
+					snprintf(miniline, sizeof(miniline) - 1, "%08" PRIX32 ":%02" PRIX32, gameptr, hexval);
 					mCheatAddLine(set, miniline, 0);
 					++gameptr;
 				}
@@ -551,7 +551,7 @@ bool mCheatParseEZFChtFile(struct mCheatDevice* device, struct VFile* vf) {
 				if (hexval > 0xFF) {
 					return false;
 				}
-				snprintf(miniline, sizeof(miniline) - 1, "%08X:%02X", gameptr, hexval);
+				snprintf(miniline, sizeof(miniline) - 1, "%08" PRIX32 ":%02" PRIX32, gameptr, hexval);
 				mCheatAddLine(set, miniline, 0);
 				hexval = 0;
 				gameptr = 0;
@@ -571,7 +571,7 @@ bool mCheatParseEZFChtFile(struct mCheatDevice* device, struct VFile* vf) {
 			if (hexval > 0xFF) {
 				return false;
 			}
-			snprintf(miniline, sizeof(miniline) - 1, "%08X:%02X", gameptr, hexval);
+			snprintf(miniline, sizeof(miniline) - 1, "%08" PRIX32 ":%02" PRIX32, gameptr, hexval);
 			mCheatAddLine(set, miniline, 0);
 		}
 	}

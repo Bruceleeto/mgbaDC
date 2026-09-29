@@ -98,7 +98,10 @@ bool _UPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* ou
 				}
 				CircleBufferWrite(&buffer, block, read);
 			}
-			CircleBufferRead8(&buffer, &byte);
+			if (CircleBufferRead8(&buffer, &byte) != 1) {
+				CircleBufferDeinit(&buffer);
+				return false;
+			}
 			if (!byte) {
 				break;
 			}
@@ -237,7 +240,9 @@ size_t _decodeLength(struct VFile* vf, struct CircleBuffer* buffer) {
 				}
 				CircleBufferWrite(buffer, block, read);
 			}
-			CircleBufferRead8(buffer, (int8_t*) &byte);
+			if (CircleBufferRead8(buffer, (int8_t*) &byte) != 1) {
+				return 0;
+			}
 		} else {
 			if (vf->read(vf, &byte, 1) != 1) {
 				break;

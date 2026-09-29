@@ -293,7 +293,7 @@ void mCoreConfigDirectory(char* out, size_t outLength) {
 const char* _mDreamcastMediaRoot = "/pc";
 
 void mCoreConfigSetDreamcastMediaRoot(const char* root) {
-	if (root && (strcmp(root, "/pc") == 0 || strcmp(root, "/cd") == 0)) {
+	if (root && (strcmp(root, "/rd") == 0 || strcmp(root, "/pc") == 0 || strcmp(root, "/cd") == 0)) {
 		_mDreamcastMediaRoot = root;
 	}
 }
@@ -314,7 +314,9 @@ void mCoreConfigPortablePath(char* out, size_t outLength) {
 	WideCharToMultiByte(CP_UTF8, 0, wpath, -1, out, outLength, 0, 0);
 	StringCchCatA(out, outLength, PATH_SEP "portable.ini");
 #elif defined(PSP2) || defined(GEKKO) || defined(__SWITCH__) || defined(__3DS__) || defined(__DREAMCAST__)
-	out[0] = '\0';
+	if (outLength) {
+		out[0] = '\0';
+	}
 #else
 	getcwd(out, outLength);
 #ifdef __APPLE__

@@ -219,7 +219,7 @@ static uint16_t GBASIOLockstepNodeMultiWriteRegister(struct GBASIODriver* driver
 	} else if (address == REG_SIOMLT_SEND) {
 		mLOG(GBA_SIO, DEBUG, "Lockstep %i: SIOMLT_SEND <- %04X", node->id, value);
 	} else {
-		mLOG(GBA_SIO, STUB, "Lockstep %i: Unknown reg %03X <- %04X", node->id, address, value);
+		mLOG(GBA_SIO, STUB, "Lockstep %i: Unknown reg %03" PRIX32 " <- %04X", node->id, address, value);
 	}
 
 	mLockstepUnlock(&node->p->d);

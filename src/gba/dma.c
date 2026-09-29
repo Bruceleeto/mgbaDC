@@ -48,7 +48,7 @@ uint32_t GBADMAWriteSAD(struct GBA* gba, int dma, uint32_t address) {
 	if (_isValidDMASAD(dma, address)) {
 		memory->dma[dma].source = address & 0x0FFFFFFE;
 	} else {
-		mLOG(GBA_DMA, GAME_ERROR, "Invalid DMA source address: 0x%08X", address);
+		mLOG(GBA_DMA, GAME_ERROR, "Invalid DMA source address: 0x%08" PRIX32, address);
 		memory->dma[dma].source = 0;
 	}
 	return memory->dma[dma].source;
@@ -60,7 +60,7 @@ uint32_t GBADMAWriteDAD(struct GBA* gba, int dma, uint32_t address) {
 	if (_isValidDMADAD(dma, address)) {
 		memory->dma[dma].dest = address;
 	} else {
-		mLOG(GBA_DMA, GAME_ERROR, "Invalid DMA destination address: 0x%08X", address);
+		mLOG(GBA_DMA, GAME_ERROR, "Invalid DMA destination address: 0x%08" PRIX32, address);
 	}
 	return memory->dma[dma].dest;
 }
@@ -91,14 +91,14 @@ uint16_t GBADMAWriteCNT_HI(struct GBA* gba, int dma, uint16_t control) {
 
 		uint32_t width = 2 << GBADMARegisterGetWidth(currentDma->reg);
 		if (currentDma->nextSource & (width - 1)) {
-			mLOG(GBA_DMA, GAME_ERROR, "Misaligned DMA source address: 0x%08X", currentDma->nextSource);
+			mLOG(GBA_DMA, GAME_ERROR, "Misaligned DMA source address: 0x%08" PRIX32, currentDma->nextSource);
 		}
 		if (currentDma->nextDest & (width - 1)) {
-			mLOG(GBA_DMA, GAME_ERROR, "Misaligned DMA destination address: 0x%08X", currentDma->nextDest);
+			mLOG(GBA_DMA, GAME_ERROR, "Misaligned DMA destination address: 0x%08" PRIX32, currentDma->nextDest);
 		}
-		mLOG(GBA_DMA, INFO, "Starting DMA %i 0x%08X -> 0x%08X (%04X:%04X)", dma,
+		mLOG(GBA_DMA, INFO, "Starting DMA %i 0x%08" PRIX32 " -> 0x%08" PRIX32 " (%04X:%04X)", dma,
 		     currentDma->nextSource, currentDma->nextDest,
-		     currentDma->reg, currentDma->count & 0xFFFF);
+		     currentDma->reg, (unsigned) (currentDma->count & 0xFFFF));
 
 		currentDma->nextSource &= -width;
 		currentDma->nextDest &= -width;

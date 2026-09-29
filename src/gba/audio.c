@@ -128,7 +128,7 @@ void GBAAudioScheduleFifoDma(struct GBAAudio* audio, int number, struct GBADMA* 
 		audio->chB.dmaSource = number;
 		break;
 	default:
-		mLOG(GBA_AUDIO, GAME_ERROR, "Invalid FIFO destination: 0x%08X", info->dest);
+		mLOG(GBA_AUDIO, GAME_ERROR, "Invalid FIFO destination: 0x%08" PRIX32, info->dest);
 		return;
 	}
 	if (audio->mixer) {

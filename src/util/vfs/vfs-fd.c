@@ -230,10 +230,11 @@ static void _vfdUnmap(struct VFile* vf, void* memory, size_t size) {
 #endif
 
 static void _vfdTruncate(struct VFile* vf, size_t size) {
-	struct VFileFD* vfd = (struct VFileFD*) vf;
 #ifndef __DREAMCAST__
+	struct VFileFD* vfd = (struct VFileFD*) vf;
 	ftruncate(vfd->fd, size);
 #else
+	UNUSED(vf);
 	UNUSED(size);
 	/* KOS's newlib has no ftruncate(). mGBA's own save/config file paths
 	 * always write a full, correctly-sized file (O_TRUNC on create, or a

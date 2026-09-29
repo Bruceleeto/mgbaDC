@@ -222,10 +222,10 @@ void GBACartEReaderWrite(struct GBACartEReader* ereader, uint32_t address, uint1
 		}
 		break;
 	case 2:
-		mLOG(GBA_HW, GAME_ERROR, "e-Reader write to read-only registers: %05X:%04X", address, value);
+		mLOG(GBA_HW, GAME_ERROR, "e-Reader write to read-only registers: %05" PRIX32 ":%04X", address, value);
 		break;
 	default:
-		mLOG(GBA_HW, STUB, "Unimplemented e-Reader write: %05X:%04X", address, value);
+		mLOG(GBA_HW, STUB, "Unimplemented e-Reader write: %05" PRIX32 ":%04X", address, value);
 	}
 }
 
@@ -247,7 +247,7 @@ void GBACartEReaderWriteFlash(struct GBACartEReader* ereader, uint32_t address, 
 		ereader->registerLed |= value << 8;
 		break;
 	default:
-		mLOG(GBA_HW, STUB, "Unimplemented e-Reader write to flash: %04X:%02X", address, value);
+		mLOG(GBA_HW, STUB, "Unimplemented e-Reader write to flash: %04" PRIX32 ":%02X", address, value);
 	}
 }
 
@@ -266,7 +266,7 @@ uint16_t GBACartEReaderRead(struct GBACartEReader* ereader, uint32_t address) {
 		LOAD_16(value, address & 0xFE, ereader->data);
 		return value;
 	}
-	mLOG(GBA_HW, STUB, "Unimplemented e-Reader read: %05X", address);
+	mLOG(GBA_HW, STUB, "Unimplemented e-Reader read: %05" PRIX32, address);
 	return 0;
 }
 
@@ -278,7 +278,7 @@ uint8_t GBACartEReaderReadFlash(struct GBACartEReader* ereader, uint32_t address
 	case 0xFFB1:
 		return ereader->registerControl1;
 	default:
-		mLOG(GBA_HW, STUB, "Unimplemented e-Reader read from flash: %04X", address);
+		mLOG(GBA_HW, STUB, "Unimplemented e-Reader read from flash: %04" PRIX32, address);
 		return 0;
 	}
 }

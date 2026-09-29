@@ -39,7 +39,8 @@ struct mInputAxisEnumerate {
 };
 
 static void _makeSectionName(const char* platform, char* sectionName, size_t len, uint32_t type) {
-	snprintf(sectionName, len, "%s.input.%c%c%c%c", platform, type >> 24, type >> 16, type >> 8, type);
+	snprintf(sectionName, len, "%s.input.%c%c%c%c", platform, (int) ((type >> 24) & 0xFF), (int) ((type >> 16) & 0xFF),
+	         (int) ((type >> 8) & 0xFF), (int) (type & 0xFF));
 	sectionName[len - 1] = '\0';
 }
 
@@ -212,7 +213,7 @@ static void _saveKey(const struct mInputMap* map, uint32_t type, const char* sec
 
 	int value = mInputQueryBinding(map, type, key);
 	char keyValue[KEY_VALUE_MAX];
-	snprintf(keyValue, KEY_VALUE_MAX, "%" PRIi32, value);
+	snprintf(keyValue, KEY_VALUE_MAX, "%d", value);
 
 	ConfigurationSetValue(config, sectionName, keyKey, keyValue);
 }
@@ -246,7 +247,7 @@ static void _saveAxis(uint32_t axis, void* dp, void* up) {
 		axisKey[KEY_NAME_MAX - 1] = '\0';
 
 		char axisInfo[AXIS_INFO_MAX];
-		snprintf(axisInfo, AXIS_INFO_MAX, "-%u", axis);
+		snprintf(axisInfo, AXIS_INFO_MAX, "-%" PRIu32, axis);
 		axisInfo[AXIS_INFO_MAX - 1] = '\0';
 		ConfigurationSetValue(user->config, sectionName, axisKey, axisInfo);
 	}
@@ -262,7 +263,7 @@ static void _saveAxis(uint32_t axis, void* dp, void* up) {
 		axisKey[KEY_NAME_MAX - 1] = '\0';
 
 		char axisInfo[AXIS_INFO_MAX];
-		snprintf(axisInfo, AXIS_INFO_MAX, "+%u", axis);
+		snprintf(axisInfo, AXIS_INFO_MAX, "+%" PRIu32, axis);
 		axisInfo[AXIS_INFO_MAX - 1] = '\0';
 		ConfigurationSetValue(user->config, sectionName, axisKey, axisInfo);
 	}

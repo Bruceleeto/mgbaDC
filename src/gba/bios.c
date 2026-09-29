@@ -278,9 +278,9 @@ static void _Div(struct GBA* gba, int32_t num, int32_t denom) {
 	struct ARMCore* cpu = gba->cpu;
 	if (denom == 0) {
 		if (num == 0 || num == -1 || num == 1) {
-			mLOG(GBA_BIOS, GAME_ERROR, "Attempting to divide %i by zero!", num);
+			mLOG(GBA_BIOS, GAME_ERROR, "Attempting to divide %" PRIi32 " by zero!", num);
 		} else {
-			mLOG(GBA_BIOS, FATAL, "Attempting to divide %i by zero!", num);
+			mLOG(GBA_BIOS, FATAL, "Attempting to divide %" PRIi32 " by zero!", num);
 		}
 		// If abs(num) > 1, this should hang, but that would be painful to
 		// emulate in HLE, and no game will get into a state under normal
@@ -425,8 +425,8 @@ static int32_t _Sqrt(uint32_t x, uint32_t* cycles) {
 
 void GBASwi16(struct ARMCore* cpu, int immediate) {
 	struct GBA* gba = (struct GBA*) cpu->master;
-	mLOG(GBA_BIOS, DEBUG, "SWI: %02X r0: %08X r1: %08X r2: %08X r3: %08X",
-	    immediate, cpu->gprs[0], cpu->gprs[1], cpu->gprs[2], cpu->gprs[3]);
+	mLOG(GBA_BIOS, DEBUG, "SWI: %02X r0: %08" PRIX32 " r1: %08" PRIX32 " r2: %08" PRIX32 " r3: %08" PRIX32,
+	    immediate, (uint32_t) cpu->gprs[0], (uint32_t) cpu->gprs[1], (uint32_t) cpu->gprs[2], (uint32_t) cpu->gprs[3]);
 
 	switch (immediate) {
 	case 0xF0: // Used for internal stall counting
@@ -672,9 +672,9 @@ static void _unLz77(struct GBA* gba, int width) {
 					if (remaining) {
 						--remaining;
 					} else {
-						mLOG(GBA_BIOS, GAME_ERROR, "Improperly compressed LZ77 data at %08X. "
-						     "This will lead to a buffer overrun at %08X and may crash on hardware.",
-						     cpu->gprs[0], cpu->gprs[1]);
+						mLOG(GBA_BIOS, GAME_ERROR, "Improperly compressed LZ77 data at %08" PRIX32 ". "
+						     "This will lead to a buffer overrun at %08" PRIX32 " and may crash on hardware.",
+						     (uint32_t) cpu->gprs[0], (uint32_t) cpu->gprs[1]);
 						if (gba->vbaBugCompat) {
 							break;
 						}

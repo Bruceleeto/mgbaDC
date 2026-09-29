@@ -206,7 +206,7 @@ void _rtcProcessByte(struct GBACartridgeHardware* hw) {
 
 			hw->rtc.bytesRemaining = RTC_BYTES[RTCCommandDataGetCommand(command)];
 			hw->rtc.commandActive = hw->rtc.bytesRemaining > 0;
-			mLOG(GBA_HW, DEBUG, "Got RTC command %x", RTCCommandDataGetCommand(command));
+			mLOG(GBA_HW, DEBUG, "Got RTC command %" PRIx32, RTCCommandDataGetCommand(command));
 			switch (RTCCommandDataGetCommand(command)) {
 			case RTC_RESET:
 				hw->rtc.control = 0;
@@ -220,7 +220,7 @@ void _rtcProcessByte(struct GBACartridgeHardware* hw) {
 				break;
 			}
 		} else {
-			mLOG(GBA_HW, WARN, "Invalid RTC command byte: %02X", hw->rtc.bits);
+			mLOG(GBA_HW, WARN, "Invalid RTC command byte: %02X", (unsigned) hw->rtc.bits);
 		}
 	} else {
 		switch (RTCCommandDataGetCommand(hw->rtc.command)) {
@@ -228,7 +228,7 @@ void _rtcProcessByte(struct GBACartridgeHardware* hw) {
 			hw->rtc.control = hw->rtc.bits;
 			break;
 		case RTC_FORCE_IRQ:
-			mLOG(GBA_HW, STUB, "Unimplemented RTC command %u", RTCCommandDataGetCommand(hw->rtc.command));
+			mLOG(GBA_HW, STUB, "Unimplemented RTC command %" PRIu32, RTCCommandDataGetCommand(hw->rtc.command));
 			break;
 		case RTC_RESET:
 		case RTC_DATETIME:
@@ -407,7 +407,7 @@ void GBAHardwareTiltWrite(struct GBACartridgeHardware* hw, uint32_t address, uin
 		if (value == 0x55) {
 			hw->tiltState = 1;
 		} else {
-			mLOG(GBA_HW, GAME_ERROR, "Tilt sensor wrote wrong byte to %04x: %02x", address, value);
+			mLOG(GBA_HW, GAME_ERROR, "Tilt sensor wrote wrong byte to %04" PRIx32 ": %02x", address, value);
 		}
 		break;
 	case 0x8100:
@@ -426,11 +426,11 @@ void GBAHardwareTiltWrite(struct GBACartridgeHardware* hw, uint32_t address, uin
 			hw->tiltX = 0x3A0 - (x >> 22);
 			hw->tiltY = 0x3A0 - (y >> 22);
 		} else {
-			mLOG(GBA_HW, GAME_ERROR, "Tilt sensor wrote wrong byte to %04x: %02x", address, value);
+			mLOG(GBA_HW, GAME_ERROR, "Tilt sensor wrote wrong byte to %04" PRIx32 ": %02x", address, value);
 		}
 		break;
 	default:
-		mLOG(GBA_HW, GAME_ERROR, "Invalid tilt sensor write to %04x: %02x", address, value);
+		mLOG(GBA_HW, GAME_ERROR, "Invalid tilt sensor write to %04" PRIx32 ": %02x", address, value);
 		break;
 	}
 }
@@ -446,7 +446,7 @@ uint8_t GBAHardwareTiltRead(struct GBACartridgeHardware* hw, uint32_t address) {
 	case 0x8500:
 		return (hw->tiltY >> 8) & 0xF;
 	default:
-		mLOG(GBA_HW, GAME_ERROR, "Invalid tilt sensor read from %04x", address);
+		mLOG(GBA_HW, GAME_ERROR, "Invalid tilt sensor read from %04" PRIx32, address);
 		break;
 	}
 	return 0xFF;

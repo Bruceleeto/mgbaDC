@@ -535,7 +535,7 @@ void GBALoadBIOS(struct GBA* gba, struct VFile* vf) {
 	gba->memory.bios = bios;
 	gba->memory.fullBios = 1;
 	uint32_t checksum = GBAChecksum(gba->memory.bios, SIZE_BIOS);
-	mLOG(GBA, DEBUG, "BIOS Checksum: 0x%X", checksum);
+	mLOG(GBA, DEBUG, "BIOS Checksum: 0x%" PRIX32, checksum);
 	if (checksum == GBA_BIOS_CHECKSUM) {
 		mLOG(GBA, INFO, "Official GBA BIOS detected");
 	} else if (checksum == GBA_DS_BIOS_CHECKSUM) {
@@ -836,18 +836,18 @@ void GBAHitStub(struct ARMCore* cpu, uint32_t opcode) {
 	}
 #endif
 	// TODO: More sensible category?
-	mLOG(GBA, ERROR, "Stub opcode: %08x", opcode);
+	mLOG(GBA, ERROR, "Stub opcode: %08" PRIx32, opcode);
 }
 
 void GBAIllegal(struct ARMCore* cpu, uint32_t opcode) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	if (cpu->executionMode == MODE_THUMB && (opcode & 0xFFC0) == 0xE800) {
-		mLOG(GBA, INFO, "Hit Wii U VC opcode: %08x", opcode);
+		mLOG(GBA, INFO, "Hit Wii U VC opcode: %08" PRIx32, opcode);
 		return;
 	}
 	if (!gba->yankedRomSize) {
 		// TODO: More sensible category?
-		mLOG(GBA, WARN, "Illegal opcode: %08x", opcode);
+		mLOG(GBA, WARN, "Illegal opcode: %08" PRIx32, opcode);
 	}
 #ifdef USE_DEBUGGERS
 	if (gba->debugger) {

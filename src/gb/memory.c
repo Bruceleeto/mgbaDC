@@ -292,7 +292,7 @@ uint8_t GBLoad8(struct SM83Core* cpu, uint16_t address) {
 			memory->cartBus = memory->sramBank[address & (GB_SIZE_EXTERNAL_RAM - 1)];
 		} else if (memory->mbcType == GB_HuC3) {
 			memory->cartBus = 0x01; // TODO: Is this supposed to be the current SRAM bank?
-		} else if (cpu->tMultiplier * (cpu->pc - memory->cartBusPc) >= memory->cartBusDecay) {
+		} else if ((unsigned) (cpu->tMultiplier * (cpu->pc - memory->cartBusPc)) >= memory->cartBusDecay) {
 			memory->cartBus = 0xFF;
 		}
 		memory->cartBusPc = cpu->pc;

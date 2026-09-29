@@ -103,7 +103,7 @@ static bool GBACheatAddAutodetect(struct GBACheatSet* set, uint32_t op1, uint32_
 	uint32_t o1 = op1;
 	uint32_t o2 = op2;
 	char line[18] = "XXXXXXXX XXXXXXXX";
-	snprintf(line, sizeof(line), "%08X %08X", op1, op2);
+	snprintf(line, sizeof(line), "%08" PRIX32 " %08" PRIX32, op1, op2);
 
 	int gsaP, rgsaP, parP, rparP;
 	int maxProbability = INT_MIN;

@@ -1,5 +1,12 @@
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.10)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/src/platform/cmake/")
+
+if(POLICY CMP0075)
+	cmake_policy(SET CMP0075 NEW)
+endif()
+if(POLICY CMP0177)
+	cmake_policy(SET CMP0177 NEW)
+endif()
 
 if(POLICY CMP0025)
 	cmake_policy(SET CMP0025 NEW)
@@ -10,6 +17,28 @@ if(POLICY CMP0072)
 endif()
 
 project(mGBA)
+
+if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	# Keep desktop testing close to the native KOS port, including when
+	# reusing a cache from an upstream build with optional features enabled.
+	foreach(OPTION BUILD_QT BUILD_GL BUILD_GLES2 BUILD_GLES3
+		BUILD_SHARED BUILD_LIBRETRO BUILD_PYTHON USE_EPOXY
+		USE_FFMPEG USE_SQLITE3 USE_ZLIB USE_MINIZIP USE_LIBZIP USE_PNG
+		USE_LZMA USE_ELF USE_EDITLINE USE_DISCORD_RPC USE_LUA ENABLE_SCRIPTING
+		USE_DEBUGGERS USE_GDB_STUB USE_PIXMAN BUILD_PERF BUILD_TEST BUILD_SUITE
+		BUILD_CINEMA BUILD_ROM_TEST BUILD_EXAMPLE BUILD_DOCGEN BUILD_UPDATER)
+		set(${OPTION} OFF CACHE BOOL "Disabled for the minimal emulator build" FORCE)
+	endforeach()
+	set(BUILD_STATIC ON CACHE BOOL "Build a static library" FORCE)
+	set(BUILD_LTO ON CACHE BOOL "Build with link-time optimization" FORCE)
+	add_definitions(-D_GNU_SOURCE -DCOLOR_16_BIT -DCOLOR_5_6_5)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		set(BUILD_SDL ON CACHE BOOL "Build SDL frontend" FORCE)
+		set(SDL_VERSION "2" CACHE STRING "Version of SDL to use" FORCE)
+	else()
+		set(BUILD_SDL OFF CACHE BOOL "Build SDL frontend" FORCE)
+	endif()
+endif()
 
 if(NOT DEFINED LIBMGBA_ONLY)
 	get_directory_property(LIBMGBA_ONLY EXCLUDE_FROM_ALL)
@@ -149,7 +178,7 @@ endif()
 mark_as_advanced(DISTBUILD)
 
 set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${LIBDIR}")
-if(${CMAKE_INSTALL_PREFIX} STREQUAL "/usr")
+if("${CMAKE_INSTALL_PREFIX}" STREQUAL "/usr")
 	set(CMAKE_SKIP_RPATH ON)
 endif()
 
@@ -282,7 +311,13 @@ if(NOT HAIKU AND NOT MSVC AND NOT PSP2)
 endif()
 list(APPEND OS_LIB ${M_LIBRARY})
 
-if(APPLE OR CMAKE_C_COMPILER_ID STREQUAL "GNU" AND BUILD_LTO)
+if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND BUILD_LTO)
+	# kos-cc prepends -ffat-lto-objects from the KOS environment. Our archive
+	# is linked with LTO and uses KOS's gcc-ar/gcc-ranlib wrappers, so omit
+	# the unused native-code fallback from each object. Keep parallel LTO.
+	set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto=auto -fno-fat-lto-objects")
+	set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto=auto -fno-fat-lto-objects")
+elseif(APPLE OR CMAKE_C_COMPILER_ID STREQUAL "GNU" AND BUILD_LTO)
 	set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto")
 	set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
 endif()
@@ -1034,6 +1069,10 @@ endif()
 if(ENABLE_SCRIPTING AND BUILD_DOCGEN)
 	add_executable(docgen ${CMAKE_CURRENT_SOURCE_DIR}/src/script/docgen.c)
 	target_link_libraries(docgen ${OS_LIB} ${PLATFORM_LIBRARY} ${BINARY_NAME})
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" AND NOT DISABLE_FRONTENDS)
+	add_subdirectory(src/platform/dreamcast)
 endif()
 
 if(BUILD_SDL)

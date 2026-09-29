@@ -524,7 +524,7 @@ void GBASavedataWriteEEPROM(struct GBASavedata* savedata, uint16_t value, uint32
 			mTimingSchedule(savedata->timing, &savedata->dust, EEPROM_SETTLE_CYCLES);
 			++savedata->writeAddress;
 		} else {
-			mLOG(GBA_SAVE, GAME_ERROR, "Writing beyond end of EEPROM: %08X", (savedata->writeAddress >> 3));
+			mLOG(GBA_SAVE, GAME_ERROR, "Writing beyond end of EEPROM: %08" PRIX32, (savedata->writeAddress >> 3));
 		}
 		break;
 	case EEPROM_COMMAND_READ_PENDING:
@@ -556,7 +556,7 @@ uint16_t GBASavedataReadEEPROM(struct GBASavedata* savedata) {
 		uint32_t address = (savedata->readAddress + step) >> 3;
 		_ensureEeprom(savedata, address);
 		if (address >= SIZE_CART_EEPROM) {
-			mLOG(GBA_SAVE, GAME_ERROR, "Reading beyond end of EEPROM: %08X", address);
+			mLOG(GBA_SAVE, GAME_ERROR, "Reading beyond end of EEPROM: %08" PRIX32, address);
 			return 0xFF;
 		}
 		uint8_t data = savedata->data[address] >> (0x7 - (step & 0x7));
@@ -694,7 +694,7 @@ void GBASavedataRTCRead(struct GBASavedata* savedata) {
 
 	savedata->gpio->rtc.offset = savedata->gpio->rtc.lastLatch - rtcTime;
 
-	mLOG(GBA_SAVE, DEBUG, "Savegame time offset set to %li", savedata->gpio->rtc.offset);
+	mLOG(GBA_SAVE, DEBUG, "Savegame time offset set to %" PRIdMAX, (intmax_t) savedata->gpio->rtc.offset);
 }
 
 void GBASavedataSerialize(const struct GBASavedata* savedata, struct GBASerializedState* state) {

@@ -77,13 +77,13 @@ bool GBDeserialize(struct GB* gb, const struct GBSerializedState* state) {
 	uint16_t ucheck16;
 	LOAD_32LE(ucheck, 0, &state->versionMagic);
 	if (ucheck > GBSavestateMagic + GBSavestateVersion) {
-		mLOG(GB_STATE, WARN, "Invalid or too new savestate: expected %08X, got %08X", GBSavestateMagic + GBSavestateVersion, ucheck);
+		mLOG(GB_STATE, WARN, "Invalid or too new savestate: expected %08" PRIX32 ", got %08" PRIX32, GBSavestateMagic + GBSavestateVersion, ucheck);
 		error = true;
 	} else if (ucheck < GBSavestateMagic) {
-		mLOG(GB_STATE, WARN, "Invalid savestate: expected %08X, got %08X", GBSavestateMagic + GBSavestateVersion, ucheck);
+		mLOG(GB_STATE, WARN, "Invalid savestate: expected %08" PRIX32 ", got %08" PRIX32, GBSavestateMagic + GBSavestateVersion, ucheck);
 		error = true;
 	} else if (ucheck < GBSavestateMagic + GBSavestateVersion) {
-		mLOG(GB_STATE, WARN, "Old savestate: expected %08X, got %08X, continuing anyway", GBSavestateMagic + GBSavestateVersion, ucheck);
+		mLOG(GB_STATE, WARN, "Old savestate: expected %08" PRIX32 ", got %08" PRIX32 ", continuing anyway", GBSavestateMagic + GBSavestateVersion, ucheck);
 	}
 	bool canSgb = ucheck >= GBSavestateMagic + 2;
 

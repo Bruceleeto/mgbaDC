@@ -15,7 +15,14 @@ CXX_GUARD_START
 #define IDLE_LOOP_NONE 0xFFFFFFFF
 
 struct GBACartridgeOverride {
-	char id[4];
+	/* Four cartridge-code bytes, intentionally without a NUL terminator. */
+	char id[4]
+#if defined(__has_attribute)
+#if __has_attribute(nonstring)
+		__attribute__((nonstring))
+#endif
+#endif
+		;
 	enum SavedataType savetype;
 	int hardware;
 	uint32_t idleLoop;

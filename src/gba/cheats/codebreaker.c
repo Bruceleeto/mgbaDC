@@ -188,7 +188,7 @@ static void _cbReseed(struct GBACheatSet* cheats, uint32_t op1, uint16_t op2) {
 
 bool GBACheatAddCodeBreaker(struct GBACheatSet* cheats, uint32_t op1, uint16_t op2) {
 	char line[14] = "XXXXXXXX XXXX";
-	snprintf(line, sizeof(line), "%08X %04X", op1, op2);
+	snprintf(line, sizeof(line), "%08" PRIX32 " %04X", op1, op2);
 
 	if (cheats->cbMaster) {
 		_cbDecrypt(cheats, &op1, &op2);
@@ -237,7 +237,7 @@ bool GBACheatAddCodeBreaker(struct GBACheatSet* cheats, uint32_t op1, uint16_t o
 		cheats->incompleteCheat = mCheatListIndex(&cheats->d.list, cheat);
 		break;
 	case CB_FILL_8:
-		mLOG(CHEATS, STUB, "CodeBreaker code %08X %04X not supported", op1, op2);
+		mLOG(CHEATS, STUB, "CodeBreaker code %08" PRIX32 " %04X not supported", op1, op2);
 		return false;
 	case CB_AND_2:
 		cheat = mCheatListAppend(&cheats->d.list);
@@ -283,7 +283,7 @@ bool GBACheatAddCodeBreaker(struct GBACheatSet* cheats, uint32_t op1, uint16_t o
 			cheat->repeat = 1;
 			return true;
 		default:
-			mLOG(CHEATS, STUB, "CodeBreaker code %08X %04X not supported", op1, op2);
+			mLOG(CHEATS, STUB, "CodeBreaker code %08" PRIX32 " %04X not supported", op1, op2);
 			return false;
 		}
 	case CB_ADD_2:

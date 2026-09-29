@@ -349,9 +349,9 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 		}
 
 		if (gba->yankedRomSize || !gba->hardCrash) {
-			mLOG(GBA_MEM, GAME_ERROR, "Jumped to invalid address: %08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Jumped to invalid address: %08" PRIX32, address);
 		} else {
-			mLOG(GBA_MEM, FATAL, "Jumped to invalid address: %08X", address);
+			mLOG(GBA_MEM, FATAL, "Jumped to invalid address: %08" PRIX32, address);
 		}
 		return;
 	}
@@ -370,11 +370,11 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 		if (memory->activeRegion == REGION_BIOS) { \
 			LOAD_32(value, address & -4, memory->bios); \
 		} else { \
-			mLOG(GBA_MEM, GAME_ERROR, "Bad BIOS Load32: 0x%08X", address); \
+			mLOG(GBA_MEM, GAME_ERROR, "Bad BIOS Load32: 0x%08" PRIX32, address); \
 			value = memory->biosPrefetch; \
 		} \
 	} else { \
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load32: 0x%08X", address); \
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load32: 0x%08" PRIX32, address); \
 		value = GBALoadBad(cpu); \
 	}
 
@@ -392,7 +392,7 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 #define LOAD_VRAM \
 	if ((address & 0x0001FFFF) >= SIZE_VRAM) { \
 		if ((address & (SIZE_VRAM | 0x00014000)) == SIZE_VRAM && (GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3)) { \
-			mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Load32: 0x%08X", address); \
+			mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Load32: 0x%08" PRIX32, address); \
 			value = 0; \
 		} else { \
 			LOAD_32(value, address & 0x00017FFC, gba->video.vram); \
@@ -414,7 +414,7 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 	} else if (memory->vfame.cartType) { \
 		value = GBAVFameGetPatternValue(address, 32); \
 	} else { \
-		mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load32: 0x%08X", address); \
+		mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load32: 0x%08" PRIX32, address); \
 		value = ((address & ~3) >> 1) & 0xFFFF; \
 		value |= (((address & ~3) + 2) >> 1) << 16; \
 	}
@@ -500,7 +500,7 @@ uint32_t GBALoad32(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		LOAD_SRAM;
 		break;
 	default:
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load32: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load32: 0x%08" PRIX32, address);
 		LOAD_BAD;
 		break;
 	}
@@ -529,11 +529,11 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 			if (memory->activeRegion == REGION_BIOS) {
 				LOAD_16(value, address & -2, memory->bios);
 			} else {
-				mLOG(GBA_MEM, GAME_ERROR, "Bad BIOS Load16: 0x%08X", address);
+				mLOG(GBA_MEM, GAME_ERROR, "Bad BIOS Load16: 0x%08" PRIX32, address);
 				value = (memory->biosPrefetch >> ((address & 2) * 8)) & 0xFFFF;
 			}
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load16: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load16: 0x%08" PRIX32, address);
 			value = (GBALoadBad(cpu) >> ((address & 2) * 8)) & 0xFFFF;
 		}
 		break;
@@ -553,7 +553,7 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	case REGION_VRAM:
 		if ((address & 0x0001FFFF) >= SIZE_VRAM) {
 			if ((address & (SIZE_VRAM | 0x00014000)) == SIZE_VRAM && (GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3)) {
-				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Load16: 0x%08X", address);
+				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Load16: 0x%08" PRIX32, address);
 				value = 0;
 				break;
 			}
@@ -585,11 +585,11 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 			} else if (agbPrintAddr < AGB_PRINT_TOP || (agbPrintAddr & 0x00FFFFF8) == AGB_PRINT_STRUCT) {
 				value = _agbPrintLoad(gba, address);
 			} else {
-				mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08X", address);
+				mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08" PRIX32, address);
 				value = (address >> 1) & 0xFFFF;
 			}
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08" PRIX32, address);
 			value = (address >> 1) & 0xFFFF;
 		}
 		break;
@@ -604,7 +604,7 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		} else if (memory->vfame.cartType) {
 			value = GBAVFameGetPatternValue(address, 16);
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08" PRIX32, address);
 			value = (address >> 1) & 0xFFFF;
 		}
 		break;
@@ -615,7 +615,7 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		value |= value << 8;
 		break;
 	default:
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load16: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load16: 0x%08" PRIX32, address);
 		value = (GBALoadBad(cpu) >> ((address & 2) * 8)) & 0xFFFF;
 		break;
 	}
@@ -644,11 +644,11 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 			if (memory->activeRegion == REGION_BIOS) {
 				value = ((uint8_t*) memory->bios)[address];
 			} else {
-				mLOG(GBA_MEM, GAME_ERROR, "Bad BIOS Load8: 0x%08X", address);
+				mLOG(GBA_MEM, GAME_ERROR, "Bad BIOS Load8: 0x%08" PRIX32, address);
 				value = (memory->biosPrefetch >> ((address & 3) * 8)) & 0xFF;
 			}
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load8: 0x%08x", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load8: 0x%08" PRIx32, address);
 			value = (GBALoadBad(cpu) >> ((address & 3) * 8)) & 0xFF;
 		}
 		break;
@@ -668,7 +668,7 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	case REGION_VRAM:
 		if ((address & 0x0001FFFF) >= SIZE_VRAM) {
 			if ((address & (SIZE_VRAM | 0x00014000)) == SIZE_VRAM && (GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3)) {
-				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Load8: 0x%08X", address);
+				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Load8: 0x%08" PRIX32, address);
 				value = 0;
 				break;
 			}
@@ -695,7 +695,7 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		} else if (memory->vfame.cartType) {
 			value = GBAVFameGetPatternValue(address, 8);
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load8: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load8: 0x%08" PRIX32, address);
 			value = ((address >> 1) >> ((address & 1) * 8)) & 0xFF;
 		}
 		break;
@@ -720,13 +720,13 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		} else if (memory->savedata.type == SAVEDATA_SRAM512) {
 			value = memory->savedata.data[address & (SIZE_CART_SRAM512 - 1)];
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Reading from non-existent SRAM: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Reading from non-existent SRAM: 0x%08" PRIX32, address);
 			value = 0xFF;
 		}
 		value &= 0xFF;
 		break;
 	default:
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load8: 0x%08x", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load8: 0x%08" PRIx32, address);
 		value = (GBALoadBad(cpu) >> ((address & 3) * 8)) & 0xFF;
 		break;
 	}
@@ -763,7 +763,7 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 #define STORE_VRAM \
 	if ((address & 0x0001FFFF) >= SIZE_VRAM) { \
 		if ((address & (SIZE_VRAM | 0x00014000)) == SIZE_VRAM && (GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3)) { \
-			mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Store32: 0x%08X", address); \
+			mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Store32: 0x%08" PRIX32, address); \
 		} else { \
 			LOAD_32(oldValue, address & 0x00017FFC, gba->video.vram); \
 			if (oldValue != value) { \
@@ -799,11 +799,11 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		GBAMatrixWrite(gba, address & 0x3C, value); \
 		break; \
 	} \
-	mLOG(GBA_MEM, STUB, "Unimplemented memory Store32: 0x%08X", address);
+	mLOG(GBA_MEM, STUB, "Unimplemented memory Store32: 0x%08" PRIX32, address);
 
 #define STORE_SRAM \
 	if (address & 0x3) { \
-		mLOG(GBA_MEM, GAME_ERROR, "Unaligned SRAM Store32: 0x%08X", address); \
+		mLOG(GBA_MEM, GAME_ERROR, "Unaligned SRAM Store32: 0x%08" PRIX32, address); \
 	} else { \
 		GBAStore8(cpu, address, value, cycleCounter); \
 		GBAStore8(cpu, address | 1, value, cycleCounter); \
@@ -812,7 +812,7 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	}
 
 #define STORE_BAD \
-	mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store32: 0x%08X", address);
+	mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store32: 0x%08" PRIX32, address);
 
 void GBAStore32(struct ARMCore* cpu, uint32_t address, int32_t value, int* cycleCounter) {
 	struct GBA* gba = (struct GBA*) cpu->master;
@@ -893,7 +893,7 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 	case REGION_VRAM:
 		if ((address & 0x0001FFFF) >= SIZE_VRAM) {
 			if ((address & (SIZE_VRAM | 0x00014000)) == SIZE_VRAM && (GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3)) {
-				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Store16: 0x%08X", address);
+				mLOG(GBA_MEM, GAME_ERROR, "Bad VRAM Store16: 0x%08" PRIX32, address);
 				break;
 			}
 			LOAD_16(oldValue, address & 0x00017FFE, gba->video.vram);
@@ -922,7 +922,7 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 	case REGION_CART0:
 		if (IS_GPIO_REGISTER(address & 0xFFFFFE)) {
 			if (memory->hw.devices == HW_NONE) {
-				mLOG(GBA_HW, WARN, "Write to GPIO address %08X on cartridge without GPIO", address);
+				mLOG(GBA_HW, WARN, "Write to GPIO address %08" PRIX32 " on cartridge without GPIO", address);
 				break;
 			}
 			uint32_t reg = address & 0xFFFFFE;
@@ -969,7 +969,7 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 				break;
 			}
 		}
-		mLOG(GBA_MEM, GAME_ERROR, "Bad cartridge Store16: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad cartridge Store16: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART2_EX:
 		if ((address & 0x0DFC0000) >= 0x0DF80000 && memory->hw.devices & HW_EREADER) {
@@ -983,19 +983,19 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 			GBASavedataWriteEEPROM(&memory->savedata, value, 1);
 			break;
 		}
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store16: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store16: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART_SRAM:
 	case REGION_CART_SRAM_MIRROR:
 		if (address & 1) {
-			mLOG(GBA_MEM, GAME_ERROR, "Unaligned SRAM Store16: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Unaligned SRAM Store16: 0x%08" PRIX32, address);
 			break;
 		}
 		GBAStore8(cpu, address, value, cycleCounter);
 		GBAStore8(cpu, address | 1, value, cycleCounter);
 		break;
 	default:
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store16: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store16: 0x%08" PRIX32, address);
 		break;
 	}
 
@@ -1030,7 +1030,7 @@ void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCo
 		break;
 	case REGION_VRAM:
 		if ((address & 0x0001FFFF) >= ((GBARegisterDISPCNTGetMode(gba->memory.io[REG_DISPCNT >> 1]) >= 3) ? 0x00014000 : 0x00010000)) {
-			mLOG(GBA_MEM, GAME_ERROR, "Cannot Store8 to OBJ: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Cannot Store8 to OBJ: 0x%08" PRIX32, address);
 			break;
 		}
 		oldValue = gba->video.renderer->vram[(address & 0x1FFFE) >> 1];
@@ -1043,10 +1043,10 @@ void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCo
 		}
 		break;
 	case REGION_OAM:
-		mLOG(GBA_MEM, GAME_ERROR, "Cannot Store8 to OAM: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Cannot Store8 to OAM: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART0:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Store8: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Store8: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART_SRAM:
 	case REGION_CART_SRAM_MIRROR:
@@ -1076,12 +1076,12 @@ void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCo
 			memory->savedata.data[address & (SIZE_CART_SRAM512 - 1)] = value;
 			memory->savedata.dirty |= mSAVEDATA_DIRT_NEW;
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08" PRIX32, address);
 		}
 		wait = memory->waitstatesNonseq16[REGION_CART_SRAM];
 		break;
 	default:
-		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store8: 0x%08X", address);
+		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store8: 0x%08" PRIX32, address);
 		break;
 	}
 
@@ -1221,7 +1221,7 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 		STORE_32(value, address & (SIZE_WORKING_IRAM - 4), memory->iwram);
 		break;
 	case REGION_IO:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch32: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch32: 0x%08" PRIX32, address);
 		break;
 	case REGION_PALETTE_RAM:
 		LOAD_32(oldValue, address & (SIZE_PALETTE_RAM - 1), gba->video.palette);
@@ -1268,11 +1268,11 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 			LOAD_32(oldValue, address & (SIZE_CART_SRAM - 4), memory->savedata.data);
 			STORE_32(value, address & (SIZE_CART_SRAM - 4), memory->savedata.data);
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08" PRIX32, address);
 		}
 		break;
 	default:
-		mLOG(GBA_MEM, WARN, "Bad memory Patch16: 0x%08X", address);
+		mLOG(GBA_MEM, WARN, "Bad memory Patch16: 0x%08" PRIX32, address);
 		break;
 	}
 	if (old) {
@@ -1295,7 +1295,7 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
 		STORE_16(value, address & (SIZE_WORKING_IRAM - 2), memory->iwram);
 		break;
 	case REGION_IO:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch16: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch16: 0x%08" PRIX32, address);
 		break;
 	case REGION_PALETTE_RAM:
 		LOAD_16(oldValue, address & (SIZE_PALETTE_RAM - 2), gba->video.palette);
@@ -1338,11 +1338,11 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
 			LOAD_16(oldValue, address & (SIZE_CART_SRAM - 2), memory->savedata.data);
 			STORE_16(value, address & (SIZE_CART_SRAM - 2), memory->savedata.data);
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08" PRIX32, address);
 		}
 		break;
 	default:
-		mLOG(GBA_MEM, WARN, "Bad memory Patch16: 0x%08X", address);
+		mLOG(GBA_MEM, WARN, "Bad memory Patch16: 0x%08" PRIX32, address);
 		break;
 	}
 	if (old) {
@@ -1365,16 +1365,16 @@ void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old)
 		((int8_t*) memory->iwram)[address & (SIZE_WORKING_IRAM - 1)] = value;
 		break;
 	case REGION_IO:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_PALETTE_RAM:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_VRAM:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_OAM:
-		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08X", address);
+		mLOG(GBA_MEM, STUB, "Unimplemented memory Patch8: 0x%08" PRIX32, address);
 		break;
 	case REGION_CART0:
 	case REGION_CART0_EX:
@@ -1396,11 +1396,11 @@ void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old)
 			oldValue = ((int8_t*) memory->savedata.data)[address & (SIZE_CART_SRAM - 1)];
 			((int8_t*) memory->savedata.data)[address & (SIZE_CART_SRAM - 1)] = value;
 		} else {
-			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08X", address);
+			mLOG(GBA_MEM, GAME_ERROR, "Writing to non-existent SRAM: 0x%08" PRIX32, address);
 		}
 		break;
 	default:
-		mLOG(GBA_MEM, WARN, "Bad memory Patch8: 0x%08X", address);
+		mLOG(GBA_MEM, WARN, "Bad memory Patch8: 0x%08" PRIX32, address);
 		break;
 	}
 	if (old) {

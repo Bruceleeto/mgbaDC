@@ -15,15 +15,15 @@
 
 static void _remapMatrix(struct GBA* gba) {
 	if (gba->memory.matrix.vaddr & 0xFFFFE1FF) {
-		mLOG(GBA_MEM, ERROR, "Invalid Matrix mapping: %08X", gba->memory.matrix.vaddr);
+		mLOG(GBA_MEM, ERROR, "Invalid Matrix mapping: %08" PRIX32, gba->memory.matrix.vaddr);
 		return;
 	}
 	if (gba->memory.matrix.size & 0xFFFFE1FF) {
-		mLOG(GBA_MEM, ERROR, "Invalid Matrix size: %08X", gba->memory.matrix.size);
+		mLOG(GBA_MEM, ERROR, "Invalid Matrix size: %08" PRIX32, gba->memory.matrix.size);
 		return;
 	}
 	if ((gba->memory.matrix.vaddr + gba->memory.matrix.size - 1) & 0xFFFFE000) {
-		mLOG(GBA_MEM, ERROR, "Invalid Matrix mapping end: %08X", gba->memory.matrix.vaddr + gba->memory.matrix.size);
+		mLOG(GBA_MEM, ERROR, "Invalid Matrix mapping end: %08" PRIX32, gba->memory.matrix.vaddr + gba->memory.matrix.size);
 		return;
 	}
 	int start = gba->memory.matrix.vaddr >> 9;
@@ -59,7 +59,7 @@ void GBAMatrixWrite(struct GBA* gba, uint32_t address, uint32_t value) {
 			_remapMatrix(gba);
 			break;
 		default:
-			mLOG(GBA_MEM, STUB, "Unknown Matrix command: %08X", value);
+			mLOG(GBA_MEM, STUB, "Unknown Matrix command: %08" PRIX32, value);
 			break;
 		}
 		return;
@@ -77,7 +77,7 @@ void GBAMatrixWrite(struct GBA* gba, uint32_t address, uint32_t value) {
 		gba->memory.matrix.size = value << 9;
 		return;
 	}
-	mLOG(GBA_MEM, STUB, "Unknown Matrix write: %08X:%04X", address, value);
+	mLOG(GBA_MEM, STUB, "Unknown Matrix write: %08" PRIX32 ":%04" PRIX32, address, value);
 }
 
 void GBAMatrixWrite16(struct GBA* gba, uint32_t address, uint16_t value) {

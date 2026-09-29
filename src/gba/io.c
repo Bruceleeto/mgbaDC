@@ -368,7 +368,7 @@ void GBAIOWrite(struct GBA* gba, uint32_t address, uint16_t value) {
 		return;
 
 	case REG_VCOUNT:
-		mLOG(GBA_IO, GAME_ERROR, "Write to read-only I/O register: %03X", address);
+		mLOG(GBA_IO, GAME_ERROR, "Write to read-only I/O register: %03" PRIX32, address);
 		return;
 
 	// Audio
@@ -595,7 +595,7 @@ void GBAIOWrite(struct GBA* gba, uint32_t address, uint16_t value) {
 			}
 			value &= ~0x8000;
 		} else {
-			mLOG(GBA_IO, GAME_ERROR, "Write to BIOS-only I/O register: %03X", address);
+			mLOG(GBA_IO, GAME_ERROR, "Write to BIOS-only I/O register: %03" PRIX32, address);
 			return;
 		}
 		break;
@@ -620,9 +620,9 @@ void GBAIOWrite(struct GBA* gba, uint32_t address, uint16_t value) {
 			STORE_16LE(value, address - REG_DEBUG_STRING, gba->debugString);
 			return;
 		}
-		mLOG(GBA_IO, STUB, "Stub I/O register write: %03X", address);
+		mLOG(GBA_IO, STUB, "Stub I/O register write: %03" PRIX32, address);
 		if (address >= REG_MAX) {
-			mLOG(GBA_IO, GAME_ERROR, "Write to unused I/O register: %03X", address);
+			mLOG(GBA_IO, GAME_ERROR, "Write to unused I/O register: %03" PRIX32, address);
 			return;
 		}
 		break;
@@ -930,7 +930,7 @@ uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
 	case REG_DMA3DAD_LO:
 	case REG_DMA3DAD_HI:
 		// Write-only register
-		mLOG(GBA_IO, GAME_ERROR, "Read from write-only I/O register: %03X", address);
+		mLOG(GBA_IO, GAME_ERROR, "Read from write-only I/O register: %03" PRIX32, address);
 		return GBALoadBad(gba->cpu);
 
 	case REG_DMA0CNT_LO:
@@ -1037,7 +1037,7 @@ uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
 	case 0x15A:
 	case 0x206:
 	case 0x302:
-		mLOG(GBA_IO, GAME_ERROR, "Read from unused I/O register: %03X", address);
+		mLOG(GBA_IO, GAME_ERROR, "Read from unused I/O register: %03" PRIX32, address);
 		return 0;
 	// These registers sit outside of the normal I/O block, so we need to stash them somewhere unused
 	case REG_EXWAITCNT_LO:
@@ -1050,7 +1050,7 @@ uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
 		}
 		// Fall through
 	default:
-		mLOG(GBA_IO, GAME_ERROR, "Read from unused I/O register: %03X", address);
+		mLOG(GBA_IO, GAME_ERROR, "Read from unused I/O register: %03" PRIX32, address);
 		return GBALoadBad(gba->cpu);
 	}
 	return gba->memory.io[address >> 1];

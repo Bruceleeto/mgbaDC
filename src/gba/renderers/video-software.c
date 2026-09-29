@@ -380,7 +380,7 @@ static uint16_t GBAVideoSoftwareRendererWriteVideoRegister(struct GBAVideoRender
 		softwareRenderer->mosaic = value;
 		break;
 	default:
-		mLOG(GBA_VIDEO, GAME_ERROR, "Invalid video register: 0x%03X", address);
+		mLOG(GBA_VIDEO, GAME_ERROR, "Invalid video register: 0x%03" PRIX32, address);
 	}
 	softwareRenderer->nextIo[address >> 1] = value;
 	if (softwareRenderer->cache[softwareRenderer->nextY].io[address >> 1] != value) {

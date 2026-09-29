@@ -112,7 +112,7 @@
 			info->operandFormat |= info->operandFormat >> 8; \
 			info->operandFormat &= ~ARM_OPERAND_3; \
 		} \
-		if (info->op1.reg == ARM_PC && (OTHER_AFFECTED & ARM_OPERAND_AFFECTED_1)) { \
+		if (info->op1.reg == ARM_PC && ((OTHER_AFFECTED & ARM_OPERAND_AFFECTED_1) != 0)) { \
 			info->branchType = ARM_BRANCH_INDIRECT; \
 		})
 
@@ -186,7 +186,7 @@
 			ARM_OPERAND_MEMORY_2; \
 		info->memory.format = ARM_MEMORY_REGISTER_BASE | ADDRESSING_MODE; \
 		ADDRESSING_DECODING; \
-		if (info->op1.reg == ARM_PC && (OTHER_AFFECTED & ARM_OPERAND_AFFECTED_1)) { \
+		if (info->op1.reg == ARM_PC && ((OTHER_AFFECTED & ARM_OPERAND_AFFECTED_1) != 0)) { \
 			info->branchType = ARM_BRANCH_INDIRECT; \
 		} \
 		if ((info->memory.format & (ARM_MEMORY_WRITEBACK | ARM_MEMORY_REGISTER_OFFSET)) == (ARM_MEMORY_WRITEBACK | ARM_MEMORY_REGISTER_OFFSET) && \
