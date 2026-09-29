@@ -37,7 +37,8 @@ static void GBAVideoSoftwareRendererWriteBGY_LO(struct GBAVideoSoftwareBackgroun
 static void GBAVideoSoftwareRendererWriteBGY_HI(struct GBAVideoSoftwareBackground* bg, uint16_t value);
 static void GBAVideoSoftwareRendererWriteBLDCNT(struct GBAVideoSoftwareRenderer* renderer, uint16_t value);
 
-static void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* renderer, int y);
+static void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* renderer, int y, bool fillRow);
+static void _fillBackdrop(struct GBAVideoSoftwareRenderer* renderer);
 static void GBAVideoSoftwareRendererPostprocessBuffer(struct GBAVideoSoftwareRenderer* renderer);
 static int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y);
 
@@ -81,6 +82,9 @@ void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer) {
 	renderer->d.highlightAmount = 0;
 
 	renderer->temporaryBuffer = 0;
+	renderer->fastPath = true;
+	renderer->fastLines = 0;
+	renderer->slowLines = 0;
 }
 
 static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
@@ -562,13 +566,29 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 		return;
 	}
 
+	bool fastEligible = GBAVideoSoftwareRendererFastEligible(softwareRenderer);
 	mPROFILE_START(profilePre, "preprocess");
-	GBAVideoSoftwareRendererPreprocessBuffer(softwareRenderer, y);
+	GBAVideoSoftwareRendererPreprocessBuffer(softwareRenderer, y, !fastEligible);
 	mPROFILE_STOP(profilePre);
 	softwareRenderer->spriteCyclesRemaining = GBARegisterDISPCNTIsHblankIntervalFree(softwareRenderer->dispcnt) ? OBJ_HBLANK_FREE_LENGTH : OBJ_LENGTH;
 	mPROFILE_START(profileSprites, "sprites draw");
 	int spriteLayers = GBAVideoSoftwareRendererPreprocessSpriteLayer(softwareRenderer, y);
 	mPROFILE_STOP(profileSprites);
+
+	bool fast = false;
+	if (fastEligible) {
+		mPROFILE_START(profileFast, "fast composite");
+		fast = GBAVideoSoftwareRendererDrawFast(softwareRenderer, y, spriteLayers, row);
+		mPROFILE_STOP(profileFast);
+		if (!fast) {
+			_fillBackdrop(softwareRenderer);
+		}
+	}
+	if (fast) {
+		++softwareRenderer->fastLines;
+		goto finish;
+	}
+	++softwareRenderer->slowLines;
 
 	int w;
 	unsigned priority;
@@ -682,6 +702,7 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	GBAVideoSoftwareRendererPostprocessBuffer(softwareRenderer);
 	mPROFILE_STOP(profilePost);
 
+finish:
 	if (GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) != 0) {
 		if (softwareRenderer->bg[2].enabled == ENABLED_MAX) {
 			softwareRenderer->bg[2].sx += softwareRenderer->bg[2].dmx;
@@ -708,6 +729,10 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	if (softwareRenderer->bg[3].enabled != 0 && softwareRenderer->bg[3].enabled < ENABLED_MAX) {
 		++softwareRenderer->bg[3].enabled;
 		DIRTY_SCANLINE(softwareRenderer, y);
+	}
+
+	if (fast) {
+		return;
 	}
 
 	mPROFILE_START(profileCopy, "copy out");
@@ -872,7 +897,7 @@ static void GBAVideoSoftwareRendererWriteBLDCNT(struct GBAVideoSoftwareRenderer*
 	}
 }
 
-void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* softwareRenderer, int y) {
+void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* softwareRenderer, int y, bool fillRow) {
 	int x;
 	for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; x += 4) {
 		softwareRenderer->spriteLayer[x] = FLAG_UNWRITTEN;
@@ -912,8 +937,19 @@ void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* s
 	}
 	softwareRenderer->forceTarget1 = false;
 
+	if (fillRow) {
+		_fillBackdrop(softwareRenderer);
+	}
+
+	softwareRenderer->bg[0].highlight = softwareRenderer->d.highlightBG[0];
+	softwareRenderer->bg[1].highlight = softwareRenderer->d.highlightBG[1];
+	softwareRenderer->bg[2].highlight = softwareRenderer->d.highlightBG[2];
+	softwareRenderer->bg[3].highlight = softwareRenderer->d.highlightBG[3];
+}
+
+static void _fillBackdrop(struct GBAVideoSoftwareRenderer* softwareRenderer) {
 	int w;
-	x = 0;
+	int x = 0;
 	for (w = 0; w < softwareRenderer->nWindows; ++w) {
 		// TOOD: handle objwin on backdrop
 		uint32_t backdrop = FLAG_UNWRITTEN | FLAG_PRIORITY | FLAG_IS_BACKGROUND;
@@ -936,11 +972,6 @@ void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* s
 			softwareRenderer->row[x] = backdrop;
 		}
 	}
-
-	softwareRenderer->bg[0].highlight = softwareRenderer->d.highlightBG[0];
-	softwareRenderer->bg[1].highlight = softwareRenderer->d.highlightBG[1];
-	softwareRenderer->bg[2].highlight = softwareRenderer->d.highlightBG[2];
-	softwareRenderer->bg[3].highlight = softwareRenderer->d.highlightBG[3];
 }
 
 void GBAVideoSoftwareRendererPostprocessBuffer(struct GBAVideoSoftwareRenderer* softwareRenderer) {

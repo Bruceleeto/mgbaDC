@@ -147,6 +147,11 @@ struct GBAVideoSoftwareRenderer {
 	int end;
 
 	uint8_t lastHighlightAmount;
+
+	// Draw simple lines back to front straight into outputBuffer
+	bool fastPath;
+	uint32_t fastLines;
+	uint32_t slowLines;
 };
 
 void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer);

@@ -18,3 +18,5 @@ CMakeFiles
 CMakeSettings.json
 version.c
 docs/
+/assets/*
+!/assets/.gitkeep

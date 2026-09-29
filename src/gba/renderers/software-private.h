@@ -31,6 +31,9 @@ void GBAVideoSoftwareRendererDrawBackgroundMode5(struct GBAVideoSoftwareRenderer
 int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* renderer, struct GBAObj* sprite, int index, int y);
 void GBAVideoSoftwareRendererPostprocessSprite(struct GBAVideoSoftwareRenderer* renderer, unsigned priority);
 
+bool GBAVideoSoftwareRendererFastEligible(struct GBAVideoSoftwareRenderer* renderer);
+bool GBAVideoSoftwareRendererDrawFast(struct GBAVideoSoftwareRenderer* renderer, int y, int spriteLayers, color_t* out);
+
 static inline unsigned _brighten(unsigned color, int y);
 static inline unsigned _darken(unsigned color, int y);
 

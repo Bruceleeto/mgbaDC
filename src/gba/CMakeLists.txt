@@ -23,6 +23,7 @@ set(SOURCE_FILES
 	renderers/common.c
 	renderers/gl.c
 	renderers/software-bg.c
+	renderers/software-fast.c
 	renderers/software-mode0.c
 	renderers/software-obj.c
 	renderers/video-software.c
