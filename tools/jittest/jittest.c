@@ -16,6 +16,7 @@
 #include <mgba/internal/arm/jit.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/input.h>
+#include <mgba/internal/gba/renderers/video-software.h>
 #include <mgba-util/vfs.h>
 
 #include <stdio.h>
@@ -44,6 +45,17 @@ static void _log(struct mLogger* logger, int category, enum mLogLevel level, con
 }
 
 static struct mLogger _logger = { .log = _log };
+
+/* JITTEST_VRAMFAST: the JIT core's renderer handed lines to a hook that
+ * ignores them, as the Dreamcast's PVR renderer does, which turns on the
+ * stubs' VRAM store path; VRAM is compared every frame. */
+extern void (*GBAVideoSoftwareLineHook)(struct GBAVideoSoftwareRenderer* renderer, int y);
+extern struct GBAVideoSoftwareRenderer* GBAVideoSoftwareLineHookTarget;
+
+static void _ignoreLine(struct GBAVideoSoftwareRenderer* renderer, int y) {
+	(void) renderer;
+	(void) y;
+}
 
 static bool _init(struct Harness* h, const char* rom, const char* state, bool jit) {
 	h->core = mCoreFind(rom);
@@ -404,12 +416,25 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
+	bool vramFast = compare && getenv("JITTEST_VRAMFAST");
+	if (vramFast) {
+		GBAVideoSoftwareLineHookTarget = (struct GBAVideoSoftwareRenderer*) b.gba->video.renderer;
+		GBAVideoSoftwareLineHook = _ignoreLine;
+	}
+
 	struct timespec t0, t1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	uint64_t slices = 0;
 	int frame;
 	for (frame = 0; frame < frames; ++frame) {
 		uint32_t keys = _keysFor(script, frame);
+		if (vramFast) {
+			int d = _firstDiff(a.gba->video.vram, b.gba->video.vram, SIZE_VRAM);
+			if (d >= 0) {
+				printf("VRAM differs at frame %d, offset %x\n", frame, d);
+				return 1;
+			}
+		}
 		a.core->setKeys(a.core, keys);
 		if (!compare && getenv("JITTEST_STEP")) {
 			uint32_t fc = a.gba->video.frameCounter;
@@ -479,7 +504,7 @@ int main(int argc, char** argv) {
 				return 1;
 			}
 		}
-		int p = _firstDiff(a.buffer, b.buffer, sizeof(a.buffer));
+		int p = vramFast ? -1 : _firstDiff(a.buffer, b.buffer, sizeof(a.buffer));
 		if (p >= 0) {
 			printf("picture differs at frame %d, pixel %d\n", frame, p / (int) sizeof(color_t));
 			return 1;
@@ -524,6 +549,13 @@ int main(int argc, char** argv) {
 	double seconds = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
 	if (compare) {
+		if (vramFast) {
+			extern uint8_t GBAVideoSoftwareVRAMUnits[];
+			int u, marked = 0;
+			for (u = 0; u < SIZE_VRAM / 32; ++u) marked += GBAVideoSoftwareVRAMUnits[u] != 0;
+			printf("VRAM units marked by the JIT's store path: %d\n", marked);
+			extern uint32_t dbgVram[3][4];
+		}
 		printf("compare: %d frames, %llu steps, all identical (%.2fs)\n", frames, (unsigned long long) slices,
 		       seconds);
 		_printStats(b.cpu);

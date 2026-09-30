@@ -1,5 +1,5 @@
-/* PVR renderer for GBA video (modes 0-2; no windows, mosaic, bitmap modes
- * or mid-frame palette/OAM changes yet).
+/* PVR renderer for GBA video (no OBJ window, mosaic or mid-frame
+ * palette/OAM changes yet).
  *
  * The software renderer still runs the register side, but hands each line's
  * state to captureLine instead of drawing it. At the end of the frame:
@@ -29,6 +29,7 @@
 
 extern void (*GBAVideoSoftwareLineHook)(struct GBAVideoSoftwareRenderer* renderer, int y);
 extern uint32_t GBAVideoSoftwareVRAMDirty[96];
+extern uint8_t GBAVideoSoftwareVRAMUnits[3072];
 extern struct GBAVideoSoftwareRenderer* GBAVideoSoftwareLineHookTarget;
 
 #define LINES 160
@@ -57,15 +58,73 @@ struct LineBG {
 	int16_t dy;
 };
 
+/* Window spans: the line cut where WIN0/WIN1 start and end, each part with
+ * its WININ/WINOUT bits (0-3 BGs, 4 OBJ, 5 blending) */
+#define MAX_SPANS 8
+
 struct Line {
 	uint16_t dispcnt;
 	uint16_t bldcnt;
 	uint16_t bldalpha;
 	uint16_t bldy;
 	struct LineBG bg[4];
+	uint8_t nSpans;
+	uint8_t spanEnd[MAX_SPANS];
+	uint8_t spanCtl[MAX_SPANS];
 };
 
 static struct Line lines[LINES];
+/* Some line this frame has a window */
+static bool windowed;
+
+static inline bool sameSpans(const struct Line* a, const struct Line* b) {
+	return a->nSpans == b->nSpans && !memcmp(a->spanEnd, b->spanEnd, a->nSpans) &&
+	       !memcmp(a->spanCtl, b->spanCtl, a->nSpans);
+}
+
+static void paintWindow(uint8_t* ctl, int start, int end, uint8_t value) {
+	if (start < 0) start = 0;
+	if (end > 240) end = 240;
+	if (end > start) memset(&ctl[start], value, end - start);
+}
+
+/* As the software renderer's _breakWindow; the OBJ window counts as outside */
+static void captureWindows(const struct GBAVideoSoftwareRenderer* renderer, struct Line* line, int y) {
+	uint16_t dispcnt = renderer->dispcnt;
+	if (!(dispcnt & 0xE000)) {
+		line->nSpans = 1;
+		line->spanEnd[0] = 240;
+		line->spanCtl[0] = 0x3F;
+		return;
+	}
+	uint8_t ctl[240];
+	memset(ctl, renderer->winout.packed & 0x3F, sizeof(ctl));
+	int w;
+	for (w = 1; w >= 0; --w) {
+		if (!(dispcnt & (0x2000 << w))) continue;
+		const struct WindowN* win = &renderer->winN[w];
+		int vs = win->v.start + win->offsetY, ve = win->v.end + win->offsetY;
+		if (win->v.end >= win->v.start ? (y < vs || y >= ve) : (y >= ve && y < vs)) continue;
+		uint8_t value = win->control.packed & 0x3F;
+		if (win->h.end > 240 || win->h.end < win->h.start) {
+			paintWindow(ctl, 0, win->h.end, value);
+			paintWindow(ctl, win->h.start, 240, value);
+		} else {
+			paintWindow(ctl, win->h.start, win->h.end, value);
+		}
+	}
+	unsigned n = 0;
+	int x;
+	for (x = 1; x <= 240; ++x) {
+		if (x < 240 && ctl[x] == ctl[x - 1]) continue;
+		if (n == MAX_SPANS - 1 && x < 240) continue;
+		line->spanEnd[n] = x;
+		line->spanCtl[n] = ctl[x - 1];
+		++n;
+	}
+	line->nSpans = n;
+	windowed = true;
+}
 
 struct Layer {
 	pvr_ptr_t texture;
@@ -77,6 +136,8 @@ struct Layer {
 	 * one frame, so a layer that skipped one is rebuilt */
 	unsigned builtFrame;
 	uint16_t shadow[128 * 128];
+	/* Bitmap layers: VRAM units changed since the last build */
+	uint32_t pending[UNITS / 32];
 };
 
 /* Textures by BG configuration: a BG can change mode or BGCNT partway down
@@ -152,6 +213,7 @@ static void captureLine(struct GBAVideoSoftwareRenderer* renderer, int y) {
 		out->dx = bg->dx;
 		out->dy = bg->dy;
 	}
+	captureWindows(renderer, line, y);
 }
 
 /* Twiddled index: y in bit 0, x in bit 1, and so on up */
@@ -287,6 +349,11 @@ static bool lineHas(const struct Line* line, int bg, bool* affine) {
 	if (line->dispcnt & 0x80) return false;
 	if (!(line->dispcnt & (0x100 << bg)) || !line->bg[bg].on) return false;
 	switch (line->dispcnt & 7) {
+	case 3:
+	case 4:
+	case 5:
+		*affine = true;
+		return bg == 2;
 	case 0:
 		*affine = false;
 		return true;
@@ -303,6 +370,21 @@ static bool lineHas(const struct Line* line, int bg, bool* affine) {
 
 static uint32_t layerKey(const struct LineBG* bg, bool affine) {
 	return (bg->charBase >> 14) | ((bg->screenBase >> 11) << 2) | (bg->size << 7) | (bg->pal256 << 9) | (affine << 10);
+}
+
+/* Bitmap modes: BG2 is the frame buffer, keyed by mode and page */
+#define BITMAP_KEY 0x800
+
+static inline bool isBitmap(const struct Line* line) {
+	return (line->dispcnt & 7) >= 3;
+}
+
+static uint32_t lineKey(const struct Line* line, int bg, bool affine) {
+	if (isBitmap(line)) {
+		unsigned mode = line->dispcnt & 7;
+		return BITMAP_KEY | (mode << 12) | ((mode != 3 && (line->dispcnt & 0x10)) << 15);
+	}
+	return layerKey(&line->bg[bg], affine);
 }
 
 static inline bool unitDirty(unsigned unit) {
@@ -399,6 +481,94 @@ static void buildLayer(struct Layer* layer, const uint8_t* vram, const struct Li
 	if (full) mPROFILE_ADD(pRebuild, "pvr: layer rebuilds", 1);
 }
 
+/* A bitmap's size and texture: modes 3 and 5 are ARGB1555 with a 512-byte
+ * stride, so each 32-byte VRAM unit is one store queue; mode 4 is twiddled
+ * PAL8 made of 8x8 tiles */
+struct BitmapFormat {
+	unsigned width, height, texW, texH;
+	uint32_t format;
+};
+
+static struct BitmapFormat bitmapFormat(uint32_t key) {
+	switch ((key >> 12) & 7) {
+	case 3:
+		return (struct BitmapFormat) { 240, 160, 256, 256, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED };
+	case 4:
+		return (struct BitmapFormat) { 240, 160, 256, 256, 0 };
+	default:
+		return (struct BitmapFormat) { 160, 128, 256, 128, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED };
+	}
+}
+
+static inline bool pendingUnit(const struct Layer* layer, unsigned unit) {
+	return layer->pending[unit >> 5] & (1U << (unit & 31));
+}
+
+static void buildBitmap(struct Layer* layer, const uint8_t* vram, uint32_t key) {
+	struct BitmapFormat f = bitmapFormat(key);
+	uint32_t base = (key & 0x8000) ? 0xA000 : 0;
+	if (!reserve(layer, f.texW * f.texH * (f.format ? 2 : 1))) return;
+	bool full = !layer->valid || layer->key != key || noCache;
+	if (full) memset(layer->pending, 0, sizeof(layer->pending));
+	layer->key = key;
+	layer->valid = true;
+	if (layer->builtFrame == frameCount && !full) return;
+	layer->builtFrame = frameCount;
+	unsigned emitted = 0;
+	if (f.format) {
+		/* A unit is 16 pixels of one row */
+		unsigned perRow = f.width / 16, units = perRow * f.height, u;
+		unsigned first = base >> 5;
+		for (u = 0; u < units; ++u) {
+			if (!full && !pendingUnit(layer, first + u)) continue;
+			const uint16_t* src = (const uint16_t*) &vram[base + u * 32];
+			uint32_t* sq = sqAddress(layer->texture, (u / perRow) * 512 + (u % perRow) * 32);
+			int i;
+			for (i = 0; i < 8; ++i) {
+				uint32_t c = src[i * 2] | (src[i * 2 + 1] << 16);
+				/* GBA is BGR, the PVR RGB: swap the 5-bit R and B fields */
+				c = 0x80008000U | ((c & 0x001F001FU) << 10) | (c & 0x03E003E0U) | ((c >> 10) & 0x001F001FU);
+				sq[i] = c;
+			}
+			sq_flush(sq);
+			++emitted;
+		}
+	} else {
+		uint8_t tile[64] __attribute__((aligned(4)));
+		unsigned tx, ty;
+		for (ty = 0; ty < 20; ++ty) {
+			uint32_t rowBase = base + ty * 8 * 240;
+			if (!full) {
+				unsigned u, dirty = 0;
+				for (u = rowBase >> 5; u <= (rowBase + 1919) >> 5 && !dirty; ++u) dirty = pendingUnit(layer, u);
+				if (!dirty) continue;
+			}
+			for (tx = 0; tx < 30; ++tx) {
+				uint32_t o = rowBase + tx * 8;
+				int r;
+				if (!full) {
+					bool dirty = false;
+					for (r = 0; r < 8 && !dirty; ++r) {
+						uint32_t a = o + r * 240;
+						dirty = pendingUnit(layer, a >> 5) || pendingUnit(layer, (a + 7) >> 5);
+					}
+					if (!dirty) continue;
+				}
+				for (r = 0; r < 8; ++r) {
+					const uint8_t* src = &vram[o + r * 240];
+					int c;
+					for (c = 0; c < 8; ++c) tile[twiddle[r * 8 + c]] = src[c];
+				}
+				emitTile(sqAddress(layer->texture, tileOffset(tx, ty, 32, 32)), tile, 0, 0);
+				++emitted;
+			}
+		}
+	}
+	memset(layer->pending, 0, sizeof(layer->pending));
+	STAT(mapTiles, emitted);
+	mPROFILE_ADD(pBitmap, "pvr: bitmap units emitted", emitted);
+}
+
 static void updatePalette(const uint16_t* palette) {
 	int i;
 	for (i = 0; i < 512; ++i) {
@@ -418,6 +588,14 @@ static void updatePalette(const uint16_t* palette) {
  * the framebuffer is 320x240 and the video output line-doubles it. */
 #define SCALE ((float) PVR_GBA_WIDTH / 240.0f)
 #define ORIGIN_Y (((float) PVR_GBA_HEIGHT - 160.0f * SCALE) / 2)
+/* Where in a GBA pixel the PVR's first sample lands: its centre at 1:1,
+ * 1/8 in at 320 wide (samples at 1/8, 3/8, 5/8, 7/8). Affine texcoords
+ * are phased from just below it so every sample reads the GBA's texel */
+#if PVR_GBA_WIDTH == 240
+#define AFFINE_PHASE 0.5f
+#else
+#define AFFINE_PHASE (0.125f - 1.0f / 32)
+#endif
 
 static inline void submitHeader(const pvr_poly_hdr_t* header) {
 	uint32_t* target = pvr_dr_target();
@@ -492,6 +670,11 @@ static struct Style lineStyle(const struct Line* line, int layer) {
 	return makeStyle(mode == 2 ? STYLE_BRIGHTEN : STYLE_DARKEN, line);
 }
 
+/* A window span with blending off */
+static inline struct Style spanStyle(const struct Line* line, int layer, uint8_t ctl) {
+	return (ctl & 0x20) ? lineStyle(line, layer) : makeStyle(STYLE_PLAIN, line);
+}
+
 static inline bool sameStyle(const struct Style* a, const struct Style* b) {
 	return a->kind == b->kind && a->argb == b->argb && a->oargb == b->oargb;
 }
@@ -529,10 +712,11 @@ static void rect(float x0, float y0, float x1, float y1, float z,
 }
 
 static void compileHeader(pvr_poly_hdr_t* header, pvr_ptr_t texture, unsigned bank, unsigned width, unsigned height,
-                          unsigned kind) {
+                          unsigned kind, uint32_t format) {
 	pvr_poly_cxt_t context;
 	pvr_poly_cxt_txr(&context, kind == STYLE_ALPHA ? PVR_LIST_TR_POLY : PVR_LIST_PT_POLY,
-	                 PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank), width, height, texture, PVR_FILTER_NONE);
+	                 format ? format : PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_8BPP_PAL(bank), width, height, texture,
+	                 PVR_FILTER_NONE);
 	context.txr.alpha = PVR_TXRALPHA_ENABLE;
 	context.gen.culling = PVR_CULLING_NONE;
 	switch (kind) {
@@ -557,13 +741,15 @@ struct HeaderState {
 	pvr_ptr_t texture;
 	unsigned bank, width, height;
 	int kind;
+	/* 0: PAL8 in bank */
+	uint32_t format;
 };
 
 static void useStyle(struct HeaderState* state, const struct Style* style) {
 	currentStyle = *style;
 	if (state->kind == style->kind) return;
 	pvr_poly_hdr_t header;
-	compileHeader(&header, state->texture, state->bank, state->width, state->height, style->kind);
+	compileHeader(&header, state->texture, state->bank, state->width, state->height, style->kind, state->format);
 	submitHeader(&header);
 	state->kind = style->kind;
 }
@@ -596,20 +782,27 @@ static void drawText(int bg, pvr_ptr_t texture, unsigned width, unsigned height,
 			const struct LineBG* next = &lines[end].bg[bg];
 			bool nextAffine;
 			if (!lineHas(&lines[end], bg, &nextAffine) || nextAffine || next->hofs != line->hofs ||
-			    next->vofs != line->vofs || next->priority != line->priority || layerKey(next, false) != key) {
+			    next->vofs != line->vofs || next->priority != line->priority || layerKey(next, false) != key ||
+			    !sameSpans(&lines[y], &lines[end])) {
 				break;
 			}
 			struct Style nextStyle = lineStyle(&lines[end], bg);
 			if (!sameStyle(&style, &nextStyle)) break;
 			++end;
 		}
-		if (inPass(&style, translucent)) {
-			state.bank = line->pal256 ? 1 : 0;
-			useStyle(&state, &style);
-			float u0 = (line->hofs & 0x1FF) * invW;
-			float v0 = ((line->vofs & 0x1FF) + y) * invH;
-			rect(0, y, 240, end, layerDepth(line->priority, bg),
-			     u0, v0, u0 + 240 * invW, v0 + (end - y) * invH);
+		state.bank = line->pal256 ? 1 : 0;
+		float u0 = (line->hofs & 0x1FF) * invW;
+		float v0 = ((line->vofs & 0x1FF) + y) * invH;
+		unsigned s, x0 = 0;
+		for (s = 0; s < lines[y].nSpans; x0 = lines[y].spanEnd[s++]) {
+			uint8_t ctl = lines[y].spanCtl[s];
+			if (!(ctl & (1 << bg))) continue;
+			struct Style spanned = spanStyle(&lines[y], bg, ctl);
+			if (!inPass(&spanned, translucent)) continue;
+			unsigned x1 = lines[y].spanEnd[s];
+			useStyle(&state, &spanned);
+			rect(x0, y, x1, end, layerDepth(line->priority, bg),
+			     u0 + x0 * invW, v0, u0 + x1 * invW, v0 + (end - y) * invH);
 			++strips;
 		}
 		y = end;
@@ -618,25 +811,31 @@ static void drawText(int bg, pvr_ptr_t texture, unsigned width, unsigned height,
 }
 
 /* Affine BG: a strip per line; without wrapping, cut to the part inside the map */
-static void drawAffine(int bg, pvr_ptr_t texture, unsigned size, uint32_t key, bool translucent) {
-	struct HeaderState state = { texture, 1, size, size, -1 };
-	float inv = 1.0f / (size * 256.0f);
-	float limit = size * 256.0f;
+static void drawAffine(int bg, pvr_ptr_t texture, unsigned width, unsigned height, uint32_t key, bool translucent) {
+	struct HeaderState state = { texture, 1, width, height, -1, 0 };
+	float invU = 1.0f / (width * 256.0f), invV = 1.0f / (height * 256.0f);
+	float limits[2] = { width * 256.0f, height * 256.0f };
+	bool bitmap = key & BITMAP_KEY;
+	if (bitmap) {
+		struct BitmapFormat f = bitmapFormat(key);
+		state.format = f.format;
+		limits[0] = f.width * 256.0f;
+		limits[1] = f.height * 256.0f;
+	}
 	unsigned strips = 0;
 	int y;
 	for (y = 0; y < LINES; ++y) {
 		bool affine;
 		const struct LineBG* line = &lines[y].bg[bg];
-		if (!lineHas(&lines[y], bg, &affine) || !affine || layerKey(line, true) != key) continue;
-		struct Style style = lineStyle(&lines[y], bg);
-		if (!inPass(&style, translucent)) continue;
+		if (!lineHas(&lines[y], bg, &affine) || !affine || lineKey(&lines[y], bg, true) != key) continue;
 		float sx = line->sx, sy = line->sy, dx = line->dx, dy = line->dy;
 		float lo = 0, hi = 240;
-		if (!line->wrap) {
+		if (!line->wrap || bitmap) {
 			/* 0 <= s + x * d < limit on both axes */
 			float s[2] = { sx, sy }, d[2] = { dx, dy };
 			int a;
 			for (a = 0; a < 2; ++a) {
+				float limit = limits[a];
 				if (d[a] == 0) {
 					if (s[a] < 0 || s[a] >= limit) hi = 0;
 				} else if (d[a] > 0) {
@@ -654,16 +853,30 @@ static void drawAffine(int bg, pvr_ptr_t texture, unsigned size, uint32_t key, b
 				continue;
 			}
 		}
-		useStyle(&state, &style);
-		/* The PVR samples pixel centres, the GBA the pixel's left edge */
-		float u0 = (sx + (lo - 0.5f) * dx) * inv, v0 = (sy + (lo - 0.5f) * dy) * inv;
-		float u1 = (sx + (hi - 0.5f) * dx) * inv, v1 = (sy + (hi - 0.5f) * dy) * inv;
-		const float xs[4] = { lo, hi, lo, hi };
-		const float ys[4] = { y, y, y + 1, y + 1 };
-		const float us[4] = { u0, u1, u0, u1 };
-		const float vs[4] = { v0, v1, v0, v1 };
-		submitQuad(xs, ys, layerDepth(line->priority, bg), us, vs);
-		++strips;
+		unsigned s;
+		float x0 = 0;
+		for (s = 0; s < lines[y].nSpans; x0 = lines[y].spanEnd[s++]) {
+			uint8_t ctl = lines[y].spanCtl[s];
+			float a = x0 > lo ? x0 : lo, b = lines[y].spanEnd[s] < hi ? lines[y].spanEnd[s] : hi;
+			if (!(ctl & (1 << bg)) || a >= b) continue;
+			struct Style style = spanStyle(&lines[y], bg, ctl);
+			if (!inPass(&style, translucent)) continue;
+			useStyle(&state, &style);
+			/* The GBA samples a pixel's left edge; half a 1/256 step in
+			 * keeps texel edges off the sample points */
+			float u0 = (sx + 0.5f + (a - AFFINE_PHASE) * dx) * invU, v0 = (sy + 0.5f + (a - AFFINE_PHASE) * dy) * invV;
+			float u1 = (sx + 0.5f + (b - AFFINE_PHASE) * dx) * invU, v1 = (sy + 0.5f + (b - AFFINE_PHASE) * dy) * invV;
+			/* The PVR misses texel edges by up to 1/8 texel: when an axis
+			 * doesn't step along the line, sample the texel's centre */
+			if (dx == 0) u0 = u1 = (floorf(sx / 256) + 0.5f) * 256 * invU;
+			if (dy == 0) v0 = v1 = (floorf(sy / 256) + 0.5f) * 256 * invV;
+			const float xs[4] = { a, b, a, b };
+			const float ys[4] = { y, y, y + 1, y + 1 };
+			const float us[4] = { u0, u1, u0, u1 };
+			const float vs[4] = { v0, v1, v0, v1 };
+			submitQuad(xs, ys, layerDepth(line->priority, bg), us, vs);
+			++strips;
+		}
 	}
 	mPROFILE_ADD(pAffine, "pvr: affine strips", strips);
 }
@@ -675,6 +888,8 @@ struct Sprite {
 	float v[4];
 	float z;
 	bool bpp8;
+	bool semi;
+	int top, bottom;
 	struct Style style;
 };
 
@@ -746,7 +961,7 @@ static inline unsigned cacheSlot(int id) {
 
 /* Finds each visible sprite's pixels in the cache, copying the ones that
  * aren't there, and works out their quads. Returns how many. */
-static unsigned buildSprites(const uint8_t* vram, const uint16_t* oam, bool map1D) {
+static unsigned buildSprites(const uint8_t* vram, const uint16_t* oam, bool map1D, bool bitmap) {
 	unsigned count = 0, tilesCopied = 0;
 	int now = frameCount;
 	int i;
@@ -767,6 +982,8 @@ static unsigned buildSprites(const uint8_t* vram, const uint16_t* oam, bool map1
 		if (x >= 240 || x + bw <= 0 || y >= 160 || y + bh <= 0) continue;
 		bool bpp8 = a & 0x2000;
 		unsigned tile = c & 0x3FF, priority = (c >> 10) & 3;
+		/* Bitmap modes own the first half of OBJ VRAM; those tiles don't draw */
+		if (bitmap && tile < 512) continue;
 		unsigned bank = bpp8 ? 0 : c >> 12;
 		unsigned wT = w >> 3, hT = h >> 3, tx, ty;
 		unsigned side = wT > hT ? wT : hT;
@@ -827,6 +1044,9 @@ static unsigned buildSprites(const uint8_t* vram, const uint16_t* oam, bool map1
 		struct Sprite* sprite = &sprites[count++];
 		sprite->z = (4 - priority) * 8.0f + 6 + (127 - i) / 128.0f;
 		sprite->bpp8 = bpp8;
+		sprite->semi = mode == 1;
+		sprite->top = y;
+		sprite->bottom = y + bh;
 		{
 			/* Semi-transparent sprites always alpha blend */
 			const struct Line* line = &lines[y < 0 ? 0 : y > LINES - 1 ? LINES - 1 : y];
@@ -874,19 +1094,85 @@ static unsigned buildSprites(const uint8_t* vram, const uint16_t* oam, bool map1
 	return count;
 }
 
+struct ClipVertex {
+	float x, y, u, v;
+};
+
+/* Sutherland-Hodgman against one edge: keeps side * (p.axis - edge) >= 0 */
+static unsigned clipEdge(const struct ClipVertex* in, unsigned n, struct ClipVertex* out, int axis, float edge, float side) {
+	unsigned m = 0, i;
+	for (i = 0; i < n; ++i) {
+		const struct ClipVertex* a = &in[i];
+		const struct ClipVertex* b = &in[(i + 1) % n];
+		float da = side * ((axis ? a->y : a->x) - edge), db = side * ((axis ? b->y : b->x) - edge);
+		if (da >= 0) out[m++] = *a;
+		if ((da >= 0) != (db >= 0)) {
+			float t = da / (da - db);
+			out[m].x = a->x + (b->x - a->x) * t;
+			out[m].y = a->y + (b->y - a->y) * t;
+			out[m].u = a->u + (b->u - a->u) * t;
+			out[m].v = a->v + (b->v - a->v) * t;
+			++m;
+		}
+	}
+	return m;
+}
+
+/* The part of a sprite inside a rectangle, as one strip */
+static void submitClipped(const struct Sprite* sprite, float x0, float y0, float x1, float y1) {
+	static const int order[4] = { 0, 1, 3, 2 };
+	struct ClipVertex a[12], b[12];
+	unsigned n = 4, i;
+	for (i = 0; i < 4; ++i) {
+		int k = order[i];
+		a[i] = (struct ClipVertex) { sprite->x[k], sprite->y[k], sprite->u[k], sprite->v[k] };
+	}
+	n = clipEdge(a, n, b, 0, x0, 1);
+	n = clipEdge(b, n, a, 0, x1, -1);
+	n = clipEdge(a, n, b, 1, y0, 1);
+	n = clipEdge(b, n, a, 1, y1, -1);
+	if (n < 3) return;
+	/* A convex polygon as a strip: zigzag in from both ends */
+	unsigned lo = 1, hi = n - 1, k;
+	for (k = 0; k < n; ++k) {
+		const struct ClipVertex* p = !k ? &a[0] : (k & 1) ? &a[lo++] : &a[hi--];
+		submitVertex(k == n - 1, p->x, p->y, sprite->z, p->u, p->v, currentStyle.argb);
+	}
+}
+
 static void drawSprites(unsigned count, bool translucent) {
 	struct HeaderState state = { atlas, 0, ATLAS, ATLAS, -1 };
 	unsigned i;
 	for (i = 0; i < count; ++i) {
 		const struct Sprite* sprite = &sprites[i];
-		if (!inPass(&sprite->style, translucent)) continue;
 		unsigned bank = sprite->bpp8 ? 3 : 2;
 		if (bank != state.bank) {
 			state.bank = bank;
 			state.kind = -1;
 		}
-		useStyle(&state, &sprite->style);
-		submitQuad(sprite->x, sprite->y, sprite->z, sprite->u, sprite->v);
+		if (!windowed) {
+			if (!inPass(&sprite->style, translucent)) continue;
+			useStyle(&state, &sprite->style);
+			submitQuad(sprite->x, sprite->y, sprite->z, sprite->u, sprite->v);
+			continue;
+		}
+		/* Bands of lines with the same windows, each cut to where OBJ shows */
+		int y = sprite->top < 0 ? 0 : sprite->top;
+		int bottom = sprite->bottom > LINES ? LINES : sprite->bottom;
+		while (y < bottom) {
+			int end = y + 1;
+			while (end < bottom && sameSpans(&lines[y], &lines[end])) ++end;
+			unsigned s, x0 = 0;
+			for (s = 0; s < lines[y].nSpans; x0 = lines[y].spanEnd[s++]) {
+				uint8_t ctl = lines[y].spanCtl[s];
+				if (!(ctl & 0x10)) continue;
+				struct Style style = (ctl & 0x20) ? sprite->style : makeStyle(STYLE_PLAIN, &lines[y]);
+				if (!inPass(&style, translucent)) continue;
+				useStyle(&state, &style);
+				submitClipped(sprite, x0, y, lines[y].spanEnd[s], end);
+			}
+			y = end;
+		}
 	}
 }
 
@@ -946,11 +1232,11 @@ bool PVRGBAInit(struct GBA* gba) {
 	return true;
 }
 
-static uint32_t backdropColor(const struct Line* line, uint16_t c) {
+static uint32_t backdropColor(const struct Line* line, uint16_t c, bool blend) {
 	unsigned r = c & 0x1F, g = (c >> 5) & 0x1F, b = (c >> 10) & 0x1F;
 	if (line->dispcnt & 0x80) {
 		r = g = b = 31;
-	} else {
+	} else if (blend) {
 		struct Style style = lineStyle(line, 5);
 		unsigned evy = line->bldy & 0x1F;
 		if (evy > 16) evy = 16;
@@ -974,6 +1260,19 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 	const uint8_t* vram = (const uint8_t*) gba->video.vram;
 	const uint16_t* palette = gba->video.palette;
 	int i;
+	/* The JIT's VRAM stores mark bytes: into bits */
+	const uint32_t* units = (const uint32_t*) GBAVideoSoftwareVRAMUnits;
+	for (i = 0; i < UNITS / 4; ++i) {
+		if (!units[i]) continue;
+		uint32_t w = units[i], bits = 0;
+		if (w & 0x000000FF) bits |= 1;
+		if (w & 0x0000FF00) bits |= 2;
+		if (w & 0x00FF0000) bits |= 4;
+		if (w & 0xFF000000) bits |= 8;
+		/* Little-endian: byte 0 is the lowest unit */
+		GBAVideoSoftwareVRAMDirty[i >> 3] |= bits << ((i & 7) * 4);
+		((uint32_t*) GBAVideoSoftwareVRAMUnits)[i] = 0;
+	}
 	for (i = 0; i < UNITS / 32; ++i) {
 		uint32_t bits = GBAVideoSoftwareVRAMDirty[i];
 		GBAVideoSoftwareVRAMDirty[i] = 0;
@@ -989,6 +1288,11 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 			if (hi & (3U << (b * 2))) bits |= 1U << (b + 16);
 		}
 		dirty8[i] |= bits;
+	}
+	for (i = 0; i < POOL; ++i) {
+		if (!pool[i].valid || !(pool[i].key & BITMAP_KEY)) continue;
+		int w;
+		for (w = 0; w < UNITS / 32; ++w) pool[i].pending[w] |= frameDirty[w];
 	}
 	updatePalette(palette);
 	uint64_t prepared = timer_us_gettime64();
@@ -1017,7 +1321,7 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 #ifdef M_PROFILE
 			++*mProfileCounterLookup(lineNames[bg][affine]);
 #endif
-			uint32_t key = layerKey(&lines[y].bg[bg], affine);
+			uint32_t key = lineKey(&lines[y], bg, affine);
 			unsigned g;
 			for (g = 0; g < nGroups; ++g) {
 				if (groups[g].bg == bg && groups[g].key == key) break;
@@ -1025,7 +1329,14 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 			if (g < nGroups || nGroups == 16) continue;
 			struct Layer* layer = findLayer(key);
 			if (!layer) continue;
-			buildLayer(layer, vram, &lines[y].bg[bg], affine, &groups[g].width, &groups[g].height);
+			if (key & BITMAP_KEY) {
+				struct BitmapFormat f = bitmapFormat(key);
+				buildBitmap(layer, vram, key);
+				groups[g].width = f.texW;
+				groups[g].height = f.texH;
+			} else {
+				buildLayer(layer, vram, &lines[y].bg[bg], affine, &groups[g].width, &groups[g].height);
+			}
 			if (!layer->texture) continue;
 			groups[g].bg = bg;
 			groups[g].key = key;
@@ -1040,7 +1351,7 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 	for (i = 0; i < LINES; ++i) {
 		if ((lines[i].dispcnt & 0x1080) == 0x1000) objects = true;
 	}
-	unsigned spriteCount = objects ? buildSprites(vram, gba->video.oam.raw, lines[0].dispcnt & 0x40) : 0;
+	unsigned spriteCount = objects ? buildSprites(vram, gba->video.oam.raw, lines[0].dispcnt & 0x40, (lines[0].dispcnt & 7) >= 3) : 0;
 	sqRelease();
 	memset(frameDirty, 0, sizeof(frameDirty));
 	uint64_t built = timer_us_gettime64();
@@ -1063,13 +1374,27 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 		currentStyle.oargb = 0;
 		int y = 0;
 		while (y < LINES) {
-			uint32_t argb = backdropColor(&lines[y], palette[0]);
+			uint32_t argb = backdropColor(&lines[y], palette[0], true);
+			uint32_t plain = backdropColor(&lines[y], palette[0], false);
 			int end = y + 1;
-			while (end < LINES && backdropColor(&lines[end], palette[0]) == argb) ++end;
-			submitVertex(false, 0, y, 0.5f, 0, 0, argb);
-			submitVertex(false, 240, y, 0.5f, 0, 0, argb);
-			submitVertex(false, 0, end, 0.5f, 0, 0, argb);
-			submitVertex(true, 240, end, 0.5f, 0, 0, argb);
+			while (end < LINES && backdropColor(&lines[end], palette[0], true) == argb &&
+			       (argb == plain || sameSpans(&lines[y], &lines[end]))) {
+				++end;
+			}
+			unsigned s, x0 = 0;
+			for (s = 0; s < lines[y].nSpans; x0 = lines[y].spanEnd[s++]) {
+				unsigned x1 = lines[y].spanEnd[s];
+				uint32_t c = (lines[y].spanCtl[s] & 0x20) ? argb : plain;
+				/* Merge spans of one colour */
+				while (s + 1 < lines[y].nSpans &&
+				       ((lines[y].spanCtl[s + 1] & 0x20) ? argb : plain) == c) {
+					x1 = lines[y].spanEnd[++s];
+				}
+				submitVertex(false, x0, y, 0.5f, 0, 0, c);
+				submitVertex(false, x1, y, 0.5f, 0, 0, c);
+				submitVertex(false, x0, end, 0.5f, 0, 0, c);
+				submitVertex(true, x1, end, 0.5f, 0, 0, c);
+			}
 			y = end;
 		}
 	}
@@ -1081,7 +1406,7 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 		for (g = 0; g < nGroups; ++g) {
 			const struct Group* group = &groups[g];
 			if (group->affine) {
-				drawAffine(group->bg, group->layer->texture, group->width, group->key, pass);
+				drawAffine(group->bg, group->layer->texture, group->width, group->height, group->key, pass);
 			} else {
 				drawText(group->bg, group->layer->texture, group->width, group->height, group->key, pass);
 			}
@@ -1089,6 +1414,7 @@ void PVRGBAFrame(struct GBA* gba, uint64_t* uploadTime, uint64_t* submitTime) {
 		drawSprites(spriteCount, pass);
 		pvr_list_finish();
 	}
+	windowed = false;
 	pvr_scene_finish();
 	++frameCount;
 #ifdef PVR_GBA_DEBUG

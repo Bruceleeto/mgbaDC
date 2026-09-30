@@ -201,7 +201,7 @@ struct ARMCore {
 	/* The stall stub's r0 while it runs */
 	uint32_t jitTmp;
 	/* What the memory stubs need of mGBA's memory state (JIT_MD_*) */
-	uint32_t jitMemData[15];
+	uint32_t jitMemData[18];
 };
 #undef ARM_REGISTER_FILE
 

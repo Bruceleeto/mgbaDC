@@ -12,6 +12,8 @@
 #include "jit-private.h"
 #include <stdio.h>
 
+#include <mgba/core/profile.h>
+
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/memory.h>
@@ -116,6 +118,11 @@ bool ARMJITInit(struct ARMCore* cpu) {
 	ARMJITHostMap(jit, jit->chunks, sizeof(jit->chunks));
 	ARMJITHostMap(jit, gba->memory.wram, SIZE_WORKING_RAM);
 	ARMJITHostMap(jit, gba->memory.iwram, SIZE_WORKING_IRAM);
+	ARMJITHostMap(jit, gba->video.vram, SIZE_VRAM);
+	{
+		extern uint8_t GBAVideoSoftwareVRAMUnits[];
+		ARMJITHostMap(jit, GBAVideoSoftwareVRAMUnits, SIZE_VRAM / 32);
+	}
 	if (gba->memory.rom) {
 		ARMJITHostMap(jit, gba->memory.rom, SIZE_CART0);
 	}
@@ -451,7 +458,10 @@ static struct JITBlock* _compile(struct ARMJIT* jit, uint32_t pc, bool thumb, st
 	}
 	struct JITBlock* block = &jit->blocks[jit->nBlocks];
 	memset(block, 0, sizeof(*block));
-	if (!ARMJITCompile(jit, block, pc, thumb, src, bytes)) {
+	mPROFILE_START(profileCompile, "jit compile");
+	bool compiled = ARMJITCompile(jit, block, pc, thumb, src, bytes);
+	mPROFILE_STOP(profileCompile);
+	if (!compiled) {
 		return NULL;
 	}
 	++jit->nBlocks;
@@ -629,7 +639,8 @@ static bool _memoryMoved(struct ARMJIT* jit) {
 	return md[JIT_MD_ROM] != (uint32_t) (uintptr_t) memory->rom ||
 	       md[JIT_MD_ROM_SIZE] != (memory->rom ? memory->romSize : 0) ||
 	       md[JIT_MD_WRAM] != (uint32_t) (uintptr_t) memory->wram ||
-	       md[JIT_MD_IWRAM] != (uint32_t) (uintptr_t) memory->iwram;
+	       md[JIT_MD_IWRAM] != (uint32_t) (uintptr_t) memory->iwram ||
+	       md[JIT_MD_VRAM] != ARMJITVramFast(jit);
 }
 
 uint32_t ARMJITRun(struct ARMCore* cpu) {
@@ -646,11 +657,22 @@ uint32_t ARMJITRun(struct ARMCore* cpu) {
 	/* N and Z both set: generated code can't hold that (jit-emit.c). */
 	if (!block || (cpu->cpsr.packed >> 30) == 3) {
 		++jit->stats.fallbackSteps;
+		/* Not every exit leaves the pipeline as the interpreter would */
+		uint32_t stale = cpu->prefetch[0];
+		cpu->memory.setActiveRegion(cpu, pc);
+		_arrive(cpu, JIT_KEY(pc, thumb));
+		if (jit->stats.fallbackSteps == 1) {
+			printf("JIT fallback: pc %08x %s cpsr %08x block %p prefetch %08x was %08x\n", (unsigned) pc,
+			       thumb ? "thumb" : "arm", (unsigned) cpu->cpsr.packed, (void*) block,
+			       (unsigned) cpu->prefetch[0], (unsigned) stale);
+		}
 		ARMRunInstruction(cpu);
 		return 1;
 	}
 	++jit->stats.blockRuns;
+	mPROFILE_START(profileCode, "jit code");
 	uint32_t executed = _execute(jit, block);
+	mPROFILE_STOP(profileCode);
 	uint32_t arg = jit->exit.arg;
 	uint32_t* site;
 	uint32_t flushes;

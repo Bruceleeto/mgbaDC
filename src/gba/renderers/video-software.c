@@ -26,6 +26,9 @@ void (*GBAVideoSoftwareLineHook)(struct GBAVideoSoftwareRenderer* renderer, int 
 // Only this renderer is hooked; the others draw as usual (NULL: all)
 struct GBAVideoSoftwareRenderer* GBAVideoSoftwareLineHookTarget;
 uint32_t GBAVideoSoftwareVRAMDirty[96];
+/* A byte per 32-byte unit, set by the JIT's VRAM stores; folded into
+ * GBAVideoSoftwareVRAMDirty by whoever reads that */
+uint8_t GBAVideoSoftwareVRAMUnits[3072] __attribute__((aligned(4)));
 
 #define DIRTY_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] |= (1U << (Y & 0x1F))
 #define CLEAN_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] &= ~(1U << (Y & 0x1F))

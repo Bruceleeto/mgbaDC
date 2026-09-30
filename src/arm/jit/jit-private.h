@@ -123,6 +123,11 @@ enum {
 	JIT_MD_EWRAM_LDM,
 	JIT_MD_EWRAM_STM,
 	JIT_MD_EWRAM_WORD,
+	/* VRAM stores: the VRAM (0 while the software renderer draws), the
+	 * dirty byte per 32-byte unit, and DISPCNT */
+	JIT_MD_VRAM,
+	JIT_MD_VRAM_DIRTY,
+	JIT_MD_DISPCNT,
 	JIT_MD_MAX
 };
 
@@ -225,6 +230,7 @@ void ARMJITEmitStubs(struct ARMJIT* jit);
 uint32_t ARMJITTimingKey(const struct ARMCore* cpu);
 /* Refresh cpu->jitMemData from mGBA's memory state. */
 void ARMJITUpdateMemory(struct ARMJIT* jit);
+uint32_t ARMJITVramFast(struct ARMJIT* jit);
 /* The flags (F_* in jit-emit.c: V, C, Z, N from bit 0) code at pc may read
  * before writing them. */
 unsigned ARMJITFlagsIn(struct ARMJIT* jit, uint32_t pc, bool thumb);

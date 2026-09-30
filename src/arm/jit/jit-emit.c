@@ -43,6 +43,13 @@
  * PC/prefetch/cycles set up as ARMStep/ThumbStep leave them. */
 #include "jit-private.h"
 
+#include <mgba/core/profile.h>
+#include <mgba/internal/gba/renderers/video-software.h>
+
+extern void (*GBAVideoSoftwareLineHook)(struct GBAVideoSoftwareRenderer* renderer, int y);
+extern struct GBAVideoSoftwareRenderer* GBAVideoSoftwareLineHookTarget;
+extern uint8_t GBAVideoSoftwareVRAMUnits[];
+
 #include <mgba/internal/arm/isa-arm.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
@@ -878,7 +885,9 @@ static uint32_t _load32(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
 	HIST(address);
 	_setPC(cpu, pc);
 	int cycles = 0;
+	mPROFILE_START(profileStub, "mem stub");
 	uint32_t value = cpu->memory.load32(cpu, address, &cycles);
+	mPROFILE_STOP(profileStub);
 	cpu->cycles += cycles;
 	return value;
 }
@@ -887,7 +896,9 @@ static uint32_t _load16(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
 	HIST(address);
 	_setPC(cpu, pc);
 	int cycles = 0;
+	mPROFILE_START(profileStub, "mem stub");
 	uint32_t value = cpu->memory.load16(cpu, address, &cycles);
+	mPROFILE_STOP(profileStub);
 	cpu->cycles += cycles;
 	return value;
 }
@@ -896,7 +907,9 @@ static uint32_t _load8(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
 	HIST(address);
 	_setPC(cpu, pc);
 	int cycles = 0;
+	mPROFILE_START(profileStub, "mem stub");
 	uint32_t value = cpu->memory.load8(cpu, address, &cycles);
+	mPROFILE_STOP(profileStub);
 	cpu->cycles += cycles;
 	return value;
 }
@@ -953,26 +966,35 @@ static uint32_t _storeEnd(struct ARMCore* cpu, const struct JITStoreState* state
 
 static uint32_t _store32(struct ARMCore* cpu, uint32_t address, uint32_t value, uint32_t pc) {
 	struct JITStoreState state;
+	mPROFILE_START(profileStub, "mem stub");
 	_storeBegin(cpu, &state, pc);
 	int cycles = 0;
 	cpu->memory.store32(cpu, address, value, &cycles);
-	return _storeEnd(cpu, &state, cycles);
+	uint32_t stop = _storeEnd(cpu, &state, cycles);
+	mPROFILE_STOP(profileStub);
+	return stop;
 }
 
 static uint32_t _store16(struct ARMCore* cpu, uint32_t address, uint32_t value, uint32_t pc) {
 	struct JITStoreState state;
+	mPROFILE_START(profileStub, "mem stub");
 	_storeBegin(cpu, &state, pc);
 	int cycles = 0;
 	cpu->memory.store16(cpu, address, value, &cycles);
-	return _storeEnd(cpu, &state, cycles);
+	uint32_t stop = _storeEnd(cpu, &state, cycles);
+	mPROFILE_STOP(profileStub);
+	return stop;
 }
 
 static uint32_t _store8(struct ARMCore* cpu, uint32_t address, uint32_t value, uint32_t pc) {
 	struct JITStoreState state;
+	mPROFILE_START(profileStub, "mem stub");
 	_storeBegin(cpu, &state, pc);
 	int cycles = 0;
 	cpu->memory.store8(cpu, address, value, &cycles);
-	return _storeEnd(cpu, &state, cycles);
+	uint32_t stop = _storeEnd(cpu, &state, cycles);
+	mPROFILE_STOP(profileStub);
+	return stop;
 }
 
 /* Address in r4; loads land in guest rd, stores take guest rd (or r5 if rd
@@ -1049,9 +1071,17 @@ static void _patchBranch(uint8_t* at, uint8_t* to) {
 	}
 	int32_t d = sh4_branch_disp12((uintptr_t) at, (uintptr_t) to);
 	if ((at[1] & 0xF0) == 0xA0) { /* bra */
+		if (d < -2048 || d > 2047) {
+			fprintf(stderr, "jit: stub bra out of range (%d)\n", (int) d);
+			abort();
+		}
 		at[0] = d & 0xFF;
 		at[1] = 0xA0 | ((d >> 8) & 0xF);
 	} else { /* bt/bf */
+		if (!sh4_disp8_fits(d)) {
+			fprintf(stderr, "jit: stub branch out of range (%d)\n", (int) d);
+			abort();
+		}
 		at[0] = d & 0xFF;
 	}
 }
@@ -1071,11 +1101,19 @@ static void _branchHere(struct JITFixups* f, uint8_t* to) {
 }
 
 static void _bfTo(struct JITEmitter* e, struct JITFixups* f) {
+	if (f->n == 8) {
+		fprintf(stderr, "jit: too many stub fixups\n");
+		abort();
+	}
 	f->at[f->n++] = e->cg.ptr;
 	sh4_emit_bf(&e->cg, 0);
 }
 
 static void _btTo(struct JITEmitter* e, struct JITFixups* f) {
+	if (f->n == 8) {
+		fprintf(stderr, "jit: too many stub fixups\n");
+		abort();
+	}
 	f->at[f->n++] = e->cg.ptr;
 	sh4_emit_bt(&e->cg, 0);
 }
@@ -1363,6 +1401,62 @@ static void _emitWaitTailConst(struct JITEmitter* e, bool stall, uint8_t* stallC
 	}
 }
 
+/* A store to VRAM while the PVR renderer draws: the store, and the unit's
+ * dirty byte for pvr-gba.c. The software renderer's line caches and mode
+ * 2's VRAM stall go to C. As GBAStore*: halfwords and words below the OBJ
+ * mirror; a byte only to BG VRAM, where it lands in both halves of its
+ * halfword. Wait 1, or 2 for a word on the 16-bit bus. */
+static void _emitVramStore(struct JITEmitter* e, enum JITMemOp op, bool stall, uint8_t* stallCode,
+                           struct JITFixups* slow) {
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_VRAM));
+	sh4_emit_tst(&e->cg, 0, 0);
+	_btTo(e, slow);
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_DISPCNT));
+	sh4_emit_mov_w_load(&e->cg, 0, 0);
+	sh4_emit_and_imm(&e->cg, 7);
+	sh4_emit_cmpeq_imm(&e->cg, 2);
+	_btTo(e, slow);
+	if (op == JIT_MEM_STORE8) {
+		/* BG VRAM ends at 0x10000, or 0x14000 in the bitmap modes */
+		sh4_emit_mov_imm(&e->cg, 3, 2);
+		sh4_emit_cmphs(&e->cg, 2, 0);
+		sh4_emit_movt(&e->cg, 2);
+		sh4_emit_shll8(&e->cg, 2);
+		sh4_emit_shll2(&e->cg, 2);
+		sh4_emit_shll2(&e->cg, 2);
+		sh4_emit_shll2(&e->cg, 2);
+		_lit(e, 0x10000, 0);
+		sh4_emit_add_reg(&e->cg, 0, 2);
+		_emitOffset(e, 0x1FFFE);
+	} else {
+		_emitOffset(e, 0x1FFFF);
+		_lit(e, 0x18000, 2);
+	}
+	sh4_emit_cmphs(&e->cg, 2, 1);
+	_btTo(e, slow);
+	if (op == JIT_MEM_STORE8) {
+		sh4_emit_extu_b(&e->cg, 5, 2);
+		sh4_emit_mov_reg(&e->cg, 2, 0);
+		sh4_emit_shll8(&e->cg, 0);
+		sh4_emit_or(&e->cg, 0, 2);
+	}
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_VRAM));
+	if (op == JIT_MEM_STORE32) {
+		sh4_emit_mov_l_store_r0(&e->cg, 5, 1);
+	} else if (op == JIT_MEM_STORE16) {
+		sh4_emit_mov_w_store_r0(&e->cg, 5, 1);
+	} else {
+		sh4_emit_mov_w_store_r0(&e->cg, 2, 1);
+	}
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_VRAM_DIRTY));
+	sh4_emit_shlr2(&e->cg, 1);
+	sh4_emit_shlr2(&e->cg, 1);
+	sh4_emit_shlr(&e->cg, 1);
+	sh4_emit_mov_imm(&e->cg, 1, 2);
+	sh4_emit_mov_b_store_r0(&e->cg, 2, 1);
+	_emitWaitTailConst(e, stall, stallCode, op == JIT_MEM_STORE32 ? 2 : 1);
+}
+
 /* cpu->jitStubs[stall][op]: r3 = offset, r4 = address, r5 = value to store;
  * a load's value comes back in r0. The fast paths touch r0-r2 only (r3-r5
  * are the slow path's), the stall model r0-r5. */
@@ -1410,7 +1504,9 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 		_btTo(e, &toRom);
 	}
 	sh4_emit_cmpeq_imm(&e->cg, REGION_WORKING_RAM);
-	_bfTo(e, &toSlow);
+	struct JITFixups toVram = { .n = 0 };
+	bool vram = store;
+	_bfTo(e, vram ? &toVram : &toSlow);
 
 	/* EWRAM */
 	_emitOffset(e, SIZE_WORKING_RAM - 1);
@@ -1424,6 +1520,13 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 		_emitAccess(e, op, JIT_MD_WRAM);
 	}
 	_emitWaitTail(e, stall, stallCode);
+
+	if (vram) {
+		_branchHere(&toVram, e->cg.ptr);
+		sh4_emit_cmpeq_imm(&e->cg, REGION_VRAM);
+		_bfTo(e, &toSlow);
+		_emitVramStore(e, op, stall, stallCode, &toSlow);
+	}
 
 	/* ROM (wait state 0 only), never stalls: above BASE_CART0 */
 	if (!store) {
@@ -1598,6 +1701,19 @@ static void _emitHandlerStub(struct JITEmitter* e, bool thumb, uint8_t* commonRa
 	_flushPool(e, false);
 }
 
+/* The VRAM for the stubs' store fast path, when the software renderer only
+ * hands lines to the PVR one (GBAVideoSoftwareLineHook): its own line caches
+ * then don't matter, only the dirty units. */
+uint32_t ARMJITVramFast(struct ARMJIT* jit) {
+	struct GBA* gba = (struct GBA*) jit->cpu->master;
+	struct GBAVideoRenderer* renderer = gba->video.renderer;
+	if (!GBAVideoSoftwareLineHook || !renderer || renderer->cache ||
+	    GBAVideoSoftwareLineHookTarget != (struct GBAVideoSoftwareRenderer*) renderer) {
+		return 0;
+	}
+	return (uint32_t) (uintptr_t) gba->video.vram;
+}
+
 void ARMJITUpdateMemory(struct ARMJIT* jit) {
 	struct GBA* gba = (struct GBA*) jit->cpu->master;
 	struct GBAMemory* memory = &gba->memory;
@@ -1617,6 +1733,9 @@ void ARMJITUpdateMemory(struct ARMJIT* jit) {
 	md[JIT_MD_EWRAM_STM] = memory->waitstatesSeq32[REGION_WORKING_RAM] - memory->waitstatesNonseq32[REGION_WORKING_RAM];
 	md[JIT_MD_EWRAM_LDM] = md[JIT_MD_EWRAM_STM] + 1;
 	md[JIT_MD_EWRAM_WORD] = 1 + memory->waitstatesSeq32[REGION_WORKING_RAM];
+	md[JIT_MD_VRAM] = ARMJITVramFast(jit);
+	md[JIT_MD_VRAM_DIRTY] = (uint32_t) (uintptr_t) GBAVideoSoftwareVRAMUnits;
+	md[JIT_MD_DISPCNT] = (uint32_t) (uintptr_t) &memory->io[REG_DISPCNT >> 1];
 #ifdef JIT_FASTMEM
 	ARMJITFastmemUpdate(jit);
 #endif

@@ -1,3 +1,4 @@
+#include <math.h>
 /* Offline check of the Dreamcast PVR renderer (src/platform/dreamcast/pvr-gba.c).
  *
  * Two cores run in lockstep with the same input: A draws with the software
@@ -150,6 +151,12 @@ static inline void _ref(color_t c, uint8_t* rgb) {
 }
 
 static inline void _pvr(int x, int y, uint8_t* rgb) {
+#if PVR_GBA_WIDTH != 240
+	/* The framebuffer pixel whose centre lies in GBA pixel (x, y) */
+	float s = PVR_GBA_WIDTH / 240.0f, oy = (PVR_GBA_HEIGHT - 160 * s) / 2;
+	x = (int) ceilf(x * s - 0.5f);
+	y = (int) ceilf(y * s + oy - 0.5f);
+#endif
 	const uint8_t* p = &front[(y * FB_W + x) * 3];
 	rgb[0] = p[0] >> 3;
 	rgb[1] = p[1] >> 3;
@@ -305,6 +312,17 @@ int main(int argc, char** argv) {
 			char path[512];
 			snprintf(path, sizeof(path), "%s/pvr-%05d.ppm", dumpDir, frame);
 			_writePPM(path, &a, mask);
+			/* The PVR's own framebuffer, unsampled */
+			snprintf(path, sizeof(path), "%s/fb-%05d.ppm", dumpDir, frame);
+			FILE* fb = fopen(path, "wb");
+			if (fb) {
+				int y;
+				fprintf(fb, "P6\n%d %d\n255\n", PVR_GBA_WIDTH, PVR_GBA_HEIGHT);
+				for (y = 0; y < PVR_GBA_HEIGHT; ++y) {
+					fwrite(&front[y * FB_W * 3], 3, PVR_GBA_WIDTH, fb);
+				}
+				fclose(fb);
+			}
 		}
 		if (frame == regFrame) {
 			PVRGBADebugLines();

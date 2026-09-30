@@ -21,6 +21,7 @@
 
 #include <arch/irq.h>
 #include <arch/mmu.h>
+#include <kos/cache.h>
 #include <kos/thread.h>
 #include <malloc.h>
 #include <stdio.h>
@@ -499,6 +500,9 @@ static void _romUnmap(uint32_t page) {
 static bool _romRead(int frame, uint32_t page) {
 	uint8_t* p = &rp.frames[frame * ROM_PAGE];
 	ssize_t got = 0;
+	/* The frame's lines may still hold the page it had, and the file read
+	 * (dcload) needn't go through the cache: drop them either side */
+	dcache_purge_range((uintptr_t) p, ROM_PAGE);
 	if (rp.vf->seek(rp.vf, page * ROM_PAGE, SEEK_SET) >= 0) {
 		got = rp.vf->read(rp.vf, p, ROM_PAGE);
 	}
@@ -506,6 +510,7 @@ static bool _romRead(int frame, uint32_t page) {
 		got = 0;
 	}
 	memset(p + got, 0, ROM_PAGE - got);
+	dcache_purge_range((uintptr_t) p, ROM_PAGE);
 	rp.owner[frame] = page;
 	rp.pte[page] = (((uint32_t) (uintptr_t) p) & 0x1FFFFC00) | PTE_V | SZ_64K | PTE_C | PTE_D | PTE_SH;
 	return got > 0;
