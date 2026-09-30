@@ -534,6 +534,7 @@ uint32_t ARMJITRun(struct ARMCore* cpu) {
 		}
 		break;
 	case JIT_EXIT_BRANCH:
+		_ARMSetMode(cpu, JIT_KEY_THUMB(arg) ? MODE_THUMB : MODE_ARM);
 		cpu->gprs[ARM_PC] = JIT_KEY_PC(arg);
 		if (JIT_KEY_THUMB(arg)) {
 			cpu->cycles += ThumbWritePC(cpu);

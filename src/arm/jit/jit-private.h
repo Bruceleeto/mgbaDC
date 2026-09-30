@@ -151,6 +151,8 @@ struct ARMJIT {
 	/* Generated code's r8: [stall][JITMemOp]. The stall set is for code
 	 * running from ROM with the prefetch buffer on (GBAMemoryStall). */
 	const void* memStubs[2][JIT_MEM_OPS];
+	/* GBAMemoryStall on the wait in r2 (_emitStall) */
+	const void* stall;
 	uint32_t memData[JIT_MD_MAX];
 	/* LDM/STM and friends: [stall][store][thumb] (_emitMultipleStub) */
 	const void* multipleStubs[2][2][2];

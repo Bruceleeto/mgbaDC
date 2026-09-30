@@ -14,6 +14,11 @@
 
 #include <mgba-util/memory.h>
 
+#ifdef M_PROFILE
+// Lines the fast compositor took, and those it didn't
+uint32_t GBAVideoLineCount[2];
+#endif
+
 #define DIRTY_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] |= (1U << (Y & 0x1F))
 #define CLEAN_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] &= ~(1U << (Y & 0x1F))
 
@@ -643,7 +648,7 @@ static inline bool _updateIoCache(uint16_t* cache, const uint16_t* io) {
 static ATTRIBUTE_NOINLINE void _drawScanlineSlow(struct GBAVideoSoftwareRenderer* softwareRenderer, int y, int spriteLayers);
 static ATTRIBUTE_NOINLINE void _copyOut(struct GBAVideoSoftwareRenderer* softwareRenderer, color_t* row);
 
-ATTRIBUTE_HOT_GROUP(3) static void _drawScanlineNow(struct GBAVideoRenderer* renderer, int y) {
+ATTRIBUTE_HOT_GROUP_BIG(3) static void _drawScanlineNow(struct GBAVideoRenderer* renderer, int y) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 
 	if (y == GBA_VIDEO_VERTICAL_PIXELS - 1) {
@@ -717,8 +722,14 @@ ATTRIBUTE_HOT_GROUP(3) static void _drawScanlineNow(struct GBAVideoRenderer* ren
 	}
 	if (fast) {
 		++softwareRenderer->fastLines;
+#ifdef M_PROFILE
+		++GBAVideoLineCount[0];
+#endif
 	} else {
 		++softwareRenderer->slowLines;
+#ifdef M_PROFILE
+		++GBAVideoLineCount[1];
+#endif
 		_drawScanlineSlow(softwareRenderer, y, spriteLayers);
 	}
 

@@ -285,11 +285,16 @@ typedef intptr_t ssize_t;
 // The Dreamcast's instruction cache is 8 KiB, direct mapped. Functions in the
 // same group are laid out together in a block no bigger than that, so that
 // they can't push each other out of it.
-// The profiler's scopes make the groups outgrow the cache
-#if defined(_arch_dreamcast) && !defined(M_PROFILE)
+#if defined(_arch_dreamcast)
 #define ATTRIBUTE_HOT_GROUP(N) __attribute__((section(".sub" #N)))
 #else
 #define ATTRIBUTE_HOT_GROUP(N)
+#endif
+// For the groups that the profiler's scopes make outgrow the cache
+#if defined(M_PROFILE)
+#define ATTRIBUTE_HOT_GROUP_BIG(N)
+#else
+#define ATTRIBUTE_HOT_GROUP_BIG(N) ATTRIBUTE_HOT_GROUP(N)
 #endif
 
 #define DECL_BITFIELD(NAME, TYPE) typedef TYPE NAME

@@ -393,6 +393,17 @@ int main(int argc, char** argv) {
 	for (frame = 0; frame < frames; ++frame) {
 		uint32_t keys = _keysFor(script, frame);
 		a.core->setKeys(a.core, keys);
+		if (!compare && getenv("JITTEST_STEP")) {
+			uint32_t fc = a.gba->video.frameCounter;
+			while (a.gba->video.frameCounter == fc) {
+				if (a.cpu->cycles >= a.cpu->nextEvent) {
+					a.cpu->irqh.processEvents(a.cpu);
+				} else {
+					ARMRunInstruction(a.cpu);
+				}
+			}
+			continue;
+		}
 		if (!compare) {
 			a.core->runFrame(a.core);
 			continue;
@@ -422,6 +433,20 @@ int main(int argc, char** argv) {
 				}
 			}
 			++slices;
+			if (getenv("JITTEST_MEM") && frame >= atoi(getenv("JITTEST_MEM"))) {
+				int d = _firstDiff(a.gba->memory.iwram, b.gba->memory.iwram, SIZE_WORKING_IRAM);
+				int d2 = _firstDiff(a.gba->memory.wram, b.gba->memory.wram, SIZE_WORKING_RAM);
+				int d3 = _firstDiff(a.gba->memory.io, b.gba->memory.io, sizeof(a.gba->memory.io));
+				if (d >= 0 || d2 >= 0 || d3 >= 0) {
+					printf("memory differs at frame %d, step %llu (%s of %u at %08X): iwram %x wram %x io %x\n", frame,
+					       (unsigned long long) slices, what, n, before, d, d2, d3);
+					if (d >= 0) printf("iwram interp %02x jit %02x\n", ((uint8_t*) a.gba->memory.iwram)[d], ((uint8_t*) b.gba->memory.iwram)[d]);
+					if (d3 >= 0) printf("io interp %02x jit %02x\n", ((uint8_t*) a.gba->memory.io)[d3], ((uint8_t*) b.gba->memory.io)[d3]);
+					_printCPU("interp", a.cpu);
+					_printCPU("jit   ", b.cpu);
+					return 1;
+				}
+			}
 			if (!_sameCPU(a.cpu, b.cpu)) {
 				printf("CPU diverged at frame %d, step %llu (%s of %u at %08X)\n", frame,
 				       (unsigned long long) slices, what, n, before);
@@ -453,6 +478,19 @@ int main(int argc, char** argv) {
 		}
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (getenv("JITTEST_DUMP")) {
+		FILE* f = fopen(getenv("JITTEST_DUMP"), "wb");
+		if (f) {
+			fprintf(f, "P6\n%d %d\n255\n", W, H);
+			int k;
+			for (k = 0; k < W * H; ++k) {
+				color_t c = a.buffer[k];
+				uint8_t rgb[3] = { (c >> 11) << 3, ((c >> 5) & 0x3F) << 2, (c & 0x1F) << 3 };
+				fwrite(rgb, 1, 3, f);
+			}
+			fclose(f);
+		}
+	}
 	double seconds = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
 	if (compare) {

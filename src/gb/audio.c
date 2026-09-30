@@ -515,6 +515,43 @@ static inline int32_t _divSmall(int32_t n, int32_t d) {
 	return n / d;
 }
 
+#ifdef M_PROFILE
+// Steps of the wave and the noise channel, for the frontend to print
+uint32_t GBAudioProfileSteps[2];
+#endif
+
+// The wave RAM from words on, n nibbles further round. Gives back the last
+// nibble to go past the start, which is what plays. The same as a nibble at
+// a time, n times.
+static int _rotateWave(uint32_t* words, int nBytes, int n) {
+	uint8_t old[32];
+	uint8_t* bytes = (uint8_t*) words;
+	int mask = nBytes - 1;
+	memcpy(old, bytes, nBytes);
+	int half = n >> 1;
+	int i;
+	if (n & 1) {
+		for (i = 0; i < nBytes; ++i) {
+			bytes[i] = (old[(i + half) & mask] << 4) | (old[(i + half + 1) & mask] >> 4);
+		}
+	} else {
+		for (i = 0; i < nBytes; ++i) {
+			bytes[i] = old[(i + half) & mask];
+		}
+	}
+	--n;
+	int byte = old[(n >> 1) & mask];
+	return n & 1 ? byte & 0xF : byte >> 4;
+}
+
+// Four steps of the noise generator at once: what's fed back in for the four
+// bits that come out, which don't get as far as coming out themselves
+static const uint16_t _noiseFeedback[2][16] = {
+	{ 0x0000, 0x000C, 0x0018, 0x0014, 0x0030, 0x003C, 0x0028, 0x0024, 0x0060, 0x006C, 0x0078, 0x0074, 0x0050, 0x005C, 0x0048, 0x0044 },
+	{ 0x0000, 0x0C00, 0x1800, 0x1400, 0x3000, 0x3C00, 0x2800, 0x2400, 0x6000, 0x6C00, 0x7800, 0x7400, 0x5000, 0x5C00, 0x4800, 0x4400 },
+};
+static const uint8_t _noiseOnes[16] = { 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 };
+
 ATTRIBUTE_HOT_GROUP(0) void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
 	if (!audio->enable) {
 		return;
@@ -587,6 +624,14 @@ ATTRIBUTE_HOT_GROUP(0) void GBAudioRun(struct GBAudio* audio, int32_t timestamp,
 				} else {
 					start = 3;
 				}
+#ifdef M_PROFILE
+				GBAudioProfileSteps[0] += diff & mask;
+#endif
+#ifndef __BIG_ENDIAN__
+				if ((diff & mask) > 2) {
+					audio->ch3.sample = _rotateWave(&audio->ch3.wavedata32[end], (start - end + 1) * 4, diff & mask);
+				} else
+#endif
 				for (iter = 0; iter < (diff & mask); ++iter) {
 					uint32_t bitsCarry = audio->ch3.wavedata32[end] & 0x000000F0;
 					uint32_t bits;
@@ -630,13 +675,27 @@ ATTRIBUTE_HOT_GROUP(0) void GBAudioRun(struct GBAudio* audio, int32_t timestamp,
 			if (!audio->ch4.power) {
 				coeff <<= 8;
 			}
-			for (last = 0; last + cycles <= diff; last += cycles) {
-				lsb = audio->ch4.lfsr & 1;
-				audio->ch4.lfsr >>= 1;
-				audio->ch4.lfsr ^= lsb * coeff;
-				++samples;
+			int32_t steps = _divSmall(diff, cycles);
+			const uint16_t* feedback = _noiseFeedback[!audio->ch4.power];
+			uint32_t lfsr = audio->ch4.lfsr;
+			samples = steps;
+			last = steps * cycles;
+#ifdef M_PROFILE
+			GBAudioProfileSteps[1] += steps;
+#endif
+			for (; steps >= 4; steps -= 4) {
+				unsigned out = lfsr & 0xF;
+				lfsr = (lfsr >> 4) ^ feedback[out];
+				positiveSamples += _noiseOnes[out];
+				lsb = out >> 3;
+			}
+			for (; steps; --steps) {
+				lsb = lfsr & 1;
+				lfsr >>= 1;
+				lfsr ^= lsb * coeff;
 				positiveSamples += lsb;
 			}
+			audio->ch4.lfsr = lfsr;
 			audio->ch4.sample = lsb * audio->ch4.envelope.currentVolume;
 			audio->ch4.nSamples += samples;
 			audio->ch4.samples += positiveSamples * audio->ch4.envelope.currentVolume;
@@ -739,7 +798,7 @@ ATTRIBUTE_HOT_GROUP(0) void GBAudioUpdateFrame(struct GBAudio* audio) {
 	}
 }
 
-void GBAudioSamplePSG(struct GBAudio* audio, int16_t* left, int16_t* right) {
+ATTRIBUTE_HOT_GROUP(0) void GBAudioSamplePSG(struct GBAudio* audio, int16_t* left, int16_t* right) {
 	int dcOffset = audio->style == GB_AUDIO_GBA ? 0 : -0x8;
 	int sampleLeft = dcOffset;
 	int sampleRight = dcOffset;

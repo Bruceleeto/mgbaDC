@@ -261,6 +261,10 @@ int main(int argc, char** argv) {
 		struct GBAAudio* gbaAudio = &((struct GBA*) core->board)->audio;
 		gbaAudio->directOutput = directAudio;
 		gbaAudio->directInterval = GBA_ARM7TDMI_FREQUENCY / SAMPLE_RATE;
+		/* Otherwise it's only once the game writes SOUNDBIAS */
+		if (gbaAudio->sampleInterval < gbaAudio->directInterval) {
+			gbaAudio->sampleInterval = gbaAudio->directInterval;
+		}
 	}
 	vid_set_mode(DM_640x480, PM_RGB565);
 	if (pvr_init_defaults() < 0) goto cleanup;
@@ -340,6 +344,28 @@ int main(int argc, char** argv) {
 #endif
 #endif
 #ifdef M_PROFILE
+			{
+				extern uint32_t GBAVideoLineCount[2];
+				extern uint32_t GBAVideoFastSpriteWhy[8];
+				uint32_t* w = GBAVideoFastSpriteWhy;
+				printf("  lines/frame: fast %u slow %u\n", (unsigned) (GBAVideoLineCount[0] / profileFrames),
+				       (unsigned) (GBAVideoLineCount[1] / profileFrames));
+				printf("  sprite lines/frame: direct %u | not: plan %u, obj is blend target %u, no blend bg %u, odd sprite %u, "
+				       "semi-transparent %u, overlap order %u, in front of blend layer %u\n",
+				       (unsigned) (w[7] / profileFrames), (unsigned) (w[0] / profileFrames), (unsigned) (w[1] / profileFrames),
+				       (unsigned) (w[2] / profileFrames), (unsigned) (w[3] / profileFrames), (unsigned) (w[4] / profileFrames),
+				       (unsigned) (w[5] / profileFrames), (unsigned) (w[6] / profileFrames));
+				memset(GBAVideoFastSpriteWhy, 0, sizeof(GBAVideoFastSpriteWhy));
+				memset(GBAVideoLineCount, 0, sizeof(GBAVideoLineCount));
+				extern uint32_t GBAudioProfileSteps[2];
+				unsigned rate = 0;
+				if (core->platform(core) == mPLATFORM_GBA) {
+					rate = GBA_ARM7TDMI_FREQUENCY / ((struct GBA*) core->board)->audio.sampleInterval;
+				}
+				printf("  audio: mixing at %u Hz, steps/frame: wave %u noise %u\n", rate,
+				       (unsigned) (GBAudioProfileSteps[0] / profileFrames), (unsigned) (GBAudioProfileSteps[1] / profileFrames));
+				memset(GBAudioProfileSteps, 0, sizeof(GBAudioProfileSteps));
+			}
 			printf("  -- %s column: %% of each section's cycles stalled on %s misses --\n",
 			       profileStalls[profileStall].label,
 			       profileStall ? "data cache" : "instruction cache");

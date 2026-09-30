@@ -106,6 +106,8 @@ struct JITEmitter {
 	bool thumb;
 	uint32_t address;
 	int index;
+	/* Instructions in the block */
+	int executed;
 	/* Guest region the block is in (address >> 24). */
 	uint32_t region;
 
@@ -421,6 +423,8 @@ static void _emitFlagsIn(struct JITEmitter* e) {
 /* Memory                                                            */
 /* ---------------------------------------------------------------- */
 
+static uint32_t _sysMultiple(struct ARMCore* cpu, uint32_t op, uint32_t pc);
+
 /* What the interpreter has in gprs[PC] and the prefetch words during the
  * access: mGBA's open bus and ROM prefetch-buffer model read them. */
 static void _setPC(struct ARMCore* cpu, uint32_t pc) {
@@ -507,7 +511,9 @@ static void _storeBegin(struct ARMCore* cpu, struct JITStoreState* state, uint32
 static uint32_t _storeEnd(struct ARMCore* cpu, const struct JITStoreState* state, int cycles) {
 	cpu->cycles += cycles;
 	bool retimed = ARMJITTimingKey(cpu) != state->timingKey;
-	if (cpu->nextEvent >= state->nextEvent && !retimed) {
+	/* An event that is due goes first: what the store set up (a DMA) can't
+	 * wait for the end of the block, the next store may be its registers. */
+	if (cpu->nextEvent >= state->nextEvent && !retimed && cpu->cycles < cpu->nextEvent) {
 		return 0;
 	}
 	if (cpu->executionMode == MODE_THUMB) {
@@ -955,11 +961,11 @@ static void _emitMultipleRegion(struct JITEmitter* e, bool store, bool stall, ui
 	}
 }
 
-/* LDM/STM-like: r4 = the lowest address, r5 = opcode, r6 = offset, r7 = the
- * number of words. In IWRAM or EWRAM without wrapping (and for a store, no
+/* LDM/STM-like: r4 = the lowest address, r5 = the instruction as
+ * _sysMultiple takes it, r6 = offset, r7 = the number of words. In IWRAM or EWRAM without wrapping (and for a store, no
  * code in the way): charges GBALoad/StoreMultiple's wait and returns T clear
- * with r0 = the host address for the caller to copy through. Otherwise runs
- * mGBA's handler for the whole instruction and returns T set (or stops, as
+ * with r0 = the host address for the caller to copy through. Otherwise
+ * _sysMultiple does the whole instruction and it returns T set (or stops, as
  * jit->handlers). */
 static void _emitMultipleStub(struct JITEmitter* e, bool store, bool stall, bool thumb, uint8_t* stallCode) {
 	struct JITFixups toSlow = { .n = 0 };
@@ -977,6 +983,7 @@ static void _emitMultipleStub(struct JITEmitter* e, bool store, bool stall, bool
 	_branchHere(&toIwram, e->cg.ptr);
 	_emitMultipleRegion(e, store, stall, stallCode, JIT_MD_IWRAM, JIT_MD_CHUNKS_IWRAM, SIZE_WORKING_IRAM, &toSlow);
 	_branchHere(&toSlow, e->cg.ptr);
+	_lit(e, (uint32_t) (uintptr_t) _sysMultiple, 7);
 	_jumpTo(e, e->jit->handlers[thumb]);
 	sh4_emit_nop(&e->cg);
 	_flushPool(e, false);
@@ -989,6 +996,7 @@ static void _emitMemoryStubs(struct JITEmitter* e) {
 	_emitSlowStore(e);
 	_flushPool(e, false);
 	uint8_t* stallCode = e->cg.ptr;
+	e->jit->stall = stallCode;
 	_emitStall(e);
 	_flushPool(e, false);
 	int op;
@@ -1002,15 +1010,13 @@ static void _emitMemoryStubs(struct JITEmitter* e) {
 	}
 }
 
-static uint32_t _thumbHandler(struct ARMCore* cpu, uint32_t opcode, uint32_t pc);
-static uint32_t _armHandler(struct ARMCore* cpu, uint32_t opcode, uint32_t pc);
+static void _registerRoutines(struct ARMJIT* jit);
 
-/* jit->handlers[thumb]: r5 = opcode, r6 = offset as for the memory stubs.
- * The flags go to the cpsr and back around mGBA's handler. Returns if the
+/* jit->handlers[thumb]: r5 = argument, r6 = offset as for the memory stubs,
+ * r7 = the C routine. The flags go to the cpsr and back around it. Returns if the
  * block can carry on; otherwise counts the instruction and leaves for
  * dispatchSync, or for C (commonRaw) if the flags can't be held. */
 static void _emitHandlerStub(struct JITEmitter* e, bool thumb, uint8_t* commonRaw) {
-	const void* fn = thumb ? (const void*) _thumbHandler : (const void*) _armHandler;
 	e->jit->handlers[thumb] = e->cg.ptr;
 	sh4_emit_sts_pr_dec(&e->cg, 15);
 	sh4_emit_mov_l_store_dec(&e->cg, 6, 15);
@@ -1019,9 +1025,7 @@ static void _emitHandlerStub(struct JITEmitter* e, bool thumb, uint8_t* commonRa
 	sh4_emit_add_reg(&e->cg, R_CYCLES, 0);
 	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_CYCLES);
 	sh4_emit_add_reg(&e->cg, R_BASE, 6);
-	ARMJITRegisterCall(e->jit, fn);
-	_lit(e, (uint32_t) (uintptr_t) fn, 1);
-	sh4_emit_jsr(&e->cg, 1);
+	sh4_emit_jsr(&e->cg, 7);
 	sh4_emit_mov_reg(&e->cg, R_CPU, 4);
 	sh4_emit_mov_reg(&e->cg, 0, 3);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CYCLES);
@@ -1195,6 +1199,7 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 	_patchBranch(bra, (uint8_t*) jit->lookup);
 	_flushPool(&e, false);
 
+	_registerRoutines(jit);
 	_emitHandlerStub(&e, true, commonRaw);
 	_emitHandlerStub(&e, false, commonRaw);
 
@@ -1208,11 +1213,6 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 /* ---------------------------------------------------------------- */
 /* Handler calls                                                     */
 /* ---------------------------------------------------------------- */
-
-static const uint16_t _conditionLut[16] = {
-	0xF0F0, 0x0F0F, 0xCCCC, 0x3333, 0xFF00, 0x00FF, 0xAAAA, 0x5555,
-	0x0C0C, 0xF3F3, 0xAA55, 0x55AA, 0x0A05, 0xF5FA, 0xFFFF, 0x0000
-};
 
 /* Run mGBA's handler for an instruction, with PC and prefetch as
  * ARMStep/ThumbStep leave them. Returns nonzero if the block must stop after
@@ -1234,38 +1234,375 @@ static uint32_t _handlerResult(struct ARMCore* cpu, uint32_t stop) {
 	return stop;
 }
 
-static uint32_t _thumbHandler(struct ARMCore* cpu, uint32_t opcode, uint32_t pc) {
-	HHIST(1, opcode);
+#define PSR_USER_MASK 0xF0000000
+#define PSR_PRIV_MASK 0x000000CF
+#define PSR_STATE_MASK 0x00000020
+
+static void _writePC(struct JITEmitter* e, int32_t cost, int executed);
+static void _armDataProcessing(struct JITEmitter* e, uint32_t op, bool flags);
+static void _armLoadStore(struct JITEmitter* e, uint32_t op, bool mode3);
+static void _armBX(struct JITEmitter* e, uint32_t op, int executed);
+static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd);
+
+/* The instructions that change the cpu's mode, or may: these are the cpu
+ * core's own routines behind them, run with PC and prefetch as the
+ * instruction sees them. Each charges the whole instruction and returns as
+ * _handlerResult. */
+static uint32_t _sysSWI(struct ARMCore* cpu, uint32_t immediate, uint32_t pc) {
 	_setPC(cpu, pc);
 	int32_t nextEvent = cpu->nextEvent;
 	uint32_t timingKey = ARMJITTimingKey(cpu);
-	_thumbTable[opcode >> 6](cpu, opcode);
-	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
-}
-
-static uint32_t _armHandler(struct ARMCore* cpu, uint32_t opcode, uint32_t pc) {
-	HHIST(0, opcode);
-	_setPC(cpu, pc);
-	unsigned flags = cpu->cpsr.flags >> 4;
-	if (!(_conditionLut[opcode >> 28] & (1 << flags))) {
-		cpu->cycles += ARM_PREFETCH_CYCLES;
-		return 0;
+	int32_t cycles;
+	if (cpu->executionMode == MODE_THUMB) {
+		cycles = 1 + cpu->memory.activeSeqCycles16;
+		cpu->irqh.swi16(cpu, immediate);
+	} else {
+		cycles = 1 + cpu->memory.activeSeqCycles32;
+		cpu->irqh.swi32(cpu, immediate);
 	}
-	int32_t nextEvent = cpu->nextEvent;
-	uint32_t timingKey = ARMJITTimingKey(cpu);
-	_armTable[((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0x00F)](cpu, opcode);
+	cpu->cycles += cycles;
 	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
 }
 
-/* Run mGBA's handler for the current instruction (jit->handlers). Returns
- * if the block can carry on. */
-static void _handler(struct JITEmitter* e, uint32_t op) {
+static uint32_t _writeCPSR(struct ARMCore* cpu, int32_t operand, uint32_t pc, int32_t mask) {
+	_setPC(cpu, pc);
+	int32_t nextEvent = cpu->nextEvent;
+	uint32_t timingKey = ARMJITTimingKey(cpu);
+	int32_t cycles = 1 + cpu->memory.activeSeqCycles32;
+	if (mask & PSR_USER_MASK) {
+		cpu->cpsr.packed = (cpu->cpsr.packed & ~PSR_USER_MASK) | (operand & PSR_USER_MASK);
+	}
+	if (mask & PSR_STATE_MASK) {
+		cpu->cpsr.packed = (cpu->cpsr.packed & ~PSR_STATE_MASK) | (operand & PSR_STATE_MASK);
+	}
+	if (cpu->privilegeMode != MODE_USER && (mask & PSR_PRIV_MASK)) {
+		ARMSetPrivilegeMode(cpu, (enum PrivilegeMode) ((operand & 0x0000000F) | 0x00000010));
+		cpu->cpsr.packed = (cpu->cpsr.packed & ~PSR_PRIV_MASK) | (operand & PSR_PRIV_MASK);
+	}
+	_ARMReadCPSR(cpu);
+	if (cpu->executionMode == MODE_THUMB) {
+		cpu->prefetch[0] = 0x46C0; // nop
+		cpu->prefetch[1] &= 0xFFFF;
+		cpu->gprs[ARM_PC] += WORD_SIZE_THUMB;
+	} else {
+		LOAD_32(cpu->prefetch[0], (cpu->gprs[ARM_PC] - WORD_SIZE_ARM) & cpu->memory.activeMask, cpu->memory.activeRegion);
+		LOAD_32(cpu->prefetch[1], cpu->gprs[ARM_PC] & cpu->memory.activeMask, cpu->memory.activeRegion);
+	}
+	cpu->cycles += cycles;
+	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
+}
+
+static uint32_t _sysCPSR0(struct ARMCore* cpu, uint32_t operand, uint32_t pc) {
+	return _writeCPSR(cpu, operand, pc, 0);
+}
+
+static uint32_t _sysCPSRc(struct ARMCore* cpu, uint32_t operand, uint32_t pc) {
+	return _writeCPSR(cpu, operand, pc, 0x000000FF);
+}
+
+static uint32_t _sysCPSRf(struct ARMCore* cpu, uint32_t operand, uint32_t pc) {
+	return _writeCPSR(cpu, operand, pc, 0xFF000000);
+}
+
+static uint32_t _sysCPSRcf(struct ARMCore* cpu, uint32_t operand, uint32_t pc) {
+	return _writeCPSR(cpu, operand, pc, 0xFF0000FF);
+}
+
+/* An S instruction writing the PC, which was given value: back from an
+ * exception, the cpsr from the spsr. In a mode without one the flags are
+ * left as they are. */
+static uint32_t _sysReturn(struct ARMCore* cpu, uint32_t value, uint32_t pc) {
+	_setPC(cpu, pc);
+	int32_t cycles = 1 + cpu->memory.activeSeqCycles32;
+	if (_ARMModeHasSPSR(cpu->cpsr.priv)) {
+		cpu->cpsr = cpu->spsr;
+		_ARMReadCPSR(cpu);
+	}
+	cpu->gprs[ARM_PC] = value;
+	if (cpu->executionMode == MODE_ARM) {
+		cycles += ARMWritePC(cpu);
+	} else {
+		cycles += ThumbWritePC(cpu);
+	}
+	cpu->cycles += cycles;
+	return _handlerResult(cpu, 1);
+}
+
+/* LDM/STM through the memory's own routines, for what the stubs don't do.
+ * op is the ARM instruction; for Thumb the one that does the same, with
+ * MULTIPLE_STACK for PUSH and POP. */
+#define MULTIPLE_STACK 0x10000000
+
+static uint32_t _sysMultiple(struct ARMCore* cpu, uint32_t op, uint32_t pc) {
+	_setPC(cpu, pc);
+	int32_t nextEvent = cpu->nextEvent;
+	uint32_t timingKey = ARMJITTimingKey(cpu);
+	bool thumb = cpu->executionMode == MODE_THUMB;
+	int cycles = 1 + (thumb ? cpu->memory.activeSeqCycles16 : cpu->memory.activeSeqCycles32);
+	int rn = (op >> 16) & 0xF;
+	int rs = op & 0xFFFF;
+	bool load = op & 0x00100000;
+	bool s = op & 0x00400000;
+	int direction = ((op & 0x00800000) ? 0 : LSM_D) | ((op & 0x01000000) ? LSM_B : 0);
+	uint32_t address = cpu->gprs[rn];
+	enum PrivilegeMode privilegeMode = cpu->privilegeMode;
+	bool user = s && (!load || (!(rs & 0x8000) && rs));
+	if (user) {
+		ARMSetPrivilegeMode(cpu, MODE_SYSTEM);
+	}
+	if (load) {
+		address = cpu->memory.loadMultiple(cpu, address, rs, direction, &cycles);
+	} else {
+		address = cpu->memory.storeMultiple(cpu, address, rs, direction, &cycles);
+	}
+	if ((op & 0x00200000) && (!load || !((1 << rn) & rs))) {
+		cpu->gprs[rn] = address;
+	}
+	if (user) {
+		ARMSetPrivilegeMode(cpu, privilegeMode);
+	} else if (s && _ARMModeHasSPSR(cpu->cpsr.priv)) {
+		cpu->cpsr = cpu->spsr;
+		_ARMReadCPSR(cpu);
+	}
+	if (thumb) {
+		cycles += cpu->memory.activeNonseqCycles16 - cpu->memory.activeSeqCycles16;
+	} else {
+		cycles += cpu->memory.activeNonseqCycles32 - cpu->memory.activeSeqCycles32;
+	}
+	if (load && ((rs & 0x8000) || (!rs && !(op & MULTIPLE_STACK)))) {
+		if (cpu->executionMode == MODE_THUMB) {
+			cycles += ThumbWritePC(cpu);
+		} else {
+			cycles += ARMWritePC(cpu);
+		}
+	}
+	cpu->cycles += cycles;
+	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
+}
+
+/* Not an instruction, a coprocessor's, a breakpoint: op is the opcode */
+static uint32_t _sysIllegal(struct ARMCore* cpu, uint32_t op, uint32_t pc) {
+	_setPC(cpu, pc);
+	int32_t nextEvent = cpu->nextEvent;
+	uint32_t timingKey = ARMJITTimingKey(cpu);
+	int32_t cycles = 1 + (cpu->executionMode == MODE_THUMB ? cpu->memory.activeSeqCycles16 : cpu->memory.activeSeqCycles32);
+	cpu->irqh.hitIllegal(cpu, op);
+	cpu->cycles += cycles;
+	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
+}
+
+static uint32_t _sysStub(struct ARMCore* cpu, uint32_t op, uint32_t pc) {
+	_setPC(cpu, pc);
+	int32_t nextEvent = cpu->nextEvent;
+	uint32_t timingKey = ARMJITTimingKey(cpu);
+	int32_t cycles = 1 + cpu->memory.activeSeqCycles32;
+	cpu->irqh.hitStub(cpu, op);
+	cpu->cycles += cycles;
+	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
+}
+
+static uint32_t _sysBreakpoint(struct ARMCore* cpu, uint32_t op, uint32_t pc) {
+	_setPC(cpu, pc);
+	int32_t nextEvent = cpu->nextEvent;
+	uint32_t timingKey = ARMJITTimingKey(cpu);
+	if (cpu->executionMode == MODE_THUMB) {
+		cpu->irqh.bkpt16(cpu, op & 0xFF);
+	} else {
+		cpu->irqh.bkpt32(cpu, ((op >> 4) & 0xFFF0) | (op & 0xF));
+	}
+	return _handlerResult(cpu, _handlerEnd(cpu, pc, nextEvent, timingKey));
+}
+
+static const void* const _sysRoutines[] = {
+	_sysIllegal, _sysStub, _sysBreakpoint, _sysSWI, _sysCPSR0, _sysCPSRc, _sysCPSRf, _sysCPSRcf, _sysReturn, _sysMultiple,
+};
+
+static void _registerRoutines(struct ARMJIT* jit) {
+	size_t i;
+	for (i = 0; i < sizeof(_sysRoutines) / sizeof(*_sysRoutines); ++i) {
+		ARMJITRegisterCall(jit, _sysRoutines[i]);
+	}
+}
+
+/* Call one of the above with r5 as its argument. Returns if the block can
+ * carry on. */
+static void _sys(struct JITEmitter* e, const void* fn) {
 	_charge(e);
-	_imm(e, op, 5);
+	_lit(e, (uint32_t) (uintptr_t) fn, 7);
 	_lit(e, (uint32_t) (uintptr_t) e->jit->handlers[e->thumb], 1);
 	sh4_emit_jsr(&e->cg, 1);
 	sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
 	e->usesBase = true;
+}
+
+/* The instructions the block compiler doesn't take as native. Returns if
+ * the block can carry on. */
+static void _handler(struct JITEmitter* e, uint32_t op) {
+	if (e->thumb) {
+		if ((op & 0xF600) == 0xB400) { // PUSH/POP
+			if (op & 0x0800) {
+				_imm(e, MULTIPLE_STACK | 0x08BD0000 | (op & 0xFF) | ((op & 0x100) ? 1 << ARM_PC : 0), 5);
+			} else {
+				_imm(e, MULTIPLE_STACK | 0x092D0000 | (op & 0xFF) | ((op & 0x100) ? 1 << ARM_LR : 0), 5);
+			}
+			_sys(e, _sysMultiple);
+			return;
+		}
+		if ((op & 0xF000) == 0xC000) { // STMIA/LDMIA
+			_imm(e, 0x08A00000 | ((op & 0x0800) << 9) | ((op & 0x0700) << 8) | (op & 0xFF), 5);
+			_sys(e, _sysMultiple);
+			return;
+		}
+		if ((op & 0xFF00) == 0xDF00) { // SWI
+			sh4_emit_mov_imm(&e->cg, 0, 5);
+			if (op & 0xFF) {
+				_imm(e, op & 0xFF, 5);
+			}
+			_sys(e, _sysSWI);
+			return;
+		}
+		if ((op & 0xF800) == 0xF800) { // the second half of a BL by itself
+			_ld(e, ARM_LR, 4);
+			_imm(e, (op & 0x07FF) << 1, 1);
+			sh4_emit_add_reg(&e->cg, 1, 4);
+			_imm(e, (e->address + WORD_SIZE_THUMB) | 1, 1);
+			_st(e, 1, ARM_LR);
+			_writePC(e, 1 + e->seq16, e->executed);
+			return;
+		}
+		_imm(e, op, 5);
+		_sys(e, (op & 0xFF00) == 0xBE00 ? (const void*) _sysBreakpoint : (const void*) _sysIllegal);
+		return;
+	}
+	if ((op >> 28) == 0xF) {
+		/* Never */
+		e->pending += 1 + e->seq32;
+		return;
+	}
+	if ((op & 0x0E000000) == 0x08000000) { // LDM/STM
+		_imm(e, op & 0x0FFFFFFF, 5);
+		_sys(e, _sysMultiple);
+		return;
+	}
+	if ((op & 0x0F000000) == 0x0F000000) { // SWI
+		_imm(e, op & 0xFFFFFF, 5);
+		_sys(e, _sysSWI);
+		return;
+	}
+	if ((op & 0x0E000000) == 0x0C000000 || (op & 0x0F000000) == 0x0E000000) { // coprocessor
+		_imm(e, op, 5);
+		_sys(e, _sysStub);
+		return;
+	}
+	if ((op & 0x0FB000F0) == 0x01000090) { // SWP
+		enum JITMemOp load = (op & 0x00400000) ? JIT_MEM_LOAD8 : JIT_MEM_LOAD32;
+		enum JITMemOp store = (op & 0x00400000) ? JIT_MEM_STORE8 : JIT_MEM_STORE32;
+		int address = offsetof(struct ARMCore, shifterOperand) / 4;
+		int value = offsetof(struct ARMCore, shifterCarryOut) / 4;
+		int32_t before = e->pending;
+		/* What's stored and where are kept over the load, which may be
+		 * into either's register */
+		_ld(e, (op >> 16) & 0xF, 0);
+		sh4_emit_mov_l_store_gbr(&e->cg, address);
+		sh4_emit_mov_reg(&e->cg, 0, 4);
+		_ld(e, op & 0xF, 0);
+		sh4_emit_mov_l_store_gbr(&e->cg, value);
+		_memory(e, load, (op >> 12) & 0xF);
+		sh4_emit_mov_l_load_gbr(&e->cg, address);
+		sh4_emit_mov_reg(&e->cg, 0, 4);
+		sh4_emit_mov_l_load_gbr(&e->cg, value);
+		sh4_emit_mov_reg(&e->cg, 0, 5);
+		_memory(e, store, -1);
+		e->pending = before + 1 + e->seq32;
+		return;
+	}
+	if ((op & 0x0E000090) == 0x00000090 || (op & 0x0C000000) == 0x04000000) {
+		/* A single load or store */
+		bool mode3 = (op & 0x0C000000) == 0;
+		bool load = op & 0x00100000;
+		bool legal;
+		if (mode3) {
+			legal = (op & 0x60) && (load || ((op >> 5) & 3) == 1);
+		} else {
+			legal = (op & 0x02000010) != 0x02000010;
+		}
+		if (legal) {
+			_armLoadStore(e, op, mode3);
+			if (load && ((op >> 12) & 0xF) == ARM_PC) {
+				int32_t cost = 1 + e->nonseq32;
+				e->pending -= cost;
+				sh4_emit_mov_reg(&e->cg, 0, 4);
+				_writePC(e, cost, e->executed);
+			}
+			return;
+		}
+	}
+	if ((op & 0x0FF000F0) == 0x01200010) { // BX
+		_armBX(e, op, e->executed);
+		return;
+	}
+	if ((op & 0x0FF000F0) == 0x01200070) { // BKPT
+		_imm(e, op, 5);
+		_sys(e, _sysBreakpoint);
+		return;
+	}
+	if ((op & 0x0FB000F0) == 0x01000000) { // MRS
+		if (op & 0x00400000) {
+			sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CPSR + 1);
+		} else {
+			_emitFlagsOut(e, 1);
+			sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CPSR);
+		}
+		_st(e, 0, (op >> 12) & 0xF);
+		e->pending += 1 + e->seq32;
+		return;
+	}
+	if ((op & 0x0FB000F0) == 0x01200000 || (op & 0x0FB00000) == 0x03200000) { // MSR
+		uint32_t mask = ((op & 0x00010000) ? 0x000000FF : 0) | ((op & 0x00080000) ? 0xFF000000 : 0);
+		if (op & 0x02000000) {
+			_imm(e, ROR(op & 0xFF, (op & 0x00000F00) >> 7), 5);
+		} else {
+			_ld(e, op & 0xF, 5);
+		}
+		if (op & 0x00400000) {
+			mask &= PSR_USER_MASK | PSR_PRIV_MASK | PSR_STATE_MASK;
+			_imm(e, mask, 1);
+			sh4_emit_and(&e->cg, 1, 5);
+			sh4_emit_not(&e->cg, 1, 1);
+			sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CPSR + 1);
+			sh4_emit_and(&e->cg, 1, 0);
+			sh4_emit_or(&e->cg, 5, 0);
+			sh4_emit_or_imm(&e->cg, 0x10);
+			sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_CPSR + 1);
+			e->pending += 1 + e->seq32;
+			return;
+		}
+		static const void* const routines[4] = { _sysCPSR0, _sysCPSRc, _sysCPSRf, _sysCPSRcf };
+		_sys(e, routines[((op >> 16) & 1) | ((op >> 18) & 2)]);
+		return;
+	}
+	if ((op & 0x0C000000) == 0 && ((op >> 12) & 0xF) == ARM_PC && (op & 0x0E000090) != 0x00000090) {
+		/* Data processing into the PC */
+		int alu = (op >> 21) & 0xF;
+		if (alu < 0x8 || alu > 0xB || (op & 0x00100000)) {
+			if (alu >= 0x8 && alu <= 0xB) {
+				_imm(e, _pcValue(e), 4);
+			} else {
+				_armDataProcessing(e, op, false);
+				e->pending -= 1 + e->seq32;
+				sh4_emit_mov_l_load_disp(&e->cg, R_CPU, 4, ARM_PC);
+			}
+			if (op & 0x00100000) {
+				sh4_emit_mov_reg(&e->cg, 4, 5);
+				_sys(e, _sysReturn);
+			} else {
+				_writePC(e, 1 + e->seq32, e->executed);
+			}
+			return;
+		}
+	}
+	_imm(e, op, 5);
+	_sys(e, _sysIllegal);
 }
 
 /* r += value */
@@ -1374,9 +1711,13 @@ static bool _thumbAnalyze(uint32_t op, unsigned* written, unsigned* read) {
 			case 0xB: // CMN
 				*written = F_ALL;
 				return true;
-			default: // register shifts, MUL
-				*read = F_ALL;
-				return false;
+			case 0xD: // MUL
+				*written = F_NZ;
+				return true;
+			default: // register shifts: C stays as it is for a shift of 0
+				*written = F_NZC;
+				*read = F_C;
+				return true;
 			}
 		}
 		switch ((op >> 8) & 3) {
@@ -1480,6 +1821,114 @@ static void _thumbShiftImmediate(struct JITEmitter* e, uint32_t op, bool flags) 
 	}
 }
 
+/* C from bit 0 of rc (which is destroyed). */
+static void _flagsC(struct JITEmitter* e, int rc) {
+	sh4_emit_rotl(&e->cg, R_CV);
+	sh4_emit_shlr(&e->cg, rc);
+	sh4_emit_rotcr(&e->cg, R_CV);
+}
+
+/* LSL/LSR/ASR/ROR by the low byte of a register: r1 by r2. */
+static void _thumbShiftRegister(struct JITEmitter* e, int alu, int rd, bool flags) {
+	sh4_emit_extu_b(&e->cg, 2, 2);
+	sh4_emit_tst(&e->cg, 2, 2);
+	uint8_t* none = e->cg.ptr;
+	sh4_emit_bt(&e->cg, 0);
+	if (alu == 0x7) { // ROR
+		sh4_emit_mov_imm(&e->cg, 31, 0);
+		sh4_emit_and(&e->cg, 0, 2);
+		sh4_emit_mov_reg(&e->cg, 1, 3);
+		sh4_emit_neg(&e->cg, 2, 0);
+		sh4_emit_shld(&e->cg, 0, 1);
+		sh4_emit_add_imm(&e->cg, 32, 0);
+		sh4_emit_shld(&e->cg, 0, 3);
+		sh4_emit_or(&e->cg, 3, 1);
+		if (flags) {
+			/* C is the result's top bit, also for a multiple of 32 */
+			sh4_emit_mov_reg(&e->cg, 1, 3);
+			sh4_emit_rotl(&e->cg, 3);
+			_flagsC(e, 3);
+		}
+	} else {
+		/* By one less and then by one, which leaves C in T. Above 32 is 32
+		 * of nothing, or for ASR just 32. */
+		sh4_emit_mov_imm(&e->cg, 32, 3);
+		sh4_emit_cmphi(&e->cg, 3, 2);
+		uint8_t* within = e->cg.ptr;
+		sh4_emit_bf(&e->cg, 0);
+		sh4_emit_mov_reg(&e->cg, 3, 2);
+		if (alu != 0x4) {
+			sh4_emit_mov_imm(&e->cg, 0, 1);
+		}
+		_patchBranch(within, e->cg.ptr);
+		sh4_emit_add_imm(&e->cg, -1, 2);
+		switch (alu) {
+		case 0x2: // LSL
+			sh4_emit_shld(&e->cg, 2, 1);
+			sh4_emit_shll(&e->cg, 1);
+			break;
+		case 0x3: // LSR
+			sh4_emit_neg(&e->cg, 2, 2);
+			sh4_emit_shld(&e->cg, 2, 1);
+			sh4_emit_shlr(&e->cg, 1);
+			break;
+		default: // ASR
+			sh4_emit_neg(&e->cg, 2, 2);
+			sh4_emit_shad(&e->cg, 2, 1);
+			sh4_emit_shar(&e->cg, 1);
+			break;
+		}
+		if (flags) {
+			sh4_emit_movt(&e->cg, 3);
+			_flagsC(e, 3);
+		}
+	}
+	_patchBranch(none, e->cg.ptr);
+	_st(e, 1, rd);
+	if (flags) {
+		_flagsNZ(e, 1);
+	}
+	e->pending += 1;
+}
+
+/* r1 * r2. The wait is ARM_WAIT_SMUL of what was in rd. */
+static void _thumbMultiply(struct JITEmitter* e, int rd, bool flags) {
+	sh4_emit_mov_reg(&e->cg, 1, 0);
+	sh4_emit_mul_l(&e->cg, 2, 1);
+	sh4_emit_sts_macl(&e->cg, 1);
+	_st(e, 1, rd);
+	if (flags) {
+		_flagsNZ(e, 1);
+	}
+	sh4_emit_mov_reg(&e->cg, 0, 2);
+	sh4_emit_shll(&e->cg, 0);
+	sh4_emit_subc(&e->cg, 3, 3);
+	sh4_emit_xor(&e->cg, 3, 2);
+	sh4_emit_mov_imm(&e->cg, 1, 3);
+	uint8_t* done[3];
+	int i;
+	for (i = 0; i < 3; ++i) {
+		sh4_emit_shlr8(&e->cg, 2);
+		sh4_emit_tst(&e->cg, 2, 2);
+		done[i] = e->cg.ptr;
+		sh4_emit_bt(&e->cg, 0);
+		sh4_emit_add_imm(&e->cg, 1, 3);
+	}
+	for (i = 0; i < 3; ++i) {
+		_patchBranch(done[i], e->cg.ptr);
+	}
+	if (e->stall) {
+		_lit(e, (uint32_t) (uintptr_t) e->jit->stall, 1);
+		sh4_emit_mov_reg(&e->cg, 3, 2);
+		sh4_emit_jsr(&e->cg, 1);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+		e->usesBase = true;
+	} else {
+		sh4_emit_add_reg(&e->cg, 3, R_CYCLES);
+	}
+	e->pending += e->nonseq16 - e->seq16;
+}
+
 static void _thumbAlu(struct JITEmitter* e, uint32_t op, bool flags) {
 	int rd = op & 7;
 	int rn = (op >> 3) & 7;
@@ -1499,11 +1948,20 @@ static void _thumbAlu(struct JITEmitter* e, uint32_t op, bool flags) {
 	case 0x1: // EOR
 		sh4_emit_xor(&e->cg, 2, 1);
 		break;
+	case 0x2: // LSL
+	case 0x3: // LSR
+	case 0x4: // ASR
+	case 0x7: // ROR
+		_thumbShiftRegister(e, alu, rd, flags);
+		return;
 	case 0x5: // ADC
 		_addCarry(e, false, rd, flags);
 		return;
 	case 0x6: // SBC
 		_addCarry(e, true, rd, flags);
+		return;
+	case 0xD: // MUL
+		_thumbMultiply(e, rd, flags);
 		return;
 	case 0x8: // TST
 		if (flags) {
@@ -1853,8 +2311,61 @@ static void _thumbBL(struct JITEmitter* e, uint32_t op1, uint32_t op2, int execu
 	_branch(e, target, executed);
 }
 
-/* BX Rm: within the region and staying in Thumb, look the target up here;
- * anything else is mGBA's. */
+/* Leave for the address in r4, in the mode its bit 0 says: the C side does
+ * the mode, the region and the branch's cycles. What the instruction itself
+ * costs is pending. */
+static void _exitAnywhere(struct JITEmitter* e, int executed) {
+	if (e->region == REGION_BIOS) {
+		/* What a read of the BIOS from outside gets is the last word it
+		 * fetched: the one two after this instruction. */
+		struct GBA* gba = (struct GBA*) e->jit->cpu->master;
+		uint32_t at = (e->address + 2 * _insnLength(e)) & (SIZE_BIOS - 1);
+		uint32_t word;
+		if (e->thumb) {
+			LOAD_16(word, at, gba->memory.bios);
+		} else {
+			LOAD_32(word, at, gba->memory.bios);
+		}
+		_lit(e, word, 0);
+		sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_PREFETCH1);
+	}
+	_charge(e);
+	_count(e, executed);
+	sh4_emit_mov_reg(&e->cg, 4, 0);
+	_jumpTo(e, e->jit->exits[JIT_EXIT_BRANCH]);
+	sh4_emit_nop(&e->cg);
+}
+
+/* A write to the PC that stays in the mode, the new value in r4: within the
+ * region the target is looked up here. */
+static void _writePC(struct JITEmitter* e, int32_t cost, int executed) {
+	if (e->thumb) {
+		sh4_emit_mov_reg(&e->cg, 4, 0);
+		sh4_emit_or_imm(&e->cg, 1);
+		sh4_emit_mov_reg(&e->cg, 0, 4);
+	} else {
+		sh4_emit_mov_imm(&e->cg, -2, 0);
+		sh4_emit_and(&e->cg, 0, 4);
+	}
+	_charge(e);
+	sh4_emit_mov_reg(&e->cg, 4, 0);
+	sh4_emit_shlr16(&e->cg, 0);
+	sh4_emit_shlr8(&e->cg, 0);
+	sh4_emit_cmpeq_imm(&e->cg, e->region);
+	uint8_t* other = e->cg.ptr;
+	sh4_emit_bf(&e->cg, 0);
+	e->pending = cost + _writePCCycles(e);
+	_charge(e);
+	_branchForgetsPrefetch(e);
+	_count(e, executed);
+	_jumpTo(e, e->jit->lookup);
+	sh4_emit_mov_imm(&e->cg, JIT_EXIT_LOOKUP, 5);
+	_patchBranch(other, e->cg.ptr);
+	e->pending = cost;
+	_exitAnywhere(e, executed);
+}
+
+/* BX Rm: within the region and staying in Thumb, look the target up here. */
 static void _thumbBX(struct JITEmitter* e, uint32_t op, int executed) {
 	_charge(e);
 	_ld(e, (op >> 3) & 0xF, 4);
@@ -1872,10 +2383,18 @@ static void _thumbBX(struct JITEmitter* e, uint32_t op, int executed) {
 	_jumpTo(e, e->jit->lookup);
 	sh4_emit_mov_imm(&e->cg, JIT_EXIT_LOOKUP, 5);
 	_patchBranch(slow, e->cg.ptr);
-	_handler(e, op);
-	_count(e, executed);
-	_jumpTo(e, e->jit->dispatchSync);
-	sh4_emit_nop(&e->cg);
+	e->pending = 1 + e->seq16;
+	_exitAnywhere(e, executed);
+}
+
+/* ADD/MOV into the PC */
+static void _thumbHighPC(struct JITEmitter* e, uint32_t op, int executed) {
+	_ld(e, (op >> 3) & 0xF, 4);
+	if (!(op & 0x0200)) {
+		_imm(e, _pcValue(e), 1);
+		sh4_emit_add_reg(&e->cg, 1, 4);
+	}
+	_writePC(e, 1 + e->seq16, executed);
 }
 
 /* ---------------------------------------------------------------- */
@@ -1897,7 +2416,8 @@ static void _multiple(struct JITEmitter* e, uint32_t op, int rn, unsigned mask, 
 	_charge(e);
 	_ld(e, rn, 4);
 	_addImmediate(e, lowest, 4);
-	_imm(e, op, 5);
+	_imm(e, 0x08000000 | (before << 24) | (up << 23) | (writeback << 21) | (!store << 20) | (rn << 16) | mask |
+	        (e->thumb && rn == ARM_SP ? MULTIPLE_STACK : 0), 5);
 	sh4_emit_mov_imm(&e->cg, n, 7);
 	_lit(e, (uint32_t) (uintptr_t) e->jit->multipleStubs[e->stall][store][e->thumb], 1);
 	sh4_emit_jsr(&e->cg, 1);
@@ -2023,7 +2543,9 @@ enum {
 	CARRY_KEEP,
 	CARRY_T,
 	CARRY_0,
-	CARRY_1
+	CARRY_1,
+	/* bit 0 of r3 */
+	CARRY_R3
 };
 
 /* r <<= n, r >>= n (logical or arithmetic) for 1 <= n <= 31; r0 is scratch. */
@@ -2129,6 +2651,74 @@ static int _armShiftImmediate(struct JITEmitter* e, uint32_t op, int dst, bool c
 	}
 }
 
+/* The shift-by-register forms of guest rm into host dst, as mGBA's _shift*.
+ * With carry the carry-out is left in r3. r0, r4 and r5 are scratch. */
+static int _armShiftRegister(struct JITEmitter* e, uint32_t op, int dst, bool carry) {
+	int rm = op & 0xF;
+	if (rm == ARM_PC) {
+		_imm(e, _pcValue(e) + WORD_SIZE_ARM, dst);
+	} else {
+		_ld(e, rm, dst);
+	}
+	_ld(e, (op >> 8) & 0xF, 0);
+	sh4_emit_extu_b(&e->cg, 0, 0);
+	if (carry) {
+		sh4_emit_mov_reg(&e->cg, R_CV, 3);
+		sh4_emit_rotl(&e->cg, 3);
+	}
+	sh4_emit_tst(&e->cg, 0, 0);
+	uint8_t* none = e->cg.ptr;
+	sh4_emit_bt(&e->cg, 0);
+	int type = (op >> 5) & 3;
+	if (type == 3) { // ROR
+		sh4_emit_mov_imm(&e->cg, 31, 4);
+		sh4_emit_and(&e->cg, 4, 0);
+		sh4_emit_mov_reg(&e->cg, dst, 4);
+		sh4_emit_neg(&e->cg, 0, 5);
+		sh4_emit_shld(&e->cg, 5, dst);
+		sh4_emit_add_imm(&e->cg, 32, 5);
+		sh4_emit_shld(&e->cg, 5, 4);
+		sh4_emit_or(&e->cg, 4, dst);
+		if (carry) {
+			sh4_emit_mov_reg(&e->cg, dst, 3);
+			sh4_emit_rotl(&e->cg, 3);
+		}
+	} else {
+		sh4_emit_mov_imm(&e->cg, 32, 4);
+		sh4_emit_cmphi(&e->cg, 4, 0);
+		uint8_t* within = e->cg.ptr;
+		sh4_emit_bf(&e->cg, 0);
+		sh4_emit_mov_reg(&e->cg, 4, 0);
+		if (type != 2) {
+			sh4_emit_mov_imm(&e->cg, 0, dst);
+		}
+		_patchBranch(within, e->cg.ptr);
+		sh4_emit_add_imm(&e->cg, -1, 0);
+		switch (type) {
+		case 0: // LSL
+			sh4_emit_shld(&e->cg, 0, dst);
+			sh4_emit_shll(&e->cg, dst);
+			break;
+		case 1: // LSR
+			sh4_emit_neg(&e->cg, 0, 0);
+			sh4_emit_shld(&e->cg, 0, dst);
+			sh4_emit_shlr(&e->cg, dst);
+			break;
+		default: // ASR
+			sh4_emit_neg(&e->cg, 0, 0);
+			sh4_emit_shad(&e->cg, 0, dst);
+			sh4_emit_shar(&e->cg, dst);
+			break;
+		}
+		if (carry) {
+			sh4_emit_movt(&e->cg, 3);
+		}
+	}
+	_patchBranch(none, e->cg.ptr);
+	e->pending += 1;
+	return carry ? CARRY_R3 : CARRY_KEEP;
+}
+
 static bool _armIsLogical(int alu) {
 	switch (alu) {
 	case 0x0: // AND
@@ -2160,18 +2750,24 @@ static void _armDataProcessing(struct JITEmitter* e, uint32_t op, bool flags) {
 		uint32_t value = ROR(op & 0xFF, rotate);
 		_imm(e, value, dst);
 		carry = !rotate ? CARRY_KEEP : value >> 31 ? CARRY_1 : CARRY_0;
+	} else if (op & 0x00000010) {
+		carry = _armShiftRegister(e, op, dst, flags && logical);
 	} else {
 		carry = _armShiftImmediate(e, op, dst, flags && logical);
 	}
 	if (flags && logical) {
 		if (carry == CARRY_T) {
 			sh4_emit_movt(&e->cg, 3);
-		} else if (carry != CARRY_KEEP) {
+		} else if (carry == CARRY_0 || carry == CARRY_1) {
 			sh4_emit_mov_imm(&e->cg, carry == CARRY_1, 3);
 		}
 	}
 	if (alu != 0xD && alu != 0xF) {
-		_ld(e, rn, src);
+		if (rn == ARM_PC && (op & 0x02000010) == 0x00000010) {
+			_imm(e, _pcValue(e) + WORD_SIZE_ARM, src);
+		} else {
+			_ld(e, rn, src);
+		}
 	}
 	switch (alu) {
 	case 0x0: // AND
@@ -2275,20 +2871,25 @@ static void _armLoadStore(struct JITEmitter* e, uint32_t op, bool mode3) {
 		mop = load ? JIT_MEM_LOAD32 : JIT_MEM_STORE32;
 	}
 	if (!load) {
-		_ld(e, rd, 5);
+		if (rd == ARM_PC) {
+			_imm(e, _pcValue(e) + WORD_SIZE_ARM, 5);
+		} else {
+			_ld(e, rd, 5);
+		}
 	}
 	_armOffset(e, op, mode3);
 	_ld(e, rn, 4);
+	/* The PC isn't written back to */
 	if (pre) {
 		if (up) {
 			sh4_emit_add_reg(&e->cg, 1, 4);
 		} else {
 			sh4_emit_sub(&e->cg, 1, 4);
 		}
-		if (writeback) {
+		if (writeback && rn != ARM_PC) {
 			_st(e, 4, rn);
 		}
-	} else {
+	} else if (rn != ARM_PC) {
 		sh4_emit_mov_reg(&e->cg, 4, 2);
 		if (up) {
 			sh4_emit_add_reg(&e->cg, 1, 2);
@@ -2300,11 +2901,47 @@ static void _armLoadStore(struct JITEmitter* e, uint32_t op, bool mode3) {
 	_memory(e, mop, load ? rd : -1);
 }
 
-/* MUL/MLA without S, outside ROM-with-prefetch code (where the wait goes
- * through the stall model). */
-static void _armMultiply(struct JITEmitter* e, uint32_t op) {
+/* ARM_WAIT_SMUL/UMUL of the value in r2, which is destroyed: base + 1-4 by
+ * how many of its top bytes are nothing but sign (or zero). */
+static void _multiplyWait(struct JITEmitter* e, bool sign, int base) {
+	if (sign) {
+		sh4_emit_mov_reg(&e->cg, 2, 0);
+		sh4_emit_shll(&e->cg, 0);
+		sh4_emit_subc(&e->cg, 3, 3);
+		sh4_emit_xor(&e->cg, 3, 2);
+	}
+	sh4_emit_mov_imm(&e->cg, base + 1, 3);
+	uint8_t* done[3];
+	int i;
+	for (i = 0; i < 3; ++i) {
+		sh4_emit_shlr8(&e->cg, 2);
+		sh4_emit_tst(&e->cg, 2, 2);
+		done[i] = e->cg.ptr;
+		sh4_emit_bt(&e->cg, 0);
+		sh4_emit_add_imm(&e->cg, 1, 3);
+	}
+	for (i = 0; i < 3; ++i) {
+		_patchBranch(done[i], e->cg.ptr);
+	}
+	if (e->stall) {
+		_lit(e, (uint32_t) (uintptr_t) e->jit->stall, 1);
+		sh4_emit_mov_reg(&e->cg, 3, 2);
+		sh4_emit_jsr(&e->cg, 1);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+		e->usesBase = true;
+	} else {
+		sh4_emit_add_reg(&e->cg, 3, R_CYCLES);
+	}
+}
+
+/* MUL/MLA. With S the C flag is left as it is. */
+static void _armMultiply(struct JITEmitter* e, uint32_t op, bool flags) {
 	int rd = (op >> 16) & 0xF;
 	bool accumulate = op & 0x00200000;
+	e->pending += 1 + e->nonseq32;
+	if (rd == ARM_PC) {
+		return;
+	}
 	_ld(e, op & 0xF, 1);
 	_ld(e, (op >> 8) & 0xF, 2);
 	sh4_emit_mul_l(&e->cg, 2, 1);
@@ -2314,26 +2951,51 @@ static void _armMultiply(struct JITEmitter* e, uint32_t op) {
 		sh4_emit_add_reg(&e->cg, 3, 1);
 	}
 	_st(e, 1, rd);
-	/* ARM_WAIT_SMUL: 1-4 by how many top bytes of rs are all sign */
-	_charge(e);
-	sh4_emit_mov_reg(&e->cg, 2, 0);
-	sh4_emit_shll(&e->cg, 0);
-	sh4_emit_subc(&e->cg, 3, 3);
-	sh4_emit_xor(&e->cg, 3, 2);
-	sh4_emit_add_imm(&e->cg, accumulate ? 2 : 1, R_CYCLES);
-	uint8_t* done[3];
-	int i;
-	for (i = 0; i < 3; ++i) {
-		sh4_emit_shlr8(&e->cg, 2);
-		sh4_emit_tst(&e->cg, 2, 2);
-		done[i] = e->cg.ptr;
-		sh4_emit_bt(&e->cg, 0);
-		sh4_emit_add_imm(&e->cg, 1, R_CYCLES);
+	if (flags && (op & 0x00100000)) {
+		_flagsNZ(e, 1);
 	}
-	for (i = 0; i < 3; ++i) {
-		_patchBranch(done[i], e->cg.ptr);
-	}
+	_multiplyWait(e, true, accumulate ? 1 : 0);
+}
+
+/* UMULL, UMLAL, SMULL, SMLAL */
+static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, bool flags) {
+	int rdHi = (op >> 16) & 0xF;
+	int rdLo = (op >> 12) & 0xF;
+	bool accumulate = op & 0x00200000;
+	bool sign = op & 0x00400000;
 	e->pending += 1 + e->nonseq32;
+	if (rdHi == ARM_PC || rdLo == ARM_PC) {
+		return;
+	}
+	_ld(e, op & 0xF, 1);
+	_ld(e, (op >> 8) & 0xF, 2);
+	if (sign) {
+		sh4_emit_dmuls_l(&e->cg, 2, 1);
+	} else {
+		sh4_emit_dmulu_l(&e->cg, 2, 1);
+	}
+	sh4_emit_sts_macl(&e->cg, 1);
+	sh4_emit_sts_mach(&e->cg, 3);
+	if (accumulate) {
+		_ld(e, rdLo, 0);
+		_ld(e, rdHi, 4);
+		sh4_emit_clrt(&e->cg);
+		sh4_emit_addc(&e->cg, 0, 1);
+		sh4_emit_addc(&e->cg, 4, 3);
+	}
+	_st(e, 1, rdLo);
+	_st(e, 3, rdHi);
+	if (flags && (op & 0x00100000)) {
+		/* N is the top word's, Z is for the two */
+		sh4_emit_mov_reg(&e->cg, 3, 0);
+		sh4_emit_tst(&e->cg, 1, 1);
+		uint8_t* zero = e->cg.ptr;
+		sh4_emit_bt(&e->cg, 0);
+		sh4_emit_or_imm(&e->cg, 1);
+		_patchBranch(zero, e->cg.ptr);
+		sh4_emit_mov_reg(&e->cg, 0, R_NZ);
+	}
+	_multiplyWait(e, sign, accumulate ? 2 : 1);
 }
 
 /* Whether op is translated natively (B/BL/BX are handled by the block
@@ -2350,14 +3012,19 @@ static bool _armAnalyze(uint32_t op, bool stall, unsigned* written, unsigned* re
 	int rn = (op >> 16) & 0xF;
 	int rm = op & 0xF;
 	if ((op & 0x0FC000F0) == 0x00000090) { // MUL/MLA
-		if ((op & 0x00100000) || stall || rn == ARM_PC || ((op & 0x00200000) && rd == ARM_PC)) {
-			*read = F_ALL;
-			return false;
+		if (op & 0x00100000) {
+			*written = F_NZ;
+		}
+		return true;
+	}
+	if ((op & 0x0F8000F0) == 0x00800090) { // UMULL and the like
+		if (op & 0x00100000) {
+			*written = F_NZ;
 		}
 		return true;
 	}
 	if ((op & 0x0E000090) == 0x00000090) {
-		if (!(op & 0x60) || (!(op & 0x00100000) && ((op >> 5) & 3) != 1)) { // SWP, MULL, LDRD/STRD
+		if (!(op & 0x60) || (!(op & 0x00100000) && ((op >> 5) & 3) != 1)) { // SWP, LDRD/STRD
 			*read = F_ALL;
 			return false;
 		}
@@ -2373,9 +3040,15 @@ static bool _armAnalyze(uint32_t op, bool stall, unsigned* written, unsigned* re
 	if ((op & 0x0C000000) == 0) {
 		int alu = (op >> 21) & 0xF;
 		bool s = op & 0x00100000;
-		if ((alu >= 0x8 && alu <= 0xB && !s) || rd == ARM_PC || (op & 0x02000010) == 0x00000010) {
+		if ((alu >= 0x8 && alu <= 0xB && !s) || rd == ARM_PC) {
 			*read = F_ALL;
 			return false;
+		}
+		if ((op & 0x02000010) == 0x00000010 && s && _armIsLogical(alu)) {
+			/* C stays as it is for a shift of 0 */
+			*written = F_NZC;
+			*read |= F_C;
+			return true;
 		}
 		if (alu == 0x5 || alu == 0x6 || alu == 0x7) {
 			*read |= F_C;
@@ -2421,7 +3094,9 @@ static void _armTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
 	if ((op & 0x0E000000) == 0x08000000) {
 		_armMultiple(e, op, e->index + 1);
 	} else if ((op & 0x0FC000F0) == 0x00000090) {
-		_armMultiply(e, op);
+		_armMultiply(e, op, flags);
+	} else if ((op & 0x0F8000F0) == 0x00800090) {
+		_armMultiplyLong(e, op, flags);
 	} else if ((op & 0x0E000090) == 0x00000090) {
 		_armLoadStore(e, op, true);
 	} else if ((op & 0x0C000000) == 0) {
@@ -2509,10 +3184,8 @@ static void _armBX(struct JITEmitter* e, uint32_t op, int executed) {
 	_jumpTo(e, e->jit->lookup);
 	sh4_emit_mov_imm(&e->cg, JIT_EXIT_LOOKUP, 5);
 	_patchBranch(slow, e->cg.ptr);
-	_handler(e, op);
-	_count(e, executed);
-	_jumpTo(e, e->jit->dispatchSync);
-	sh4_emit_nop(&e->cg);
+	e->pending = 1 + e->seq32;
+	_exitAnywhere(e, executed);
 }
 
 struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint32_t pc, bool thumb,
@@ -2534,7 +3207,11 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 		const char* env = getenv("JIT_MAX_INSNS");
 		maxInsns = env ? atoi(env) : 0;
 	}
-	if (maxInsns > 0 && avail > (uint32_t) maxInsns) {
+	static uint32_t longLo, longHi;
+	if (!longHi && getenv("JIT_LONG")) {
+		sscanf(getenv("JIT_LONG"), "%x-%x", &longLo, &longHi);
+	}
+	if (maxInsns > 0 && avail > (uint32_t) maxInsns && !(pc >= longLo && pc < longHi)) {
 		avail = maxInsns;
 	}
 #endif
@@ -2578,10 +3255,16 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 		if (native[i] && (thumb ? (op >> 11) >= 0x09 && (op >> 11) <= 0x19 : _armIsMemory(op))) {
 			usesBase = true;
 		}
+		if (stall && (thumb ? (op & 0xFFC0) == 0x4340 : (op & 0x0F0000F0) == 0x00000090)) { // a multiply's wait
+			usesBase = true;
+		}
 		/* handler calls, except for the branches translated whole */
 		if (!native[i]) {
 			if (thumb) {
 				if ((op & 0xF800) == 0xE000 || ((op & 0xF000) == 0xD000 && ((op >> 8) & 0xF) < 0xE)) {
+					continue;
+				}
+				if ((op & 0xFF87) == 0x4700 || (op & 0xFD87) == 0x4487) {
 					continue;
 				}
 				if ((op & 0xF800) == 0xF000 && i + 1 < (int) n && (ops[i + 1] & 0xF800) == 0xF800) {
@@ -2632,6 +3315,7 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 	}
 
 	bool ended = false;
+	e.executed = n;
 	for (i = 0; i < (int) n; ++i) {
 		uint32_t op = ops[i];
 		e.index = i;
@@ -2653,8 +3337,13 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 				ended = true;
 				break;
 			}
-			if ((op & 0xFF87) == 0x4700 && ((op >> 3) & 0xF) != ARM_PC) {
+			if ((op & 0xFF87) == 0x4700) {
 				_thumbBX(&e, op, n);
+				ended = true;
+				break;
+			}
+			if ((op & 0xFD87) == 0x4487) {
+				_thumbHighPC(&e, op, n);
 				ended = true;
 				break;
 			}
@@ -2665,7 +3354,7 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 				ended = true;
 				break;
 			}
-			if ((op & 0x0FFFFFF0) == 0x012FFF10 && (op >> 28) == 0xE && (op & 0xF) != ARM_PC) {
+			if ((op & 0x0FFFFFF0) == 0x012FFF10 && (op >> 28) == 0xE) {
 				_armBX(&e, op, n);
 				ended = true;
 				break;
