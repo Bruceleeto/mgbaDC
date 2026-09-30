@@ -104,6 +104,8 @@ struct GBAVideoSoftwareRenderer {
 	color_t variantPalette[512];
 	color_t highlightPalette[512];
 	color_t highlightVariantPalette[512];
+	// The colours as the fast path paints a target 1 layer: waiting for what's under them
+	color_t pendingPalette[512];
 
 	uint16_t blda;
 	uint16_t bldb;
@@ -165,34 +167,35 @@ struct GBAVideoSoftwareRenderer {
 	uint32_t fastLines;
 	uint32_t slowLines;
 
-	// Filled in with the sprite layer: which 8 pixel blocks of it may hold
-	// something, and which may hold something of each priority
-	uint32_t spriteBlocks;
-	uint32_t spritePriorityBlocks[4];
 	// The blocks of the sprite layer that aren't known to be clear
 	uint32_t spriteLayerDirty;
 
 	// The sprites on each line, as indices into sprites and in the same
 	// order. Line y has spriteLines[spriteLineStart[y]] up to
-	// spriteLines[spriteLineStart[y + 1]]
+	// spriteLines[spriteLineStart[y + 1]]. Alongside: each one's priority,
+	// and the cycles the ones before it on the line take.
 	uint16_t spriteLineStart[GBA_VIDEO_VERTICAL_PIXELS + 1];
 	uint8_t spriteLines[128 * GBA_VIDEO_VERTICAL_PIXELS];
+	uint8_t spriteLinePriority[128 * GBA_VIDEO_VERTICAL_PIXELS];
+	uint16_t spriteLineCycles[128 * GBA_VIDEO_VERTICAL_PIXELS];
+	// The priorities with a sprite on each line, a bit each
+	uint8_t spriteLinePriorities[GBA_VIDEO_VERTICAL_PIXELS];
+	// Lines with a sprite the fast path can't draw
+	uint8_t spriteLineSlow[GBA_VIDEO_VERTICAL_PIXELS];
 
 	// What the fast path needs of each of sprites, worked out when OAM or
 	// the registers behind fastSpriteKey change instead of on every line
 	bool fastSpritesValid;
 	struct GBAVideoSoftwareFastSpriteKey {
 		const color_t* palette[2];
-		uint32_t flags[2];
 		int16_t offsetX;
 		int16_t offsetY;
-		uint8_t force[2];
+		uint8_t slow[2];
 		uint8_t mapping;
 		uint8_t bitmap;
 	} fastSpriteKey;
 	struct GBAVideoSoftwareFastSprite {
 		const color_t* palette;
-		uint32_t flags;
 		// Affine: the accumulators on the sprite's first line
 		int32_t xAccum;
 		int32_t yAccum;
@@ -204,29 +207,17 @@ struct GBAVideoSoftwareRenderer {
 		int16_t outX;
 		int16_t condition;
 		int16_t inX;
-		int16_t cycles;
 		uint16_t charBase;
 		uint16_t maskLo;
 		uint16_t maskHi;
 		uint8_t width;
 		uint8_t height;
 		uint8_t strideShift;
-		uint8_t priority;
 		uint8_t kind;
 	} fastSprites[128];
 
-	// The sprites of a line that go straight into the output row, in OAM
-	// order
+	// The line's sprites go straight into the output row: no sprite layer
 	bool fastSpritesDirect;
-	int nFastLine;
-	struct GBAVideoSoftwareFastLine {
-		// yBase for a regular sprite
-		int32_t xAccum;
-		int32_t yAccum;
-		int16_t outX;
-		uint8_t index;
-		uint8_t priority;
-	} fastLine[128];
 };
 
 void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer);

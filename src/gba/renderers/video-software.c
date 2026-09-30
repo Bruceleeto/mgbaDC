@@ -531,6 +531,15 @@ static void GBAVideoSoftwareRendererWritePalette(struct GBAVideoRenderer* render
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	color_t color = mColorFrom555(value);
 	softwareRenderer->normalPalette[address >> 1] = color;
+#if defined(COLOR_16_BIT) && defined(COLOR_5_6_5)
+	// The fast path's "waiting to blend" form: green's spare bit set. White
+	// would read as its empty pixel, so it loses a bit of blue instead.
+	color_t pending = color | 0x0020;
+	if (pending == 0xFFFF) {
+		pending = 0xFFFE;
+	}
+	softwareRenderer->pendingPalette[address >> 1] = pending;
+#endif
 	if (softwareRenderer->blendEffect == BLEND_BRIGHTEN) {
 		softwareRenderer->variantPalette[address >> 1] = _brighten(color, softwareRenderer->bldy);
 	} else if (softwareRenderer->blendEffect == BLEND_DARKEN) {
@@ -711,14 +720,13 @@ ATTRIBUTE_HOT_GROUP_BIG(3) static void _drawScanlineNow(struct GBAVideoRenderer*
 	int spriteLayers = GBAVideoSoftwareRendererPreprocessSpriteLayer(softwareRenderer, y, fastEligible);
 	mPROFILE_STOP(profileSprites);
 
-	bool fast = false;
-	if (fastEligible) {
+	bool fast = fastEligible && softwareRenderer->fastSpritesDirect;
+	if (fast) {
 		mPROFILE_START(profileFast, "fast composite");
-		fast = GBAVideoSoftwareRendererDrawFast(softwareRenderer, y, spriteLayers, row);
+		GBAVideoSoftwareRendererDrawFast(softwareRenderer, y, spriteLayers, row);
 		mPROFILE_STOP(profileFast);
-		if (!fast) {
-			_fillBackdrop(softwareRenderer);
-		}
+	} else if (fastEligible) {
+		_fillBackdrop(softwareRenderer);
 	}
 	if (fast) {
 		++softwareRenderer->fastLines;
@@ -1201,73 +1209,26 @@ void GBAVideoSoftwareRendererPostprocessBuffer(struct GBAVideoSoftwareRenderer* 
 	}
 }
 
-// The lines a sprite is on: from its top down, and from the top of the screen
-// if it wraps around
-static void _spriteLineRanges(const struct GBAVideoRendererSprite* sprite, int* start, int* end, int* wrapEnd) {
-	*start = sprite->y < 0 ? 0 : sprite->y;
-	*end = sprite->endY > GBA_VIDEO_VERTICAL_PIXELS ? GBA_VIDEO_VERTICAL_PIXELS : sprite->endY;
-	*wrapEnd = sprite->endY - 256;
-	if (*wrapEnd > sprite->y) {
-		*wrapEnd = sprite->y;
-	}
-	if (*wrapEnd > *end) {
-		*wrapEnd = *end;
-	}
-}
-
-static void _listSpriteLines(struct GBAVideoSoftwareRenderer* renderer) {
-	uint16_t* lineStart = renderer->spriteLineStart;
-	memset(renderer->spriteLineStart, 0, sizeof(renderer->spriteLineStart));
-	int i;
-	int y;
-	int start, end, wrapEnd;
-	for (i = 0; i < renderer->oamMax; ++i) {
-		_spriteLineRanges(&renderer->sprites[i], &start, &end, &wrapEnd);
-		for (y = 0; y < wrapEnd; ++y) {
-			++lineStart[y];
-		}
-		for (y = start; y < end; ++y) {
-			++lineStart[y];
-		}
-	}
-	int total = 0;
-	for (y = 0; y < GBA_VIDEO_VERTICAL_PIXELS; ++y) {
-		int count = lineStart[y];
-		lineStart[y] = total;
-		total += count;
-	}
-	lineStart[GBA_VIDEO_VERTICAL_PIXELS] = total;
-	for (i = 0; i < renderer->oamMax; ++i) {
-		_spriteLineRanges(&renderer->sprites[i], &start, &end, &wrapEnd);
-		for (y = 0; y < wrapEnd; ++y) {
-			renderer->spriteLines[lineStart[y]++] = i;
-		}
-		for (y = start; y < end; ++y) {
-			renderer->spriteLines[lineStart[y]++] = i;
-		}
-	}
-	// Each start is now where the next line starts
-	memmove(&lineStart[1], &lineStart[0], sizeof(lineStart[0]) * (GBA_VIDEO_VERTICAL_PIXELS - 1));
-	lineStart[0] = 0;
-}
-
-int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y, bool fast) {
+// The regular path's sprite layer is a lot of code: kept out of the line drawer's cache group
+ATTRIBUTE_NOINLINE int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y, bool fast) {
 	int w;
 	int spriteLayers = 0;
-	renderer->spriteBlocks = 0;
+	renderer->fastSpritesDirect = false;
 	if (GBARegisterDISPCNTIsObjEnable(renderer->dispcnt) && !renderer->d.disableOBJ) {
 		if (renderer->oamDirty) {
 			mPROFILE_START(profileOam, "OAM rebuild");
 			renderer->oamMax = GBAVideoRendererCleanOAM(renderer->d.oam->obj, renderer->sprites, renderer->objOffsetY);
-			_listSpriteLines(renderer);
+			GBAVideoSoftwareRendererListSpriteLines(renderer);
 			mPROFILE_STOP(profileOam);
 			renderer->oamDirty = false;
 			renderer->fastSpritesValid = false;
 		}
-		if (fast) {
-			return GBAVideoSoftwareRendererFastSpriteLayer(renderer, y);
+		if (fast && GBAVideoSoftwareRendererFastSpriteLayer(renderer, y)) {
+			// Straight into the row, no sprite layer
+			renderer->fastSpritesDirect = true;
+			renderer->spriteLayerDirty = 0;
+			return renderer->spriteLinePriorities[y];
 		}
-		memset(renderer->spritePriorityBlocks, 0xFF, sizeof(renderer->spritePriorityBlocks));
 		int mosaicV = GBAMosaicControlGetObjV(renderer->mosaic) + 1;
 		int mosaicY = y - (y % mosaicV);
 		int i;
@@ -1312,7 +1273,7 @@ int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRendere
 			}
 		}
 	} else {
-		memset(renderer->spritePriorityBlocks, fast ? 0 : 0xFF, sizeof(renderer->spritePriorityBlocks));
+		renderer->fastSpritesDirect = fast;
 		renderer->spriteLayerDirty = 0;
 	}
 	return spriteLayers;
