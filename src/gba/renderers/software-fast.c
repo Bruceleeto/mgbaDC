@@ -682,14 +682,52 @@ FAST_INLINE void _directAffine(struct GBAVideoSoftwareRenderer* renderer, const 
 	const color_t* palette = sprite->palette;
 	unsigned charBase = sprite->charBase;
 	unsigned maskLo = sprite->maskLo;
-	unsigned maskHi = sprite->maskHi;
-	unsigned strideShift = sprite->strideShift;
-	int condition = sprite->condition;
 	int dx = sprite->a;
 	int dy = sprite->c;
 	unsigned widthMask = ~(sprite->width - 1);
+	color_t* pixel = &top[outX];
+	color_t* end = &top[sprite->condition];
+	if (!dy) {
+		// Scaled, not rotated: one row of the sprite for the whole line
+		int localY = yAccum >> 8;
+		if (pixel >= end || (localY & ~(sprite->height - 1))) {
+			return;
+		}
+		unsigned yBase;
+		if (bpp8) {
+			yBase = ((localY & ~0x7) << sprite->strideShift) + (localY & 0x7) * 8 + sprite->maskHi;
+		} else {
+			yBase = ((localY & ~0x7) << sprite->strideShift) + (localY & 0x7) * 4 + sprite->maskHi;
+		}
+		for (; pixel < end; ++pixel) {
+			xAccum += dx;
+			int localX = xAccum >> 8;
+			if (localX & widthMask) {
+				break;
+			}
+			if (under && !(*pixel & MIX_EMPTY)) {
+				continue;
+			}
+			unsigned p;
+			if (bpp8) {
+				unsigned xBase = (localX & ~0x7) * 8 + (localX & 6);
+				LOAD_16(p, (yBase + ((xBase + charBase) & maskLo)) & 0x7FFE, vramBase);
+				p = (p >> ((localX & 1) << 3)) & 0xFF;
+			} else {
+				unsigned xBase = (localX & ~0x7) * 4 + ((localX >> 1) & 2);
+				LOAD_16(p, (yBase + ((xBase + charBase) & maskLo)) & 0x7FFE, vramBase);
+				p = (p >> ((localX & 3) << 2)) & 0xF;
+			}
+			if (p) {
+				*pixel = palette[p];
+			}
+		}
+		return;
+	}
+	unsigned maskHi = sprite->maskHi;
+	unsigned strideShift = sprite->strideShift;
 	unsigned heightMask = ~(sprite->height - 1);
-	for (; outX < condition; ++outX) {
+	for (; pixel < end; ++pixel) {
 		xAccum += dx;
 		yAccum += dy;
 		int localX = xAccum >> 8;
@@ -697,7 +735,7 @@ FAST_INLINE void _directAffine(struct GBAVideoSoftwareRenderer* renderer, const 
 		if ((localX & widthMask) | (localY & heightMask)) {
 			break;
 		}
-		if (under && !(top[outX] & MIX_EMPTY)) {
+		if (under && !(*pixel & MIX_EMPTY)) {
 			continue;
 		}
 		unsigned p;
@@ -713,7 +751,7 @@ FAST_INLINE void _directAffine(struct GBAVideoSoftwareRenderer* renderer, const 
 			p = (p >> ((localX & 3) << 2)) & 0xF;
 		}
 		if (p) {
-			top[outX] = palette[p];
+			*pixel = palette[p];
 		}
 	}
 }
