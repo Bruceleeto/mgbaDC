@@ -1,3 +1,12 @@
+Dreamcast build
+---------------
+
+	kos-cmake ..
+
+or with fastmem and the PVR renderer:
+
+	kos-cmake -DM_ARM_JIT_FASTMEM=ON -DDC_PVR_RENDER=ON ..
+
 mGBA
 ====
 

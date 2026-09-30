@@ -20,8 +20,8 @@
 #include <dc/perfctr.h>
 #endif
 
-/* Draw GBA video on the PVR instead of the software renderer */
-#define DC_PVR_RENDER
+/* DC_PVR_RENDER (CMake option): draw GBA video on the PVR instead of the
+ * software renderer */
 #ifdef DC_PVR_RENDER
 #include "pvr-gba.h"
 #endif

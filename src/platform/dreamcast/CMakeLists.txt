@@ -1,4 +1,11 @@
-add_executable(mgba-dreamcast main.c pvr-gba.c)
+# Draw GBA video on the PowerVR instead of the software renderer.
+option(DC_PVR_RENDER "PowerVR renderer for GBA video" OFF)
+if(DC_PVR_RENDER)
+	add_executable(mgba-dreamcast main.c pvr-gba.c)
+	target_compile_definitions(mgba-dreamcast PRIVATE DC_PVR_RENDER)
+else()
+	add_executable(mgba-dreamcast main.c)
+endif()
 include(kallistios)
 set(DC_ROMDISK_DIR "${CMAKE_SOURCE_DIR}/assets/dc" CACHE PATH "Directory packed into the romdisk")
 kos_add_romdisk(mgba-dreamcast "${DC_ROMDISK_DIR}")
