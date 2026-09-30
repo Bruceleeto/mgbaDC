@@ -177,12 +177,16 @@ ATTRIBUTE_HOT_GROUP(1) void _startHdraw(struct mTiming* timing, void* context, u
 			video->renderer->finishFrame(video->renderer);
 			mPROFILE_STOP(profileFinish);
 		}
+		mPROFILE_START(profileVblankDma, "vblank DMA");
 		GBADMARunVblank(video->p, -cyclesLate);
+		mPROFILE_STOP(profileVblankDma);
 		if (GBARegisterDISPSTATIsVblankIRQ(dispstat)) {
 			GBARaiseIRQ(video->p, GBA_IRQ_VBLANK, cyclesLate);
 		}
+		mPROFILE_START(profileFrameEnd, "frame end");
 		GBAFrameEnded(video->p);
 		mCoreSyncPostFrame(video->p->sync);
+		mPROFILE_STOP(profileFrameEnd);
 		--video->frameskipCounter;
 		if (video->frameskipCounter < 0) {
 			video->frameskipCounter = video->frameskip;

@@ -46,6 +46,8 @@ extern uint32_t mProfileArmInstructions;
 extern uint32_t mProfileThumbInstructions;
 
 struct mProfileEntry* mProfileLookup(const char* name, struct mProfileEntry* parent);
+/* A named event counter, printed per frame under the tree. */
+uint32_t* mProfileCounterLookup(const char* name);
 
 /* Prints the tree as per-frame averages, then resets the totals. coreMs is
  * the frontend's own per-frame measurement of the code the profiled sections
@@ -84,10 +86,19 @@ static inline void mProfileEnd(struct mProfileScope* scope) {
 	mProfileBegin(&VAR, NAME, &VAR ## Cache)
 #define mPROFILE_STOP(VAR) mProfileEnd(&VAR)
 #define mPROFILE_COUNT(VAR) ++(VAR)
+#define mPROFILE_ADD(VAR, NAME, N) \
+	do { \
+		static uint32_t* VAR ## Counter; \
+		if (!VAR ## Counter) { \
+			VAR ## Counter = mProfileCounterLookup(NAME); \
+		} \
+		*VAR ## Counter += (N); \
+	} while (0)
 #else
 #define mPROFILE_START(VAR, NAME)
 #define mPROFILE_STOP(VAR) do {} while (0)
 #define mPROFILE_COUNT(VAR) do {} while (0)
+#define mPROFILE_ADD(VAR, NAME, N) do { (void) (N); } while (0)
 #endif
 
 CXX_GUARD_END

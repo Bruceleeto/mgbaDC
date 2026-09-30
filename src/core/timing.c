@@ -39,8 +39,33 @@ struct mProfileEntry* mProfileLookup(const char* name, struct mProfileEntry* par
 	return entry;
 }
 
+#define mPROFILE_MAX_COUNTERS 64
+static struct {
+	const char* name;
+	uint32_t value;
+} _profileCounters[mPROFILE_MAX_COUNTERS];
+static unsigned _profileNumCounters;
+static uint32_t _profileCounterOverflow;
+
+uint32_t* mProfileCounterLookup(const char* name) {
+	unsigned i;
+	for (i = 0; i < _profileNumCounters; ++i) {
+		if (_profileCounters[i].name == name) {
+			return &_profileCounters[i].value;
+		}
+	}
+	if (_profileNumCounters == mPROFILE_MAX_COUNTERS) {
+		return &_profileCounterOverflow;
+	}
+	_profileCounters[_profileNumCounters].name = name;
+	return &_profileCounters[_profileNumCounters++].value;
+}
+
 void mProfileReset(void) {
 	unsigned i;
+	for (i = 0; i < _profileNumCounters; ++i) {
+		_profileCounters[i].value = 0;
+	}
 	for (i = 0; i < _profileNumEntries; ++i) {
 		_profileEntries[i].ticks = 0;
 		_profileEntries[i].events = 0;
@@ -153,6 +178,12 @@ void mProfilePrint(double coreMs, unsigned frames, double ticksPerMs, const char
 	}
 	printf("  %-34s %7.2f ms (%.0f ticks x %.0f scopes/frame, spread over the tree)\n", "profiler overhead est.",
 	       (double) scopeCost * scopes / ticksPerMs / frames, (double) scopeCost, (double) scopes / frames);
+	if (_profileNumCounters) {
+		printf("  -- counters, per frame --\n");
+		for (i = 0; i < _profileNumCounters; ++i) {
+			printf("  %-34s %10.1f\n", _profileCounters[i].name, (double) _profileCounters[i].value / frames);
+		}
+	}
 	mProfileReset();
 }
 #endif

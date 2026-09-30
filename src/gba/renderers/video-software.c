@@ -19,6 +19,14 @@
 uint32_t GBAVideoLineCount[2];
 #endif
 
+// Set by a hardware renderer (the Dreamcast PVR path): each line's registers
+// go to the hook instead of being drawn. The bitmap marks VRAM written, one
+// bit per 32 bytes.
+void (*GBAVideoSoftwareLineHook)(struct GBAVideoSoftwareRenderer* renderer, int y);
+// Only this renderer is hooked; the others draw as usual (NULL: all)
+struct GBAVideoSoftwareRenderer* GBAVideoSoftwareLineHookTarget;
+uint32_t GBAVideoSoftwareVRAMDirty[96];
+
 #define DIRTY_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] |= (1U << (Y & 0x1F))
 #define CLEAN_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] &= ~(1U << (Y & 0x1F))
 
@@ -231,12 +239,28 @@ static void GBAVideoSoftwareRendererFlushLines(struct GBAVideoRenderer* renderer
 	softwareRenderer->nDeferred = 0;
 	renderer->pendingLines = 0;
 	int i;
+	mPROFILE_ADD(pFlush, "vid: line flushes", 1);
 	for (i = 0; i < n; ++i) {
 		struct GBAVideoSoftwareDeferred* deferred = &softwareRenderer->deferred[i];
 		if (deferred->address == DEFERRED_LINE) {
+			mPROFILE_ADD(pLines, "vid: lines flushed", 1);
 			_drawScanlineNow(renderer, deferred->value);
 		} else {
+#ifdef M_PROFILE
+			unsigned a = deferred->address;
+			if (a >= REG_BG2PA && a < REG_WIN0H) {
+				mPROFILE_ADD(pAff, "vid: replay affine regs", 1);
+			} else if (a >= REG_BG0HOFS && a < REG_BG2PA) {
+				mPROFILE_ADD(pScroll, "vid: replay scroll regs", 1);
+			} else if (a >= REG_BLDCNT && a <= REG_BLDY) {
+				mPROFILE_ADD(pBld, "vid: replay blend regs", 1);
+			} else {
+				mPROFILE_ADD(pOther, "vid: replay other regs", 1);
+			}
+#endif
+			mPROFILE_START(profileReplay, "register replay");
 			_writeVideoRegisterNow(renderer, deferred->address, deferred->value);
+			mPROFILE_STOP(profileReplay);
 		}
 	}
 }
@@ -505,6 +529,14 @@ static uint16_t _writeVideoRegisterNow(struct GBAVideoRenderer* renderer, uint32
 }
 
 static void GBAVideoSoftwareRendererWriteVRAM(struct GBAVideoRenderer* renderer, uint32_t address) {
+	mPROFILE_ADD(pVram, "cpu: VRAM writes", 1);
+	if (renderer->pendingLines) {
+		mPROFILE_ADD(pVramFlush, "cpu: VRAM writes forcing flush", 1);
+	}
+	{
+		uint32_t unit = (address >= 0x18000 ? address - 0x8000 : address) >> 5;
+		GBAVideoSoftwareVRAMDirty[unit >> 5] |= 1U << (unit & 31);
+	}
 	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	if (renderer->cache) {
@@ -518,6 +550,10 @@ static void GBAVideoSoftwareRendererWriteVRAM(struct GBAVideoRenderer* renderer,
 }
 
 static void GBAVideoSoftwareRendererWriteOAM(struct GBAVideoRenderer* renderer, uint32_t oam) {
+	mPROFILE_ADD(pOam, "cpu: OAM writes", 1);
+	if (renderer->pendingLines) {
+		mPROFILE_ADD(pOamFlush, "cpu: OAM writes forcing flush", 1);
+	}
 	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	UNUSED(oam);
@@ -527,6 +563,10 @@ static void GBAVideoSoftwareRendererWriteOAM(struct GBAVideoRenderer* renderer, 
 }
 
 static void GBAVideoSoftwareRendererWritePalette(struct GBAVideoRenderer* renderer, uint32_t address, uint16_t value) {
+	mPROFILE_ADD(pPal, "cpu: palette writes", 1);
+	if (renderer->pendingLines) {
+		mPROFILE_ADD(pPalFlush, "cpu: palette writes forcing flush", 1);
+	}
 	GBA_VIDEO_TOUCH(renderer);
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	color_t color = mColorFrom555(value);
@@ -666,6 +706,14 @@ ATTRIBUTE_HOT_GROUP_BIG(3) static void _drawScanlineNow(struct GBAVideoRenderer*
 		softwareRenderer->nextY = y + 1;
 	}
 
+	bool hooked = GBAVideoSoftwareLineHook &&
+	              (!GBAVideoSoftwareLineHookTarget || GBAVideoSoftwareLineHookTarget == softwareRenderer);
+	if (hooked) {
+		GBAVideoSoftwareLineHook(softwareRenderer, y);
+		goto advance;
+	}
+
+	mPROFILE_START(profileSetup, "line setup");
 	bool dirty = softwareRenderer->scanlineDirty[y >> 5] & (1U << (y & 0x1F));
 	if (_updateIoCache(softwareRenderer->cache[y].io, softwareRenderer->nextIo)) {
 		dirty = true;
@@ -683,6 +731,7 @@ ATTRIBUTE_HOT_GROUP_BIG(3) static void _drawScanlineNow(struct GBAVideoRenderer*
 	softwareRenderer->cache[y].scale[0][1] = softwareRenderer->bg[2].sy;
 	softwareRenderer->cache[y].scale[1][0] = softwareRenderer->bg[3].sx;
 	softwareRenderer->cache[y].scale[1][1] = softwareRenderer->bg[3].sy;
+	mPROFILE_STOP(profileSetup);
 
 	if (!dirty) {
 		mPROFILE_START(profileClean, "clean line (skipped)");
@@ -741,6 +790,7 @@ ATTRIBUTE_HOT_GROUP_BIG(3) static void _drawScanlineNow(struct GBAVideoRenderer*
 		_drawScanlineSlow(softwareRenderer, y, spriteLayers);
 	}
 
+advance:
 	if (GBARegisterDISPCNTGetMode(softwareRenderer->dispcnt) != 0) {
 		if (softwareRenderer->bg[2].enabled == ENABLED_MAX) {
 			softwareRenderer->bg[2].sx += softwareRenderer->bg[2].dmx;
@@ -769,7 +819,7 @@ ATTRIBUTE_HOT_GROUP_BIG(3) static void _drawScanlineNow(struct GBAVideoRenderer*
 		DIRTY_SCANLINE(softwareRenderer, y);
 	}
 
-	if (!fast) {
+	if (!hooked && !fast) {
 		_copyOut(softwareRenderer, row);
 	}
 }
@@ -1223,7 +1273,13 @@ ATTRIBUTE_NOINLINE int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAV
 			renderer->oamDirty = false;
 			renderer->fastSpritesValid = false;
 		}
-		if (fast && GBAVideoSoftwareRendererFastSpriteLayer(renderer, y)) {
+		bool direct = false;
+		if (fast) {
+			mPROFILE_START(profileKey, "sprite key");
+			direct = GBAVideoSoftwareRendererFastSpriteLayer(renderer, y);
+			mPROFILE_STOP(profileKey);
+		}
+		if (direct) {
 			// Straight into the row, no sprite layer
 			renderer->fastSpritesDirect = true;
 			renderer->spriteLayerDirty = 0;

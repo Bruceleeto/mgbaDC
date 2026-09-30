@@ -1,4 +1,4 @@
-add_executable(mgba-dreamcast main.c)
+add_executable(mgba-dreamcast main.c pvr-gba.c)
 include(kallistios)
 set(DC_ROMDISK_DIR "${CMAKE_SOURCE_DIR}/assets/dc" CACHE PATH "Directory packed into the romdisk")
 kos_add_romdisk(mgba-dreamcast "${DC_ROMDISK_DIR}")

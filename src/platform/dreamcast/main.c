@@ -20,6 +20,12 @@
 #include <dc/perfctr.h>
 #endif
 
+/* Draw GBA video on the PVR instead of the software renderer */
+#define DC_PVR_RENDER
+#ifdef DC_PVR_RENDER
+#include "pvr-gba.h"
+#endif
+
 #define TEXTURE_SIZE 256
 #define SAMPLE_RATE 32768
 #define AUDIO_FRAMES 8192
@@ -271,8 +277,16 @@ int main(int argc, char** argv) {
 			gbaAudio->sampleInterval = gbaAudio->directInterval;
 		}
 	}
+#ifdef DC_PVR_RENDER
+	vid_set_mode(PVR_GBA_MODE, PM_RGB565);
+#else
 	vid_set_mode(DM_640x480, PM_RGB565);
+#endif
+#ifdef DC_PVR_RENDER
+	if (pvr_init(&PVRGBAInitParams) < 0) goto cleanup;
+#else
 	if (pvr_init_defaults() < 0) goto cleanup;
+#endif
 	videoInitialized = true;
 	pvr_set_bg_color(0, 0, 0);
 	texture[0] = pvr_mem_malloc(sizeof(pixels));
@@ -291,6 +305,9 @@ int main(int argc, char** argv) {
 		context.depth.write = false;
 		pvr_poly_compile(&header[t], &context);
 	}
+#ifdef DC_PVR_RENDER
+	if (core->platform(core) != mPLATFORM_GBA || !PVRGBAInit(core->board)) goto cleanup;
+#endif
 	unsigned frame = 0;
 	if (snd_stream_init_ex(2, STREAM_BYTES) < 0) goto cleanup;
 	audioInitialized = true;
@@ -318,6 +335,8 @@ int main(int argc, char** argv) {
 	uint64_t profileStart = timer_us_gettime64();
 	uint64_t profileInput = 0, profileCore = 0, profileAudio = 0;
 	unsigned profileFrames = 0;
+	uint64_t pvrRender = 0, pvrRenderMax = 0, pvrRegister = 0;
+	size_t pvrVertexBytes = 0;
 	while (true) {
 		uint64_t start = timer_us_gettime64();
 		if (!updateInput(core)) break;
@@ -327,7 +346,19 @@ int main(int argc, char** argv) {
 		collectAudio(core);
 		snd_stream_poll(sound);
 		uint64_t audioDone = timer_us_gettime64();
+#ifdef DC_PVR_RENDER
+		PVRGBAFrame(core->board, &profileUpload, &profileSubmit);
+		{
+			pvr_stats_t stats;
+			pvr_get_stats(&stats);
+			pvrRender += stats.rnd_last_time;
+			if (stats.rnd_last_time > pvrRenderMax) pvrRenderMax = stats.rnd_last_time;
+			pvrRegister += stats.reg_last_time;
+			pvrVertexBytes = stats.vtx_buffer_used;
+		}
+#else
 		present(texture[frame & 1], &header[frame & 1], width, height);
+#endif
 		++frame;
 		uint64_t now = timer_us_gettime64();
 		profileInput += inputDone - start;
@@ -340,6 +371,16 @@ int main(int argc, char** argv) {
 			       profileFrames * 1000000.0 / (now - profileStart),
 			       profileInput / divisor, profileCore / divisor, profileAudio / divisor,
 			       profileUpload / divisor, profileSubmit / divisor);
+#ifdef DC_PVR_RENDER
+			printf("  PVR: render %.2f ms avg %.2f max, TA registration %.2f ms, %u vertex bytes\n",
+			       pvrRender / 1e6 / profileFrames, pvrRenderMax / 1e6, pvrRegister / 1e6 / profileFrames,
+			       (unsigned) pvrVertexBytes);
+			printf("  PVR upload: dirty+palette %.2f ms, layers %.2f ms, sprites %.2f ms\n",
+			       PVRGBAUploadSplit[0] / 1e3 / profileFrames, PVRGBAUploadSplit[1] / 1e3 / profileFrames,
+			       PVRGBAUploadSplit[2] / 1e3 / profileFrames);
+			memset(PVRGBAUploadSplit, 0, sizeof(PVRGBAUploadSplit));
+			pvrRender = pvrRenderMax = pvrRegister = 0;
+#endif
 #ifdef DC_JIT
 			struct ARMJITStats jitStats;
 			ARMJITGetStats(core->cpu, &jitStats);
