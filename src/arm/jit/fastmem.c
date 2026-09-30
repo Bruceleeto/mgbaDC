@@ -17,11 +17,14 @@
 
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/memory.h>
+#include <mgba-util/vfs.h>
 
 #include <arch/irq.h>
 #include <arch/mmu.h>
 #include <kos/thread.h>
+#include <malloc.h>
 #include <stdio.h>
+#include <string.h>
 
 /* The vectors: exception entry for the direct accesses.
  * A fault at one of the six access instructions (address r4, value r5, offset
@@ -47,8 +50,83 @@ __asm__(
 	"\tnop\n"
 	"\t.org\t0x400\n"
 	"\tnop\n"
+	/* A TLB miss in the paged ROM's window: a resident page goes into the
+	 * next ROM slot, one that isn't is read in by _fastmem_tramp. */
+	"\tmov.l\tm_tea,r0\n"
+	"\tmov.l\t@r0,r3\n"
+	"\tmov.l\t_fastmem_romlo,r1\n"
+	"\tmov\tr3,r0\n"
+	"\tsub\tr1,r0\n"
+	"\tmov.l\t_fastmem_romlen,r2\n"
+	"\tcmp/hs\tr2,r0\n"
+	"\tbt\tm_common\n"
+	"\tshlr16\tr0\n"
+	"\tshll2\tr0\n"
+	"\tmov.l\t_fastmem_rompte,r1\n"
+	"\tmov.l\t@(r0,r1),r1\n"
+	"\ttst\tr1,r1\n"
+	"\tbt\tm_pagein\n"
+	"\tmov.l\t_fastmem_romslot,r2\n"
+	"\ttst\tr2,r2\n"
+	"\tbf\tm_dec\n"
+	"\tmov.l\t_fastmem_romslots,r2\n"
+	"m_dec:\n"
+	"\tadd\t#-1,r2\n"
+	"\tmova\t_fastmem_romslot,r0\n"
+	"\tmov.l\tr2,@r0\n"
+	"\tshll8\tr2\n"
+	"\tmov.l\tm_utlbd,r0\n"
+	"\tor\tr2,r0\n"
+	"\tmov.l\tr1,@r0\n"
+	"\tmov.l\tm_utlba,r0\n"
+	"\tor\tr2,r0\n"
+	"\tshlr16\tr3\n"
+	"\tshll16\tr3\n"
+	"\tmov.w\tm_v,r1\n"
+	"\tor\tr1,r3\n"
+	"\tmov.l\tr3,@r0\n"
+	"\trte\n"
+	"\tnop\n"
+	"m_pagein:\n"
+	"\tmova\t_fastmem_pi,r0\n"
+	"\tstc\tspc,r1\n"
+	"\tmov.l\tr1,@r0\n"
+	"\tmov.l\tr3,@(4,r0)\n"
+	"\tmov.l\tm_tramp,r1\n"
+	"\tldc\tr1,spc\n"
+	"\trte\n"
+	"\tnop\n"
+	"m_common:\n"
 	"\tbra\tcommon\n"
 	"\tnop\n"
+	"\t.balign\t4\n"
+	"m_tea:\n"
+	"\t.long\t0xFF00000C\n"
+	"m_utlbd:\n"
+	"\t.long\t0xF7000000\n"
+	"m_utlba:\n"
+	"\t.long\t0xF6000000\n"
+	"m_tramp:\n"
+	"\t.long\t_fastmem_tramp\n"
+	"\t.globl\t_fastmem_romlo\n"
+	"_fastmem_romlo:\n"
+	"\t.long\t0\n"
+	"\t.globl\t_fastmem_romlen\n"
+	"_fastmem_romlen:\n"
+	"\t.long\t0\n"
+	"\t.globl\t_fastmem_rompte\n"
+	"_fastmem_rompte:\n"
+	"\t.long\t0\n"
+	"_fastmem_romslot:\n"
+	"\t.long\t0\n"
+	"\t.globl\t_fastmem_romslots\n"
+	"_fastmem_romslots:\n"
+	"\t.long\t0\n"
+	"\t.globl\t_fastmem_pi\n"
+	"_fastmem_pi:\n"
+	"\t.long\t0, 0\n"
+	"m_v:\n"
+	"\t.word\t0x0300\n"
 	"\t.org\t0x600\n"
 	"\tnop\n"
 	"\tmov.l\tkos,r0\n"
@@ -153,11 +231,117 @@ __asm__(
 	"\t.long\t0, 0, 0, 0, 0, 0, 0, 0\n"
 	".text\n");
 
+/* A ROM page fault's way into C: runs with everything the faulting code had,
+ * saves it, reads the page in, and goes back to the access with rte. */
+__asm__(
+	"\t.text\n"
+	"\t.balign\t4\n"
+	"_fastmem_tramp:\n"
+	"\tmov.l\tr0,@-r15\n"
+	"\tstc\tsr,r0\n"
+	"\tmov.l\tr0,@-r15\n"
+	"\tmov.l\tt_pi,r0\n"
+	"\tmov.l\t@r0,r0\n"
+	"\tmov.l\tr0,@-r15\n"
+	"\tmov.l\tr1,@-r15\n"
+	"\tmov.l\tr2,@-r15\n"
+	"\tmov.l\tr3,@-r15\n"
+	"\tmov.l\tr4,@-r15\n"
+	"\tmov.l\tr5,@-r15\n"
+	"\tmov.l\tr6,@-r15\n"
+	"\tmov.l\tr7,@-r15\n"
+	"\tmov.l\tr8,@-r15\n"
+	"\tmov.l\tr9,@-r15\n"
+	"\tmov.l\tr10,@-r15\n"
+	"\tmov.l\tr11,@-r15\n"
+	"\tmov.l\tr12,@-r15\n"
+	"\tmov.l\tr13,@-r15\n"
+	"\tmov.l\tr14,@-r15\n"
+	"\tsts.l\tpr,@-r15\n"
+	"\tsts.l\tmach,@-r15\n"
+	"\tsts.l\tmacl,@-r15\n"
+	"\tstc.l\tgbr,@-r15\n"
+	"\tsts.l\tfpul,@-r15\n"
+	"\tsts.l\tfpscr,@-r15\n"
+	"\tsts\tfpscr,r0\n"
+	"\tmov.l\tt_fpmask,r1\n"
+	"\tand\tr1,r0\n"
+	"\tlds\tr0,fpscr\n"
+	"\tfmov.s\tfr0,@-r15\n"
+	"\tfmov.s\tfr1,@-r15\n"
+	"\tfmov.s\tfr2,@-r15\n"
+	"\tfmov.s\tfr3,@-r15\n"
+	"\tfmov.s\tfr4,@-r15\n"
+	"\tfmov.s\tfr5,@-r15\n"
+	"\tfmov.s\tfr6,@-r15\n"
+	"\tfmov.s\tfr7,@-r15\n"
+	"\tfmov.s\tfr8,@-r15\n"
+	"\tfmov.s\tfr9,@-r15\n"
+	"\tfmov.s\tfr10,@-r15\n"
+	"\tfmov.s\tfr11,@-r15\n"
+	"\tmov.l\tt_fn,r0\n"
+	"\tjsr\t@r0\n"
+	"\tnop\n"
+	"\tfmov.s\t@r15+,fr11\n"
+	"\tfmov.s\t@r15+,fr10\n"
+	"\tfmov.s\t@r15+,fr9\n"
+	"\tfmov.s\t@r15+,fr8\n"
+	"\tfmov.s\t@r15+,fr7\n"
+	"\tfmov.s\t@r15+,fr6\n"
+	"\tfmov.s\t@r15+,fr5\n"
+	"\tfmov.s\t@r15+,fr4\n"
+	"\tfmov.s\t@r15+,fr3\n"
+	"\tfmov.s\t@r15+,fr2\n"
+	"\tfmov.s\t@r15+,fr1\n"
+	"\tfmov.s\t@r15+,fr0\n"
+	"\tlds.l\t@r15+,fpscr\n"
+	"\tlds.l\t@r15+,fpul\n"
+	"\tldc.l\t@r15+,gbr\n"
+	"\tlds.l\t@r15+,macl\n"
+	"\tlds.l\t@r15+,mach\n"
+	"\tlds.l\t@r15+,pr\n"
+	"\tmov.l\t@r15+,r14\n"
+	"\tmov.l\t@r15+,r13\n"
+	"\tmov.l\t@r15+,r12\n"
+	"\tmov.l\t@r15+,r11\n"
+	"\tmov.l\t@r15+,r10\n"
+	"\tmov.l\t@r15+,r9\n"
+	"\tmov.l\t@r15+,r8\n"
+	"\tmov.l\t@r15+,r7\n"
+	"\tmov.l\t@r15+,r6\n"
+	"\tmov.l\t@r15+,r5\n"
+	"\tmov.l\t@r15+,r4\n"
+	"\tmov.l\t@r15+,r3\n"
+	"\tmov.l\t@r15+,r2\n"
+	"\tmov.l\t@r15+,r1\n"
+	"\tstc\tsr,r0\n"
+	"\tor\t#0xF0,r0\n"
+	"\tldc\tr0,sr\n"
+	"\tmov.l\t@r15+,r0\n"
+	"\tldc\tr0,spc\n"
+	"\tmov.l\t@r15+,r0\n"
+	"\tldc\tr0,ssr\n"
+	"\tmov.l\t@r15+,r0\n"
+	"\trte\n"
+	"\tnop\n"
+	"\t.balign\t4\n"
+	"t_pi:\n"
+	"\t.long\t_fastmem_pi\n"
+	"t_fpmask:\n"
+	"\t.long\t0xFFC7FFFF\n"
+	"t_fn:\n"
+	"\t.long\t_ARMJITFastmemPageIn\n");
+
 extern uint8_t fastmem_vbr[];
 extern uint32_t fastmem_lo;
 extern uint32_t fastmem_hi;
 extern uint32_t fastmem_count;
 extern uint32_t fastmem_table[8];
+extern uint32_t fastmem_romlo;
+extern uint32_t fastmem_romlen;
+extern uint32_t* fastmem_rompte;
+extern uint32_t fastmem_romslots;
+extern uint32_t fastmem_pi[2];
 
 #define UTLB_ADDR(E) (*(volatile uint32_t*) (0xF6000000 | ((E) << 8)))
 #define UTLB_DATA(E) (*(volatile uint32_t*) (0xF7000000 | ((E) << 8)))
@@ -179,6 +363,7 @@ extern uint32_t fastmem_table[8];
 
 static struct {
 	bool on;
+	bool jit;
 	uint32_t vbr;
 	const void* wram;
 	const void* rom;
@@ -186,6 +371,25 @@ static struct {
 	bool ram;
 	int next;
 } fm;
+
+/* ROM paging: the ROM read from its file ROM_PAGE bytes at a time into
+ * frames, seen at BASE_CART0 through the MMU. The vector puts resident pages
+ * into the ROM slots (UTLB entries 0 to MAX_ROM_PAGES - 1) in turn; the rest
+ * go through ARMJITFastmemPageIn. Frame 0 keeps page 0 for good: the header
+ * and the GPIO registers C writes. */
+#define ROM_PAGE 0x10000
+#define ROM_PAGES (SIZE_CART0 / ROM_PAGE)
+
+static struct {
+	struct VFile* vf;
+	uint32_t pages;
+	uint8_t* frames;
+	int nframes;
+	int next;
+	int16_t owner[ROM_PAGES];
+	uint32_t pte[ROM_PAGES];
+	uint32_t faults;
+} rp;
 
 static void _entry(int entry, uint32_t virt, uint32_t phys, uint32_t size) {
 	UTLB_DATA(entry) = (phys & 0x1FFFFC00) | PTE_V | size | PTE_RW | PTE_C | PTE_D | PTE_SH;
@@ -220,7 +424,7 @@ static void _map(struct ARMJIT* jit) {
 			_entry(entry, BASE_WORKING_RAM + (i << 16), wram + (i << 16), SZ_64K);
 		}
 	}
-	if (rom && !(rom & 0xFFFFF)) {
+	if (rom && !(rom & 0xFFFFF) && !rp.vf) {
 		int pages = (fm.romSize + 0xFFFFF) >> 20;
 		if (pages > MAX_ROM_PAGES) {
 			pages = MAX_ROM_PAGES;
@@ -260,9 +464,140 @@ __attribute__((used, externally_visible)) void ARMJITFastmemCrash(void) {
 	}
 }
 
+static void _vectors(bool on) {
+	if (on == fm.on) {
+		return;
+	}
+	int old = irq_disable();
+	uint32_t vbr;
+	if (on) {
+		mmu_init_basic();
+		__asm__ volatile("stc vbr,%0" : "=r"(vbr));
+		fm.vbr = vbr;
+		vbr = (uint32_t) (uintptr_t) fastmem_vbr;
+		__asm__ volatile("ldc %0,vbr" : : "r"(vbr));
+	} else {
+		__asm__ volatile("ldc %0,vbr" : : "r"(fm.vbr));
+		mmu_shutdown_basic();
+	}
+	fm.on = on;
+	irq_restore(old);
+}
+
+static void _romUnmap(uint32_t page) {
+	uint32_t virt = BASE_CART0 + page * ROM_PAGE;
+	int i;
+	rp.pte[page] = 0;
+	for (i = 0; i < MAX_ROM_PAGES; ++i) {
+		if ((UTLB_ADDR(i) & 0xFFFFFD00) == (virt | PTE_V)) {
+			UTLB_ADDR(i) = 0;
+			UTLB_DATA(i) = 0;
+		}
+	}
+}
+
+static bool _romRead(int frame, uint32_t page) {
+	uint8_t* p = &rp.frames[frame * ROM_PAGE];
+	ssize_t got = 0;
+	if (rp.vf->seek(rp.vf, page * ROM_PAGE, SEEK_SET) >= 0) {
+		got = rp.vf->read(rp.vf, p, ROM_PAGE);
+	}
+	if (got < 0) {
+		got = 0;
+	}
+	memset(p + got, 0, ROM_PAGE - got);
+	rp.owner[frame] = page;
+	rp.pte[page] = (((uint32_t) (uintptr_t) p) & 0x1FFFFC00) | PTE_V | SZ_64K | PTE_C | PTE_D | PTE_SH;
+	return got > 0;
+}
+
+/* From _fastmem_tramp, in the context of the access that faulted */
+__attribute__((used, externally_visible)) void ARMJITFastmemPageIn(void) {
+	uint32_t page = (fastmem_pi[1] - BASE_CART0) / ROM_PAGE;
+	if (page >= rp.pages || rp.pte[page]) {
+		return;
+	}
+	int frame = rp.next;
+	rp.next = frame + 1 < rp.nframes ? frame + 1 : 1;
+	int old = irq_disable();
+	if (rp.owner[frame] >= 0) {
+		_romUnmap(rp.owner[frame]);
+	}
+	irq_restore(old);
+	_romRead(frame, page);
+	++rp.faults;
+}
+
+void* ARMJITRomPagingOpen(struct VFile* vf, size_t size, size_t budget, void** page0) {
+	if (rp.vf || !size || size > SIZE_CART0) {
+		return NULL;
+	}
+	uint32_t pages = (size + ROM_PAGE - 1) / ROM_PAGE;
+	/* One frame of the budget goes to the alignment */
+	int n = budget / ROM_PAGE - 1;
+	if (n > (int) pages) {
+		n = pages;
+	}
+	if (n < 2) {
+		return NULL;
+	}
+	rp.frames = memalign(ROM_PAGE, (size_t) n * ROM_PAGE);
+	if (!rp.frames) {
+		return NULL;
+	}
+	rp.vf = vf;
+	rp.pages = pages;
+	rp.nframes = n;
+	rp.next = 1;
+	rp.faults = 0;
+	int i;
+	for (i = 0; i < n; ++i) {
+		rp.owner[i] = -1;
+	}
+	memset(rp.pte, 0, sizeof(rp.pte));
+	_romRead(0, 0);
+	printf("ROM paging: %u KiB in %d KiB of frames\n", (unsigned) (size >> 10), n * (ROM_PAGE >> 10));
+	int old = irq_disable();
+	for (i = 0; i < MAX_ROM_PAGES; ++i) {
+		UTLB_ADDR(i) = 0;
+		UTLB_DATA(i) = 0;
+	}
+	fastmem_rompte = rp.pte;
+	fastmem_romslots = MAX_ROM_PAGES;
+	fastmem_romlo = BASE_CART0;
+	fastmem_romlen = pages * ROM_PAGE;
+	irq_restore(old);
+	_vectors(true);
+	*page0 = rp.frames;
+	return (void*) BASE_CART0;
+}
+
+void ARMJITRomPagingClose(void) {
+	if (!rp.vf) {
+		return;
+	}
+	int old = irq_disable();
+	fastmem_romlen = 0;
+	int i;
+	for (i = 0; i < MAX_ROM_PAGES; ++i) {
+		UTLB_ADDR(i) = 0;
+		UTLB_DATA(i) = 0;
+	}
+	irq_restore(old);
+	free(rp.frames);
+	rp.frames = NULL;
+	rp.vf = NULL;
+	if (!fm.jit) {
+		_vectors(false);
+	}
+}
+
+uint32_t ARMJITRomPagingFaults(void) {
+	return rp.faults;
+}
+
 bool ARMJITFastmemInit(struct ARMJIT* jit) {
 	UNUSED(jit);
-	mmu_init_basic();
 	return true;
 }
 
@@ -275,33 +610,28 @@ void ARMJITFastmemInstall(struct ARMJIT* jit) {
 	fastmem_table[4] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_LOADS8];
 	fastmem_table[5] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_LOADS16];
 	fastmem_table[6] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_LOAD32];
+	_vectors(true);
+	fm.jit = true;
 	_map(jit);
-	int old = irq_disable();
-	uint32_t vbr;
-	__asm__ volatile("stc vbr,%0" : "=r"(vbr));
-	fm.vbr = vbr;
-	vbr = (uint32_t) (uintptr_t) fastmem_vbr;
-	__asm__ volatile("ldc %0,vbr" : : "r"(vbr));
-	fm.on = true;
-	irq_restore(old);
 }
 
 void ARMJITFastmemDeinit(struct ARMJIT* jit) {
 	UNUSED(jit);
-	if (!fm.on) {
+	if (!fm.jit) {
 		return;
 	}
-	int old = irq_disable();
-	__asm__ volatile("ldc %0,vbr" : : "r"(fm.vbr));
-	fm.on = false;
-	irq_restore(old);
-	mmu_shutdown_basic();
+	fm.jit = false;
+	fastmem_lo = 0;
+	fastmem_hi = 0;
+	if (!rp.vf) {
+		_vectors(false);
+	}
 }
 
 void ARMJITFastmemUpdate(struct ARMJIT* jit) {
 	struct GBA* gba = (struct GBA*) jit->cpu->master;
 	struct GBAMemory* memory = &gba->memory;
-	if (!fm.on) {
+	if (!fm.jit) {
 		return;
 	}
 	if (memory->wram == fm.wram && memory->rom == fm.rom && (memory->rom ? memory->romSize : 0) == fm.romSize) {
@@ -324,7 +654,7 @@ static int _page(uint32_t address) {
 
 void ARMJITFastmemProtect(struct ARMJIT* jit, uint32_t start, uint32_t end) {
 	UNUSED(jit);
-	if (!fm.on || !fm.ram) {
+	if (!fm.jit || !fm.ram) {
 		return;
 	}
 	int first = _page(start);
@@ -339,7 +669,7 @@ void ARMJITFastmemProtect(struct ARMJIT* jit, uint32_t start, uint32_t end) {
 
 void ARMJITFastmemUnprotectPage(struct ARMJIT* jit, uint32_t address) {
 	UNUSED(jit);
-	if (!fm.on || !fm.ram) {
+	if (!fm.jit || !fm.ram) {
 		return;
 	}
 	int page = _page(address);
@@ -350,7 +680,7 @@ void ARMJITFastmemUnprotectPage(struct ARMJIT* jit, uint32_t address) {
 
 void ARMJITFastmemUnprotect(struct ARMJIT* jit) {
 	UNUSED(jit);
-	if (!fm.on || !fm.ram) {
+	if (!fm.jit || !fm.ram) {
 		return;
 	}
 	int i;

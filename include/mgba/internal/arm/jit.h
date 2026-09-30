@@ -48,6 +48,17 @@ void ARMJITGetStats(struct ARMCore* cpu, struct ARMJITStats* stats);
  * nothing from the next instruction on reads them before writing them. */
 uint32_t ARMJITStaleFlags(struct ARMCore* cpu);
 
+#if defined(__DREAMCAST__) && defined(M_ARM_JIT_FASTMEM)
+struct VFile;
+/* ROM paging (fastmem.c) for a ROM that doesn't fit: read from vf 64 KiB at a
+ * time into up to budget bytes of frames, and seen through the MMU at
+ * BASE_CART0, which it returns (NULL if it can't). *page0 is page 0's frame,
+ * for C to write the GPIO registers through. */
+void* ARMJITRomPagingOpen(struct VFile* vf, size_t size, size_t budget, void** page0);
+void ARMJITRomPagingClose(void);
+uint32_t ARMJITRomPagingFaults(void);
+#endif
+
 CXX_GUARD_END
 
 #endif

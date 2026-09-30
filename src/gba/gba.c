@@ -132,7 +132,32 @@ static void GBAInit(void* cpu, struct mCPUComponent* component) {
 }
 
 #ifdef __DREAMCAST__
+#include <malloc.h>
+#include <unistd.h>
+#ifdef M_ARM_JIT_FASTMEM
+#include <mgba/internal/arm/jit.h>
+#endif
+
+/* Left free for what's allocated after the ROM (the JIT, audio, video) */
+#define DC_ROM_RESERVE 0x200000
+/* GBALoadNull's blank cart */
+#define DC_NULL_ROM 0x10000
+
 static void* dcRom;
+static void* dcPage0;
+static bool dcPaged;
+
+/* RAM left above the heap, up to the stock 16 MiB (0x8D000000) */
+static size_t _dcFree(void) {
+	uintptr_t top = 0x8D000000 - 0x10000;
+	uintptr_t brk = (uintptr_t) sbrk(0);
+	return top > brk ? top - brk : 0;
+}
+
+static bool _dcRomFits(size_t size) {
+	// Plus up to 1 MiB lost to the alignment
+	return size + 0x100000 + DC_ROM_RESERVE <= _dcFree();
+}
 #endif
 
 void GBAUnloadROM(struct GBA* gba) {
@@ -151,8 +176,14 @@ void GBAUnloadROM(struct GBA* gba) {
 		if (gba->isPristine && gba->memory.rom) {
 #ifdef __DREAMCAST__
 			if (gba->memory.rom == dcRom) {
+#ifdef M_ARM_JIT_FASTMEM
+				if (dcPaged) {
+					ARMJITRomPagingClose();
+				} else
+#endif
 				mappedMemoryFree(dcRom, gba->pristineRomSize);
 				dcRom = NULL;
+				dcPaged = false;
 			} else
 #endif
 			gba->romVf->unmap(gba->romVf, gba->memory.rom, gba->pristineRomSize);
@@ -370,15 +401,22 @@ bool GBALoadNull(struct GBA* gba) {
 	GBAUnloadROM(gba);
 	gba->romVf = NULL;
 	gba->pristineRomSize = 0;
+#ifdef __DREAMCAST__
+	// Not 32 MiB of blank cart out of 16 MiB of RAM
+	gba->memory.rom = anonymousMemoryMap(DC_NULL_ROM);
+	gba->memory.romSize = DC_NULL_ROM;
+	gba->memory.romMask = DC_NULL_ROM - 1;
+#else
 #ifndef FIXED_ROM_BUFFER
 	gba->memory.rom = anonymousMemoryMap(SIZE_CART0);
 #else
 	gba->memory.rom = romBuffer;
 #endif
-	gba->isPristine = false;
-	gba->yankedRomSize = 0;
 	gba->memory.romSize = SIZE_CART0;
 	gba->memory.romMask = SIZE_CART0 - 1;
+#endif
+	gba->isPristine = false;
+	gba->yankedRomSize = 0;
 	gba->romCrc32 = 0;
 
 	if (gba->cpu) {
@@ -439,6 +477,8 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 		gba->memory.romSize = 0x00400000;
 #ifdef FIXED_ROM_BUFFER
 		gba->memory.rom = romBuffer;
+#elif defined(__DREAMCAST__)
+		gba->memory.rom = anonymousMemoryMap(gba->memory.romSize);
 #else
 		gba->memory.rom = anonymousMemoryMap(SIZE_CART0);
 #endif
@@ -449,10 +489,30 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 	} else {
 #ifdef __DREAMCAST__
 		// On a 1 MiB boundary, so the JIT can map it (src/arm/jit/fastmem.c)
-		dcRom = anonymousMemoryMap(gba->pristineRomSize);
+		dcRom = _dcRomFits(gba->pristineRomSize) ? anonymousMemoryMap(gba->pristineRomSize) : NULL;
 		if (dcRom) {
-			vf->read(vf, dcRom, gba->pristineRomSize);
+			// In 1 MiB pieces: a read can return less than it was asked for
+			size_t done = 0;
+			while (done < gba->pristineRomSize) {
+				size_t chunk = gba->pristineRomSize - done;
+				ssize_t got = vf->read(vf, (uint8_t*) dcRom + done, chunk < 0x100000 ? chunk : 0x100000);
+				if (got <= 0) {
+					break;
+				}
+				done += got;
+			}
+			if (done < gba->pristineRomSize) {
+				mLOG(GBA, WARN, "ROM read short: %u of %u bytes", (unsigned) done, (unsigned) gba->pristineRomSize);
+			}
 		}
+#ifdef M_ARM_JIT_FASTMEM
+		// Too big: paged in from vf as it's read
+		else {
+			size_t free = _dcFree();
+			dcRom = ARMJITRomPagingOpen(vf, gba->pristineRomSize, free > DC_ROM_RESERVE ? free - DC_ROM_RESERVE : 0, &dcPage0);
+			dcPaged = dcRom;
+		}
+#endif
 		gba->memory.rom = dcRom;
 #else
 		gba->memory.rom = vf->map(vf, gba->pristineRomSize, MAP_READ);
@@ -466,8 +526,15 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 	}
 	gba->yankedRomSize = 0;
 	gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
+#ifdef __DREAMCAST__
+	// Reading all of a paged ROM for this would take ages
+	gba->romCrc32 = dcPaged ? 0 : doCrc32(gba->memory.rom, gba->pristineRomSize);
+	// No 32 MiB flash cart copy either: a ROM that isn't a power of two keeps its size
+	if (false) {
+#else
 	gba->romCrc32 = doCrc32(gba->memory.rom, gba->pristineRomSize);
 	if (popcount32(gba->memory.romSize) != 1) {
+#endif
 		// This ROM is either a bad dump or homebrew. Emulate flash cart behavior.
 #ifndef FIXED_ROM_BUFFER
 		void* newRom = anonymousMemoryMap(SIZE_CART0);
@@ -481,7 +548,12 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 	if (gba->cpu && gba->memory.activeRegion >= REGION_CART0) {
 		gba->cpu->memory.setActiveRegion(gba->cpu, gba->cpu->gprs[ARM_PC]);
 	}
+#ifdef __DREAMCAST__
+	// The paged ROM is read only: GPIO goes through its page 0's frame
+	GBAHardwareInit(&gba->memory.hw, &((uint16_t*) (dcPaged ? dcPage0 : gba->memory.rom))[GPIO_REG_DATA >> 1]);
+#else
 	GBAHardwareInit(&gba->memory.hw, &((uint16_t*) gba->memory.rom)[GPIO_REG_DATA >> 1]);
+#endif
 	GBAVFameDetect(&gba->memory.vfame, gba->memory.rom, gba->memory.romSize);
 	// TODO: error check
 	return true;
