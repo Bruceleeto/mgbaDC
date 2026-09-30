@@ -2769,12 +2769,13 @@ static void _multiplyWait(struct JITEmitter* e, int base, bool sign) {
 static void _thumbMultiply(struct JITEmitter* e, int rd, int a, int b, unsigned flags) {
 	sh4_emit_mul_l(&e->cg, b, a);
 	_multiplyFold(e, true, a);
+	/* In the multiplier's shadow: MACL takes ~5 cycles to be ready */
+	_multiplyWait(e, 0, true);
 	int dst = _pinned(rd);
 	sh4_emit_sts_macl(&e->cg, dst);
 	if (flags & F_NZ) {
 		_flagsNZ(e, dst);
 	}
-	_multiplyWait(e, 0, true);
 	_st(e, dst, rd);
 	e->pending += e->nonseq16 - e->seq16;
 }
@@ -3963,6 +3964,8 @@ static void _armMultiply(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int b = _getR0(e, (op >> 8) & 0xF);
 	sh4_emit_mul_l(&e->cg, b, a);
 	_multiplyFold(e, true, b);
+	/* In the multiplier's shadow: MACL takes ~5 cycles to be ready */
+	_multiplyWait(e, accumulate ? 1 : 0, true);
 	int dst = _pinned(rd);
 	if (accumulate) {
 		int c = _get(e, (op >> 12) & 0xF, 4);
@@ -3979,7 +3982,6 @@ static void _armMultiply(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	if ((flags & F_NZ) && (op & 0x00100000)) {
 		_flagsNZ(e, dst);
 	}
-	_multiplyWait(e, accumulate ? 1 : 0, true);
 	_st(e, dst, rd);
 }
 
@@ -4001,6 +4003,8 @@ static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, unsigned flags) 
 		sh4_emit_dmulu_l(&e->cg, b, a);
 	}
 	_multiplyFold(e, sign, b);
+	/* In the multiplier's shadow */
+	_multiplyWait(e, accumulate ? 2 : 1, sign);
 	sh4_emit_sts_macl(&e->cg, 5);
 	sh4_emit_sts_mach(&e->cg, 2);
 	if (accumulate) {
@@ -4022,7 +4026,6 @@ static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, unsigned flags) 
 		_patchBranch(zero, e->cg.ptr);
 		sh4_emit_mov_reg(&e->cg, 0, R_NZ);
 	}
-	_multiplyWait(e, accumulate ? 2 : 1, sign);
 }
 
 /* Whether op is translated natively (B/BL/BX are handled by the block

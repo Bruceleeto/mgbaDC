@@ -579,7 +579,11 @@ void GBAIOWrite(struct GBA* gba, uint32_t address, uint16_t value) {
 		return;
 	case REG_IME:
 		gba->memory.io[REG_IME >> 1] = value & 1;
-		GBATestIRQ(gba, 1);
+		/* Clearing it raises nothing, and GBAHalt tests for itself: as the
+		 * JIT's IME stub, which doesn't come here for that */
+		if (value & 1) {
+			GBATestIRQ(gba, 1);
+		}
 		return;
 	case REG_MAX:
 		// Some bad interrupt libraries will write to this

@@ -115,6 +115,8 @@ bool ARMJITInit(struct ARMCore* cpu) {
 	ARMJITHostMap(jit, &jit->exit, sizeof(jit->exit));
 	ARMJITHostMap(jit, jit->baseCache, sizeof(jit->baseCache));
 	ARMJITHostMap(jit, &gba->memory, sizeof(gba->memory));
+	/* The I/O stubs clear it on DISPSTAT, VCOUNT, IE and IF reads */
+	ARMJITHostMap(jit, &gba->haltPending, sizeof(gba->haltPending));
 	ARMJITHostMap(jit, jit->chunks, sizeof(jit->chunks));
 	ARMJITHostMap(jit, gba->memory.wram, SIZE_WORKING_RAM);
 	ARMJITHostMap(jit, gba->memory.iwram, SIZE_WORKING_IRAM);
