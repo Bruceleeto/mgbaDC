@@ -48,7 +48,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "^[Dd]ream[Cc]ast$" OR CMAKE_SYSTEM_NAME STREQUAL "
 	endif()
 	# Dreamcast only. Needs the MMU's exceptions, which Flycast doesn't
 	# raise: turn it off for a build that is to run there.
-	option(M_ARM_JIT_FASTMEM "Guest memory through the SH-4's MMU" ON)
+	option(M_ARM_JIT_FASTMEM "Guest memory through the SH-4's MMU" OFF)
 	if(M_ARM_JIT AND M_ARM_JIT_FASTMEM)
 		add_definitions(-DM_ARM_JIT_FASTMEM)
 	endif()

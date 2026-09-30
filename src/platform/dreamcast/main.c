@@ -33,7 +33,7 @@ static color_t pixels[TEXTURE_SIZE * TEXTURE_SIZE] __attribute__((aligned(32)));
 static int16_t audioRing[AUDIO_FRAMES][2];
 static int16_t audioOutput[AUDIO_FRAMES][2] __attribute__((aligned(32)));
 static unsigned audioRead, audioWrite, audioCount;
-static uint64_t profileWait, profileUpload, profileSubmit;
+static uint64_t profileUpload, profileSubmit;
 
 static void logMessage(struct mLogger* logger, int category, enum mLogLevel level,
                        const char* format, va_list args) {
@@ -146,41 +146,46 @@ static bool updateInput(struct mCore* core) {
 
 static void present(pvr_ptr_t texture, const pvr_poly_hdr_t* header,
                     unsigned width, unsigned height) {
-	/* Finish the preceding render before overwriting its texture. The padded
-	 * stride lets KOS upload directly with store queues, without swizzling. */
+	/* Two textures, swapped every frame, so this never overwrites the one the
+	 * PVR may still be drawing; pvr_list_begin waits for the TA itself. The
+	 * padded stride lets KOS upload with store queues, without swizzling. */
 	uint64_t start = timer_us_gettime64();
-	pvr_wait_ready();
-	uint64_t ready = timer_us_gettime64();
 	pvr_txr_load(pixels, texture, TEXTURE_SIZE * height * sizeof(color_t));
 	uint64_t uploaded = timer_us_gettime64();
-	profileWait += ready - start;
-	profileUpload += uploaded - ready;
-	pvr_scene_begin();
-	pvr_list_begin(PVR_LIST_OP_POLY);
-	pvr_prim(header, sizeof(*header));
+	profileUpload += uploaded - start;
 	float scale = 640.0f / width;
 	if (height * scale > 480.0f) scale = 480.0f / height;
-	float x = (640.0f - width * scale) / 2;
-	float y = (480.0f - height * scale) / 2;
-	pvr_vertex_t vertex = {0};
-	vertex.flags = PVR_CMD_VERTEX;
-	vertex.z = 1.0f;
-	vertex.argb = 0xFFFFFFFF;
-	vertex.x = x;
-	vertex.y = y;
-	pvr_prim(&vertex, sizeof(vertex));
-	vertex.x = x + width * scale;
-	vertex.u = (float) width / TEXTURE_SIZE;
-	pvr_prim(&vertex, sizeof(vertex));
-	vertex.x = x;
-	vertex.y = y + height * scale;
-	vertex.u = 0;
-	vertex.v = (float) height / TEXTURE_SIZE;
-	pvr_prim(&vertex, sizeof(vertex));
-	vertex.x = x + width * scale;
-	vertex.u = (float) width / TEXTURE_SIZE;
-	vertex.flags = PVR_CMD_VERTEX_EOL;
-	pvr_prim(&vertex, sizeof(vertex));
+	float x0 = (640.0f - width * scale) / 2;
+	float y0 = (480.0f - height * scale) / 2;
+	float x1 = x0 + width * scale;
+	float y1 = y0 + height * scale;
+	float u1 = (float) width / TEXTURE_SIZE;
+	float v1 = (float) height / TEXTURE_SIZE;
+	pvr_scene_begin();
+	pvr_list_begin(PVR_LIST_OP_POLY);
+	/* Direct render: the header and each vertex go straight out of a store
+	 * queue. The texture replaces the colour, so argb is left out; z stays
+	 * because the PVR interpolates u/v with it. */
+	static const float cornerX[4] = { 0, 1, 0, 1 };
+	static const float cornerY[4] = { 0, 0, 1, 1 };
+	int i;
+	uint32_t* sq = sq_lock((void*) PVR_TA_INPUT);
+	const uint32_t* words = (const uint32_t*) header;
+	for (i = 0; i < 8; ++i) {
+		sq[i] = words[i];
+	}
+	sq_flush(sq);
+	for (i = 0; i < 4; ++i) {
+		pvr_vertex_t* vertex = (pvr_vertex_t*) &sq[(~i & 1) * 8];
+		vertex->flags = i == 3 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+		vertex->x = cornerX[i] ? x1 : x0;
+		vertex->y = cornerY[i] ? y1 : y0;
+		vertex->z = 1.0f;
+		vertex->u = cornerX[i] ? u1 : 0;
+		vertex->v = cornerY[i] ? v1 : 0;
+		sq_flush(vertex);
+	}
+	sq_unlock();
 	pvr_list_finish();
 	pvr_scene_finish();
 	profileSubmit += timer_us_gettime64() - uploaded;
@@ -224,7 +229,7 @@ int main(int argc, char** argv) {
 	mCoreLoadConfig(core);
 	int result = 1;
 	bool videoInitialized = false, audioInitialized = false;
-	pvr_ptr_t texture = NULL;
+	pvr_ptr_t texture[2] = { NULL, NULL };
 	snd_stream_hnd_t sound = SND_STREAM_INVALID;
 	if (!mCoreLoadFile(core, path)) {
 		printf("mgba-dc: failed to load %s\n", path);
@@ -270,14 +275,23 @@ int main(int argc, char** argv) {
 	if (pvr_init_defaults() < 0) goto cleanup;
 	videoInitialized = true;
 	pvr_set_bg_color(0, 0, 0);
-	texture = pvr_mem_malloc(sizeof(pixels));
-	if (!texture) goto cleanup;
-	pvr_poly_cxt_t context;
-	pvr_poly_hdr_t header;
-	pvr_poly_cxt_txr(&context, PVR_LIST_OP_POLY,
-	                PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
-	                TEXTURE_SIZE, TEXTURE_SIZE, texture, PVR_FILTER_NONE);
-	pvr_poly_compile(&header, &context);
+	texture[0] = pvr_mem_malloc(sizeof(pixels));
+	texture[1] = pvr_mem_malloc(sizeof(pixels));
+	if (!texture[0] || !texture[1]) goto cleanup;
+	pvr_poly_hdr_t header[2];
+	int t;
+	for (t = 0; t < 2; ++t) {
+		pvr_poly_cxt_t context;
+		pvr_poly_cxt_txr(&context, PVR_LIST_OP_POLY,
+		                PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+		                TEXTURE_SIZE, TEXTURE_SIZE, texture[t], PVR_FILTER_NONE);
+		/* The texture is the colour; nothing to depth test against */
+		context.txr.env = PVR_TXRENV_REPLACE;
+		context.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+		context.depth.write = false;
+		pvr_poly_compile(&header[t], &context);
+	}
+	unsigned frame = 0;
 	if (snd_stream_init_ex(2, STREAM_BYTES) < 0) goto cleanup;
 	audioInitialized = true;
 	sound = snd_stream_alloc(audioCallback, STREAM_BYTES);
@@ -313,7 +327,8 @@ int main(int argc, char** argv) {
 		collectAudio(core);
 		snd_stream_poll(sound);
 		uint64_t audioDone = timer_us_gettime64();
-		present(texture, &header, width, height);
+		present(texture[frame & 1], &header[frame & 1], width, height);
+		++frame;
 		uint64_t now = timer_us_gettime64();
 		profileInput += inputDone - start;
 		profileCore += coreDone - inputDone;
@@ -321,10 +336,10 @@ int main(int argc, char** argv) {
 		++profileFrames;
 		if (now - profileStart >= 1000000) {
 			double divisor = profileFrames * 1000.0;
-			printf("FPS %.1f | ms/frame: input %.2f core %.2f audio %.2f PVR-wait %.2f upload %.2f submit %.2f\n",
+			printf("FPS %.1f | ms/frame: input %.2f core %.2f audio %.2f upload %.2f submit %.2f\n",
 			       profileFrames * 1000000.0 / (now - profileStart),
 			       profileInput / divisor, profileCore / divisor, profileAudio / divisor,
-			       profileWait / divisor, profileUpload / divisor, profileSubmit / divisor);
+			       profileUpload / divisor, profileSubmit / divisor);
 #ifdef DC_JIT
 			struct ARMJITStats jitStats;
 			ARMJITGetStats(core->cpu, &jitStats);
@@ -369,7 +384,7 @@ int main(int argc, char** argv) {
 			profileStart = timer_us_gettime64();
 			profileFrames = 0;
 			profileInput = profileCore = profileAudio = 0;
-			profileWait = profileUpload = profileSubmit = 0;
+			profileUpload = profileSubmit = 0;
 		}
 	}
 	result = 0;
@@ -382,7 +397,8 @@ cleanup:
 	if (audioInitialized) snd_stream_shutdown();
 	if (videoInitialized) {
 		pvr_wait_ready();
-		if (texture) pvr_mem_free(texture);
+		if (texture[0]) pvr_mem_free(texture[0]);
+		if (texture[1]) pvr_mem_free(texture[1]);
 		pvr_shutdown();
 	}
 	mCoreConfigDeinit(&core->config);

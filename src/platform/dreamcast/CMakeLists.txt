@@ -5,7 +5,7 @@ kos_add_romdisk(mgba-dreamcast "${DC_ROMDISK_DIR}")
 target_compile_definitions(mgba-dreamcast PRIVATE ${FEATURE_DEFINES} ${FUNCTION_DEFINES} ${OS_DEFINES})
 target_link_libraries(mgba-dreamcast ${BINARY_NAME})
 # Run guest code on the ARM -> SH-4 recompiler instead of the interpreter.
-option(DC_JIT "Use the ARM recompiler" OFF)
+option(DC_JIT "Use the ARM recompiler" ON)
 if(DC_JIT AND M_ARM_JIT)
 	target_compile_definitions(mgba-dreamcast PRIVATE DC_JIT)
 endif()
