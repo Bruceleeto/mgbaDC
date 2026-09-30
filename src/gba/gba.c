@@ -659,6 +659,9 @@ ATTRIBUTE_HOT_GROUP(1) void GBATestIRQ(struct GBA* gba, uint32_t cyclesLate) {
 void GBAHalt(struct GBA* gba) {
 	gba->cpu->nextEvent = gba->cpu->cycles;
 	gba->cpu->halted = 1;
+	/* An IRQ already pending ends it, even with IME clear; writes that
+	 * clear IME don't test for it (the JIT's) */
+	GBATestIRQ(gba, 0);
 }
 
 void GBAStop(struct GBA* gba) {

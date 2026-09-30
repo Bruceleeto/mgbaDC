@@ -206,6 +206,7 @@ void ARMJITFlush(struct ARMCore* cpu) {
 	memset(jit->hash, 0, JIT_HASH_SIZE * sizeof(*jit->hash));
 	memset(jit->baseCache, 0, sizeof(jit->baseCache));
 	jit->nBlocks = 0;
+	jit->nFaultedBlocks = 0;
 	jit->codeUsed = jit->codeBase;
 	++jit->stats.flushes;
 #ifdef JIT_FASTMEM
@@ -518,6 +519,60 @@ static void _kill(struct ARMJIT* jit, struct JITBlock* block) {
 	++jit->stats.invalidations;
 }
 
+static inline uint32_t _siteKey(uint32_t address, bool thumb) {
+	return 0x80000000 | (address << 1) | thumb;
+}
+
+bool ARMJITSlowSite(struct ARMJIT* jit, uint32_t address, bool thumb) {
+	if (!jit->nSlowSites) {
+		return false;
+	}
+	uint32_t key = _siteKey(address, thumb);
+	uint32_t i = (address >> 1) * 0x9E3779B1U >> 22;
+	while (jit->slowSites[i]) {
+		if (jit->slowSites[i] == key) {
+			return true;
+		}
+		i = (i + 1) & (JIT_SLOW_SITES - 1);
+	}
+	return false;
+}
+
+/* An access at host faulted into its stub at an I/O address: its block is
+ * recompiled with a stub call there, once the run is out of it. Only I/O:
+ * RAM faults are code-page protection, and the rest are rare. */
+void ARMJITFaulted(struct ARMJIT* jit, uint32_t host, uint32_t address, uint32_t pc) {
+	if (address >> 24 != REGION_IO || jit->nSlowSites >= JIT_SLOW_SITES / 2) {
+		return;
+	}
+	bool thumb = jit->cpu->executionMode == MODE_THUMB;
+	uint32_t insn = pc - (thumb ? 2 * WORD_SIZE_THUMB : 2 * WORD_SIZE_ARM);
+	if (ARMJITSlowSite(jit, insn, thumb)) {
+		return;
+	}
+	uint32_t i = (insn >> 1) * 0x9E3779B1U >> 22;
+	while (jit->slowSites[i]) {
+		i = (i + 1) & (JIT_SLOW_SITES - 1);
+	}
+	jit->slowSites[i] = _siteKey(insn, thumb);
+	++jit->nSlowSites;
+	/* The block holding host: the last one that starts before it */
+	uint32_t lo = 0, hi = jit->nBlocks;
+	while (hi - lo > 1) {
+		uint32_t mid = (lo + hi) / 2;
+		if ((uint32_t) (uintptr_t) jit->blocks[mid].code <= host) {
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	struct JITBlock* block = &jit->blocks[lo];
+	if (jit->nBlocks && !block->dead && (uint32_t) (uintptr_t) block->code <= host &&
+	    jit->nFaultedBlocks < sizeof(jit->faultedBlocks) / sizeof(*jit->faultedBlocks)) {
+		jit->faultedBlocks[jit->nFaultedBlocks++] = block;
+	}
+}
+
 /* A store landed in [address, address + size): drop every block that covers
  * any of it. Blocks spanning two chunks sit on both lists; a dead one is
  * unlinked lazily when the other list is next walked. */
@@ -673,6 +728,12 @@ uint32_t ARMJITRun(struct ARMCore* cpu) {
 	mPROFILE_START(profileCode, "jit code");
 	uint32_t executed = _execute(jit, block);
 	mPROFILE_STOP(profileCode);
+	while (jit->nFaultedBlocks) {
+		struct JITBlock* faulted = jit->faultedBlocks[--jit->nFaultedBlocks];
+		if (!faulted->dead) {
+			_kill(jit, faulted);
+		}
+	}
 	uint32_t arg = jit->exit.arg;
 	uint32_t* site;
 	uint32_t flushes;

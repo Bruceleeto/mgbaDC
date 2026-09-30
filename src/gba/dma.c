@@ -374,7 +374,12 @@ static bool _canBatch(struct GBA* gba, int number, struct GBADMA* info) {
 	}
 	uint32_t sourceRegion = info->nextSource >> BASE_OFFSET;
 	uint32_t destRegion = info->nextDest >> BASE_OFFSET;
-	if (!info->nextSource || !_batchRegion(sourceRegion) || !_batchRegion(destRegion) || destRegion >= REGION_CART0) {
+	/* The video registers from BG0CNT to BLDY only change what later lines
+	 * draw, and schedule nothing: HBlank DMAs of affine parameters batch */
+	uint32_t ioOffset = info->nextDest & 0x00FFFFFF;
+	bool videoIO = destRegion == REGION_IO && ioOffset >= 0x08 && ioOffset + (2 << GBADMARegisterGetWidth(info->reg)) <= 0x56;
+	if (!info->nextSource || !_batchRegion(sourceRegion) || (!_batchRegion(destRegion) && !videoIO) ||
+	    destRegion >= REGION_CART0) {
 		return false;
 	}
 	int i;
@@ -468,6 +473,17 @@ static int32_t _bulk(struct GBA* gba, int number, struct GBADMA* info) {
 		destOffset = dest & (SIZE_OAM - width);
 		destSize = SIZE_OAM;
 		break;
+	case REGION_IO:
+		/* The video registers from BG0CNT to BLDY, as GBAIOWrite writes
+		 * them: HBlank DMAs of affine parameters */
+		destBase = NULL;
+		destOffset = dest & 0x00FFFFFF & -width;
+		if (destOffset < REG_BG0CNT) {
+			return 0;
+		}
+		destOffset -= REG_BG0CNT;
+		destSize = (REG_BLDY + 2 - REG_BG0CNT) & -width;
+		break;
 	default:
 		return 0;
 	}
@@ -498,17 +514,25 @@ static int32_t _bulk(struct GBA* gba, int number, struct GBADMA* info) {
 		}
 	}
 	int32_t cycles = 2;
+	/* The first unit of a transfer waits nonsequentially */
+	int32_t first = 0;
 	if (width == 4) {
 		cycles += memory->waitstatesSeq32[sourceRegion] + memory->waitstatesSeq32[destRegion];
+		if (info->count == info->nextCount) {
+			first = memory->waitstatesNonseq32[sourceRegion] + memory->waitstatesNonseq32[destRegion] + 2 - cycles;
+		}
 	} else {
 		cycles += memory->waitstatesSeq16[sourceRegion] + memory->waitstatesSeq16[destRegion];
+		if (info->count == info->nextCount) {
+			first = memory->waitstatesNonseq16[sourceRegion] + memory->waitstatesNonseq16[destRegion] + 2 - cycles;
+		}
 	}
 	struct mTimingEvent* next = timing->root;
 	if (next == &memory->dmaEvent) {
 		next = next->next;
 	}
 	if (next) {
-		int32_t until = next->when - info->when;
+		int32_t until = next->when - info->when - first;
 		room = until <= 0 ? 1 : (until + cycles - 1) / cycles;
 		if (room < n) {
 			n = room;
@@ -523,7 +547,22 @@ static int32_t _bulk(struct GBA* gba, int number, struct GBADMA* info) {
 	bool changed = false;
 	uint32_t last = 0;
 	int32_t left;
-	if (plain && width == 4) {
+	if (destRegion == REGION_IO) {
+		for (left = n; left; --left, sourceOffset += sourceStep, destOffset += destStep) {
+			uint32_t address = destOffset + REG_BG0CNT;
+			if (width == 4) {
+				LOAD_32(value, sourceOffset, sourceBase);
+				memory->io[address >> 1] = renderer->writeVideoRegister(renderer, address, value);
+				memory->io[(address >> 1) + 1] = renderer->writeVideoRegister(renderer, address + 2, value >> 16);
+			} else {
+				LOAD_16(value, sourceOffset, sourceBase);
+				memory->io[address >> 1] = renderer->writeVideoRegister(renderer, address, value);
+			}
+		}
+		if (width == 2) {
+			value = (value & 0xFFFF) | (value << 16);
+		}
+	} else if (plain && width == 4) {
 		for (left = n; left; --left, sourceOffset += sourceStep, destOffset += destStep) {
 			LOAD_32(value, sourceOffset, sourceBase);
 			STORE_32(value, destOffset, destBase);
@@ -586,7 +625,7 @@ static int32_t _bulk(struct GBA* gba, int number, struct GBADMA* info) {
 	gba->bus = value;
 	gba->performingDMA = 0;
 
-	info->when += cycles * n;
+	info->when += cycles * n + first;
 	info->nextCount -= n;
 	info->nextSource = source + sourceStep * n;
 	info->nextDest = dest + destStep * n;
@@ -606,13 +645,11 @@ void GBADMAService(struct GBA* gba, int number, struct GBADMA* info) {
 		if ((info->nextDest >> BASE_OFFSET) >= REGION_PALETTE_RAM && (info->nextDest >> BASE_OFFSET) <= REGION_OAM) {
 			GBA_VIDEO_TOUCH(gba->video.renderer);
 		}
-		if (info->count != info->nextCount) {
-			sourceRegion = info->nextSource >> BASE_OFFSET;
-			destRegion = info->nextDest >> BASE_OFFSET;
-			if (_bulk(gba, number, info)) {
-				wordsRemaining = info->nextCount;
-				continue;
-			}
+		sourceRegion = info->nextSource >> BASE_OFFSET;
+		destRegion = info->nextDest >> BASE_OFFSET;
+		if (_bulk(gba, number, info)) {
+			wordsRemaining = info->nextCount;
+			continue;
 		}
 		width = 2 << GBADMARegisterGetWidth(info->reg);
 		wordsRemaining = info->nextCount;

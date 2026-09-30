@@ -881,7 +881,20 @@ uint32_t jitHandlerHist[2][256];
 #define HIST(A)
 #define HHIST(T, OP)
 #endif
+#ifdef JIT_FASTMEM
+extern uint32_t fastmem_site;
+/* Set by a fault into the stub, not by a call */
+#define FAULTED(A)                                                   \
+	if (fastmem_site) {                                          \
+		ARMJITFaulted(cpu->jit, fastmem_site, (A), pc); \
+		fastmem_site = 0;                                    \
+	}
+#else
+#define FAULTED(A)
+#endif
+
 static uint32_t _load32(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
+	FAULTED(address);
 	HIST(address);
 	_setPC(cpu, pc);
 	int cycles = 0;
@@ -893,6 +906,7 @@ static uint32_t _load32(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
 }
 
 static uint32_t _load16(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
+	FAULTED(address);
 	HIST(address);
 	_setPC(cpu, pc);
 	int cycles = 0;
@@ -904,6 +918,7 @@ static uint32_t _load16(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
 }
 
 static uint32_t _load8(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
+	FAULTED(address);
 	HIST(address);
 	_setPC(cpu, pc);
 	int cycles = 0;
@@ -915,11 +930,13 @@ static uint32_t _load8(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
 }
 
 static uint32_t _loadS8(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
+	FAULTED(address);
 	return ARM_SXT_8(_load8(cpu, address, pc));
 }
 
 /* An odd address loads a sign-extended byte, as LDRSH does on the ARM7. */
 static uint32_t _loadS16(struct ARMCore* cpu, uint32_t address, uint32_t pc) {
+	FAULTED(address);
 	uint32_t value = _load16(cpu, address, pc);
 	return address & 1 ? ARM_SXT_8(value) : ARM_SXT_16(value);
 }
@@ -965,6 +982,7 @@ static uint32_t _storeEnd(struct ARMCore* cpu, const struct JITStoreState* state
 }
 
 static uint32_t _store32(struct ARMCore* cpu, uint32_t address, uint32_t value, uint32_t pc) {
+	FAULTED(address);
 	struct JITStoreState state;
 	mPROFILE_START(profileStub, "mem stub");
 	_storeBegin(cpu, &state, pc);
@@ -976,6 +994,7 @@ static uint32_t _store32(struct ARMCore* cpu, uint32_t address, uint32_t value, 
 }
 
 static uint32_t _store16(struct ARMCore* cpu, uint32_t address, uint32_t value, uint32_t pc) {
+	FAULTED(address);
 	struct JITStoreState state;
 	mPROFILE_START(profileStub, "mem stub");
 	_storeBegin(cpu, &state, pc);
@@ -987,6 +1006,7 @@ static uint32_t _store16(struct ARMCore* cpu, uint32_t address, uint32_t value, 
 }
 
 static uint32_t _store8(struct ARMCore* cpu, uint32_t address, uint32_t value, uint32_t pc) {
+	FAULTED(address);
 	struct JITStoreState state;
 	mPROFILE_START(profileStub, "mem stub");
 	_storeBegin(cpu, &state, pc);
@@ -1005,7 +1025,7 @@ static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd) {
 	if (store && rd >= 0) {
 		_ld(e, rd, 5);
 	}
-	if (e->jit->fastmem) {
+	if (e->jit->fastmem && !ARMJITSlowSite(e->jit, e->address, e->thumb)) {
 		/* The access itself, at the guest's address (fastmem.c). The mask
 		 * keeps it out of the host's half of the address space; what isn't
 		 * mapped faults into the stub, which returns after the access.
@@ -1505,8 +1525,13 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 	}
 	sh4_emit_cmpeq_imm(&e->cg, REGION_WORKING_RAM);
 	struct JITFixups toVram = { .n = 0 };
+	struct JITFixups toIo = { .n = 0 };
 	bool vram = store;
-	_bfTo(e, vram ? &toVram : &toSlow);
+	bool io = !store;
+	_bfTo(e, vram ? &toVram : io ? &toIo : &toSlow);
+	struct JITFixups toIoStore = { .n = 0 };
+	struct JITFixups toSlow2 = { .n = 0 };
+	bool ioStore = true;
 
 	/* EWRAM */
 	_emitOffset(e, SIZE_WORKING_RAM - 1);
@@ -1524,8 +1549,40 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 	if (vram) {
 		_branchHere(&toVram, e->cg.ptr);
 		sh4_emit_cmpeq_imm(&e->cg, REGION_VRAM);
-		_bfTo(e, &toSlow);
+		_bfTo(e, ioStore ? &toIoStore : &toSlow);
 		_emitVramStore(e, op, stall, stallCode, &toSlow);
+	}
+
+	/* DISPSTAT and VCOUNT, which games poll, and IE/IF, which IRQ handlers
+	 * read: io[] as GBAIORead has it, which clears haltPending (for IE it
+	 * needn't, which only makes idle loop removal wait). Wait as IWRAM's. */
+	if (io) {
+		_branchHere(&toIo, e->cg.ptr);
+		sh4_emit_cmpeq_imm(&e->cg, REGION_IO);
+		_bfTo(e, &toSlow);
+#ifdef JIT_FASTMEM
+		/* A fault from direct access: C marks the site slow */
+		_lit(e, (uint32_t) (uintptr_t) &fastmem_site, 2);
+		sh4_emit_mov_l_load(&e->cg, 2, 2);
+		sh4_emit_tst(&e->cg, 2, 2);
+		_bfTo(e, &toSlow);
+#endif
+		/* DISPSTAT/VCOUNT or IE/IF: offset >> 2 is 1 or 0x80 */
+		struct JITFixups ioOk = { .n = 0 };
+		_emitOffset(e, 0x00FFFFFF);
+		sh4_emit_mov_reg(&e->cg, 1, 0);
+		sh4_emit_shlr2(&e->cg, 0);
+		sh4_emit_cmpeq_imm(&e->cg, REG_DISPSTAT >> 2);
+		_btTo(e, &ioOk);
+		sh4_emit_add_imm(&e->cg, -(REG_IE >> 2), 0);
+		sh4_emit_tst(&e->cg, 0, 0);
+		_bfTo(e, &toSlow);
+		_branchHere(&ioOk, e->cg.ptr);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_HALT_PENDING));
+		sh4_emit_mov_imm(&e->cg, 0, 2);
+		sh4_emit_mov_b_store(&e->cg, 2, 0);
+		_emitAccess(e, op, JIT_MD_DISPCNT);
+		_emitWaitTailConst(e, stall, stallCode, 2);
 	}
 
 	/* ROM (wait state 0 only), never stalls: above BASE_CART0 */
@@ -1541,12 +1598,83 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 	}
 
 	_branchHere(&toSlow, e->cg.ptr);
+	uint8_t* slowLabel = e->cg.ptr;
 	ARMJITRegisterCall(e->jit, slow[op]);
 	_lit(e, (uint32_t) (uintptr_t) slow[op], 2);
 	uint8_t* bra = e->cg.ptr;
 	sh4_emit_bra(&e->cg, 0);
 	sh4_emit_nop(&e->cg);
 	_patchBranch(bra, store ? slowStore : slowLoad);
+
+	/* After the slow path, where its branches back reach */
+	/* IF acks and IME: as GBAIOWrite, which then runs GBATestIRQ. That
+	 * only schedules something when IE & IF, so then C does it all again
+	 * (clearing IF bits and setting IME twice changes nothing). */
+	if (ioStore) {
+		struct JITFixups toIf = { .n = 0 };
+		_branchHere(&toIoStore, e->cg.ptr);
+		sh4_emit_cmpeq_imm(&e->cg, REGION_IO);
+		_bfTo(e, &toSlow2);
+#ifdef JIT_FASTMEM
+		_lit(e, (uint32_t) (uintptr_t) &fastmem_site, 2);
+		sh4_emit_mov_l_load(&e->cg, 2, 2);
+		sh4_emit_tst(&e->cg, 2, 2);
+		_bfTo(e, &toSlow2);
+#endif
+		_emitOffset(e, 0x00FFFFFF);
+		if (op == JIT_MEM_STORE16) {
+			_lit(e, REG_IF, 0);
+			sh4_emit_cmpeq(&e->cg, 1, 0);
+			_btTo(e, &toIf);
+		}
+		_lit(e, REG_IME, 0);
+		sh4_emit_cmpeq(&e->cg, 1, 0);
+		_bfTo(e, &toSlow2);
+		/* IME = value & 1 (a byte's too, as GBAIOWrite8 merges it; a
+		 * word's top half lands at REG_MAX, which GBAIOWrite keeps);
+		 * r1 = IE | IF << 16 */
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_DISPCNT));
+		if (op == JIT_MEM_STORE32) {
+			sh4_emit_mov_reg(&e->cg, 5, 2);
+			sh4_emit_shlr16(&e->cg, 2);
+			sh4_emit_add_imm(&e->cg, REG_MAX - REG_IME, 1);
+			sh4_emit_mov_w_store_r0(&e->cg, 2, 1);
+			sh4_emit_add_imm(&e->cg, REG_IME - REG_MAX, 1);
+		}
+		sh4_emit_mov_imm(&e->cg, 1, 2);
+		sh4_emit_and(&e->cg, 5, 2);
+		sh4_emit_mov_w_store_r0(&e->cg, 2, 1);
+		/* Clearing IME can't raise anything: GBAHalt tests for itself */
+		struct JITFixups imeDone = { .n = 0 };
+		sh4_emit_tst(&e->cg, 2, 2);
+		_btTo(e, &imeDone);
+		sh4_emit_add_imm(&e->cg, REG_IE - REG_IME, 1);
+		sh4_emit_mov_l_load_r0(&e->cg, 1, 1);
+		sh4_emit_mov_reg(&e->cg, 1, 2);
+		sh4_emit_shlr16(&e->cg, 2);
+		sh4_emit_tst(&e->cg, 1, 2);
+		_bfTo(e, &toSlow2);
+		_branchHere(&imeDone, e->cg.ptr);
+		_emitWaitTailConst(e, stall, stallCode, 1);
+		if (op != JIT_MEM_STORE16) {
+			goto ioDone;
+		}
+		/* IF &= ~value, as ~(~IF | value) */
+		_branchHere(&toIf, e->cg.ptr);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_DISPCNT));
+		sh4_emit_mov_w_load_r0(&e->cg, 1, 2);
+		sh4_emit_not(&e->cg, 2, 2);
+		sh4_emit_or(&e->cg, 5, 2);
+		sh4_emit_not(&e->cg, 2, 2);
+		sh4_emit_mov_w_store_r0(&e->cg, 2, 1);
+		sh4_emit_add_imm(&e->cg, REG_IE - REG_IF, 1);
+		sh4_emit_mov_w_load_r0(&e->cg, 1, 1);
+		sh4_emit_tst(&e->cg, 1, 2);
+		_bfTo(e, &toSlow2);
+		_emitWaitTailConst(e, stall, stallCode, 1);
+	}
+ioDone:
+	_branchHere(&toSlow2, slowLabel);
 	_flushPool(e, false);
 }
 
@@ -1630,6 +1758,17 @@ static void _emitMemoryStubs(struct JITEmitter* e) {
 	_flushPool(e, false);
 	int op;
 	for (op = 0; op < JIT_MEM_OPS; ++op) {
+		if (op == JIT_MEM_OPS / 2) {
+			/* Again, for the rest to reach with bra */
+			slowLoad = e->cg.ptr;
+			_emitSlowLoad(e);
+			slowStore = e->cg.ptr;
+			_emitSlowStore(e);
+			_flushPool(e, false);
+			stallCode = e->cg.ptr;
+			_emitStall(e);
+			_flushPool(e, false);
+		}
 		_emitMemoryStub(e, op, false, stallCode, slowLoad, slowStore);
 		_emitMemoryStub(e, op, true, stallCode, slowLoad, slowStore);
 	}
@@ -1736,6 +1875,7 @@ void ARMJITUpdateMemory(struct ARMJIT* jit) {
 	md[JIT_MD_VRAM] = ARMJITVramFast(jit);
 	md[JIT_MD_VRAM_DIRTY] = (uint32_t) (uintptr_t) GBAVideoSoftwareVRAMUnits;
 	md[JIT_MD_DISPCNT] = (uint32_t) (uintptr_t) &memory->io[REG_DISPCNT >> 1];
+	md[JIT_MD_HALT_PENDING] = (uint32_t) (uintptr_t) &((struct GBA*) jit->cpu->master)->haltPending;
 #ifdef JIT_FASTMEM
 	ARMJITFastmemUpdate(jit);
 #endif

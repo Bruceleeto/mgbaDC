@@ -168,6 +168,9 @@ __asm__(
 	"\tmov.l\t@r0,r1\n"
 	"\tadd\t#1,r1\n"
 	"\tmov.l\tr1,@r0\n"
+	/* The stub finds the site here and has it compiled as a call */
+	"\tmova\t_fastmem_site,r0\n"
+	"\tmov.l\tr3,@r0\n"
 	"\trte\n"
 	"\tnop\n"
 	"pass:\n"
@@ -222,6 +225,9 @@ __asm__(
 	"_fastmem_hi:\n"
 	"\t.long\t0\n"
 	"_fastmem_count:\n"
+	"\t.long\t0\n"
+	"\t.globl\t_fastmem_site\n"
+	"_fastmem_site:\n"
 	"\t.long\t0\n"
 	"_expevt:\n"
 	"\t.long\t0xFF000024\n"
@@ -360,7 +366,11 @@ extern uint32_t fastmem_pi[2];
 #define FIRST_ENTRY 61
 #define IWRAM_PAGES (SIZE_WORKING_IRAM >> 10)
 #define EWRAM_PAGES (SIZE_WORKING_RAM >> 16)
-#define MAX_ROM_PAGES (FIRST_ENTRY + 1 - IWRAM_PAGES - EWRAM_PAGES)
+/* IWRAM's last page again at 0x03FFFC00, where the BIOS's IRQ handler reads
+ * the game's handler from (0x04000000 - 4); as write protected as it */
+#define MIRROR_ENTRY (FIRST_ENTRY - IWRAM_PAGES - EWRAM_PAGES)
+#define IWRAM_TOP_ENTRY (FIRST_ENTRY - IWRAM_PAGES + 1)
+#define MAX_ROM_PAGES MIRROR_ENTRY
 
 static struct {
 	bool on;
@@ -425,6 +435,10 @@ static void _map(struct ARMJIT* jit) {
 			_entry(entry, BASE_WORKING_RAM + (i << 16), wram + (i << 16), SZ_64K);
 		}
 	}
+	if (fm.ram) {
+		_entry(entry, BASE_WORKING_IRAM | 0xFFFC00, wram + SIZE_WORKING_RAM + SIZE_WORKING_IRAM - 0x400, SZ_1K);
+	}
+	--entry;
 	if (rom && !(rom & 0xFFFFF) && !rp.vf) {
 		int pages = (fm.romSize + 0xFFFFF) >> 20;
 		if (pages > MAX_ROM_PAGES) {
@@ -646,6 +660,17 @@ void ARMJITFastmemUpdate(struct ARMJIT* jit) {
 	ARMJITFlush(jit->cpu);
 }
 
+static void _setRW(int page, bool rw) {
+	if (rw) {
+		UTLB_DATA(page) |= PTE_RW;
+	} else {
+		UTLB_DATA(page) &= ~PTE_RW;
+	}
+	if (page == IWRAM_TOP_ENTRY) {
+		_setRW(MIRROR_ENTRY, rw);
+	}
+}
+
 static int _page(uint32_t address) {
 	switch (address >> BASE_OFFSET) {
 	case REGION_WORKING_IRAM:
@@ -665,10 +690,10 @@ void ARMJITFastmemProtect(struct ARMJIT* jit, uint32_t start, uint32_t end) {
 	int first = _page(start);
 	int last = _page(end - 1);
 	if (first >= 0) {
-		UTLB_DATA(first) &= ~PTE_RW;
+		_setRW(first, false);
 	}
 	if (last >= 0 && last != first) {
-		UTLB_DATA(last) &= ~PTE_RW;
+		_setRW(last, false);
 	}
 }
 
@@ -679,7 +704,7 @@ void ARMJITFastmemUnprotectPage(struct ARMJIT* jit, uint32_t address) {
 	}
 	int page = _page(address);
 	if (page >= 0) {
-		UTLB_DATA(page) |= PTE_RW;
+		_setRW(page, true);
 	}
 }
 
@@ -692,6 +717,7 @@ void ARMJITFastmemUnprotect(struct ARMJIT* jit) {
 	for (i = 0; i < IWRAM_PAGES + EWRAM_PAGES; ++i) {
 		UTLB_DATA(FIRST_ENTRY - i) |= PTE_RW;
 	}
+	UTLB_DATA(MIRROR_ENTRY) |= PTE_RW;
 }
 
 uint32_t ARMJITFastmemFaults(void) {

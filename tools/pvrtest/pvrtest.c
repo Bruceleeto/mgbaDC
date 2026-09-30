@@ -76,6 +76,8 @@ static bool _init(struct Harness* h, const char* rom, const char* state) {
 		fprintf(stderr, "Can't load %s\n", rom);
 		return false;
 	}
+	/* Save memory in RAM: some games wait on their save chip */
+	h->core->loadSave(h->core, VFileMemChunk(NULL, 0));
 	h->core->reset(h->core);
 	if (state) {
 		struct VFile* vf = VFileOpen(state, O_RDONLY);

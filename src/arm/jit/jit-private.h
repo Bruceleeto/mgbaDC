@@ -128,6 +128,9 @@ enum {
 	JIT_MD_VRAM,
 	JIT_MD_VRAM_DIRTY,
 	JIT_MD_DISPCNT,
+	/* DISPSTAT/VCOUNT loads: the I/O registers are at JIT_MD_DISPCNT, and
+	 * a read clears gba->haltPending, here */
+	JIT_MD_HALT_PENDING,
 	JIT_MD_MAX
 };
 
@@ -154,6 +157,8 @@ struct JITExit {
 	uint32_t arg;
 	uint32_t type;
 };
+
+#define JIT_SLOW_SITES 1024
 
 struct ARMJIT {
 	struct ARMCore* cpu;
@@ -205,6 +210,14 @@ struct ARMJIT {
 
 	/* Memory accesses go straight to guest addresses (fastmem.c) */
 	bool fastmem;
+	/* Accesses that faulted into a stub (I/O and the like): compiled as
+	 * stub calls from then on. Open addressing, 0 is empty. */
+	uint32_t slowSites[JIT_SLOW_SITES];
+	uint32_t nSlowSites;
+	/* Their blocks, killed once the run is out of generated code: one
+	 * killed as it runs carries on, and broke */
+	struct JITBlock* faultedBlocks[4];
+	uint32_t nFaultedBlocks;
 
 	struct ARMJITStats stats;
 	struct ARMJITHost* host;
@@ -222,6 +235,8 @@ void ARMJITFastmemUnprotect(struct ARMJIT* jit);
 void ARMJITFastmemUnprotectPage(struct ARMJIT* jit, uint32_t address);
 uint32_t ARMJITFastmemFaults(void);
 #endif
+bool ARMJITSlowSite(struct ARMJIT* jit, uint32_t address, bool thumb);
+void ARMJITFaulted(struct ARMJIT* jit, uint32_t host, uint32_t address, uint32_t pc);
 
 /* jit-emit.c */
 struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint32_t pc, bool thumb,
