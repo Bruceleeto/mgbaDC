@@ -35,7 +35,8 @@ void ARMJITDeinit(struct ARMCore* cpu);
 void ARMJITRunLoop(struct ARMCore* cpu);
 /* Run generated code from the PC until it needs C: an event is due, a
  * target has to be compiled, and so on. Doesn't process events. Returns how
- * many guest instructions it executed. */
+ * many guest instructions it executed; generated code only counts them off
+ * the Dreamcast (tools/jittest), so there it's 0 for a block run. */
 uint32_t ARMJITRun(struct ARMCore* cpu);
 /* One instruction on the interpreter, events or not (arm.c). */
 void ARMRunInstruction(struct ARMCore* cpu);
@@ -43,6 +44,9 @@ void ARMRunInstruction(struct ARMCore* cpu);
  * guest code behind the CPU's back. */
 void ARMJITFlush(struct ARMCore* cpu);
 void ARMJITGetStats(struct ARMCore* cpu, struct ARMJITStats* stats);
+/* The cpsr flag bits generated code may have left stale where it stopped:
+ * nothing from the next instruction on reads them before writing them. */
+uint32_t ARMJITStaleFlags(struct ARMCore* cpu);
 
 CXX_GUARD_END
 

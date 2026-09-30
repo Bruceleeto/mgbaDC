@@ -19,6 +19,15 @@
 #define JIT_GBR_FLAGS 67
 #define JIT_GBR_SEQ16 86
 #define JIT_GBR_NONSEQ16 88
+/* gprs[PC] as the block's first instruction sees it: set on entry by blocks
+ * that call out, read by the stubs to make an instruction's PC. */
+#define JIT_GBR_BASE 104
+/* cpu->jitStubs[stall][op]: the memory stubs, called through r0 */
+#define JIT_GBR_STUBS 105
+#define JIT_GBR_MASK 121
+#define JIT_GBR_COUNT 122
+#define JIT_GBR_TMP 123
+#define JIT_GBR_MD(I) (124 + (I))
 
 /* Guest code longer than this is split. Also bounds how far back an SMC
  * store has to look for a block that covers it. */
@@ -30,9 +39,12 @@
 #define JIT_IWRAM_CHUNKS (0x8000 >> JIT_CHUNK_SHIFT)
 #define JIT_CHUNKS (JIT_EWRAM_CHUNKS + JIT_IWRAM_CHUNKS)
 
-/* Indirect branch cache: key -> block entry, direct mapped. */
-#define JIT_HASH_BITS 12
-#define JIT_HASH_SIZE (1 << JIT_HASH_BITS)
+/* Indirect branch cache: key -> block entry, two-way set associative, the
+ * most recently inserted in way 0. JIT_HASH_SIZE entries in all; a set is
+ * jit->hash[JIT_HASH_SET(key) * 2 ...+ 1]. */
+#define JIT_HASH_BITS 13
+#define JIT_HASH_SIZE (2 << JIT_HASH_BITS)
+#define JIT_HASH_SET(KEY) (((KEY) >> 1) & ((1 << JIT_HASH_BITS) - 1))
 
 /* A block's key: its guest address, bit 0 set for Thumb. That is also what
  * BX takes, so an indirect branch looks its target up without converting. */
@@ -78,7 +90,8 @@ enum JITExitType {
 #define JIT_PRE_TARGET 12
 
 /* Memory accesses generated code makes through the stubs (ARMJITEmitStubs),
- * in the order of jit->memStubs. */
+ * in the order of cpu->jitStubs. The stall set is for code running from ROM
+ * with the prefetch buffer on (GBAMemoryStall). */
 enum JITMemOp {
 	JIT_MEM_LOAD32,
 	JIT_MEM_LOAD16,
@@ -91,8 +104,8 @@ enum JITMemOp {
 	JIT_MEM_OPS
 };
 
-/* What the memory stubs' fast paths read, @(index,r3). Refreshed by
- * ARMJITUpdateMemory. */
+/* What the memory stubs' fast paths read: cpu->jitMemData[index], at
+ * @(JIT_GBR_MD(index),GBR). Refreshed by ARMJITUpdateMemory. */
 enum {
 	JIT_MD_WRAM,
 	JIT_MD_IWRAM,
@@ -116,6 +129,10 @@ enum {
 struct JITBlock {
 	uint32_t pc;
 	uint32_t end;
+	/* The guest code it depends on (a store there kills it): [pc, end) and
+	 * what it looked at after for the flags, within its chunks. */
+	uint32_t lo;
+	uint32_t hi;
 	uint8_t* code;
 	uint32_t codeSize;
 	uint16_t nInsns;
@@ -148,12 +165,10 @@ struct ARMJIT {
 	const void* dispatchSync;
 	/* mGBA's handler for an instruction: [thumb] */
 	const void* handlers[2];
-	/* Generated code's r8: [stall][JITMemOp]. The stall set is for code
-	 * running from ROM with the prefetch buffer on (GBAMemoryStall). */
-	const void* memStubs[2][JIT_MEM_OPS];
 	/* GBAMemoryStall on the wait in r2 (_emitStall) */
 	const void* stall;
-	uint32_t memData[JIT_MD_MAX];
+	/* r0 = the guest base of the block that called at r1 (_emitGuestBase) */
+	const void* guestBase;
 	/* LDM/STM and friends: [stall][store][thumb] (_emitMultipleStub) */
 	const void* multipleStubs[2][2][2];
 
@@ -169,6 +184,9 @@ struct ARMJIT {
 
 	/* { key, entry } pairs, read by generated code. */
 	uint32_t (*hash)[2];
+	/* { return address, guest base } pairs for ARMJITGuestBase, by
+	 * (return address >> 1) & 0xFF. */
+	uint32_t baseCache[256][2];
 	struct JITExit exit;
 
 	/* Wait states the blocks were compiled with; a change flushes them. */
@@ -205,13 +223,22 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
                                const uint8_t* src, uint32_t srcBytes);
 void ARMJITEmitStubs(struct ARMJIT* jit);
 uint32_t ARMJITTimingKey(const struct ARMCore* cpu);
-/* Refresh jit->memData from mGBA's memory state. */
+/* Refresh cpu->jitMemData from mGBA's memory state. */
 void ARMJITUpdateMemory(struct ARMJIT* jit);
+/* The flags (F_* in jit-emit.c: V, C, Z, N from bit 0) code at pc may read
+ * before writing them. */
+unsigned ARMJITFlagsIn(struct ARMJIT* jit, uint32_t pc, bool thumb);
 
 /* jit.c */
+/* Where guest code at pc lives on the host, and how many bytes of it can be
+ * read before the region ends. NULL for regions we don't compile from. */
+const uint8_t* ARMJITSource(struct ARMJIT* jit, uint32_t pc, uint32_t* bytes);
 /* Every C function generated code calls goes through here, so the Linux
  * host can refuse calls to anything else. No-op on the Dreamcast. */
 void ARMJITRegisterCall(struct ARMJIT* jit, const void* fn);
+/* The guest base (pc + 2 * length) of the block whose code has ret in it,
+ * cached. */
+uint32_t ARMJITGuestBase(struct ARMJIT* jit, uint32_t ret);
 /* The wait states changed under the running code: drop everything. Safe to
  * call from a helper; the caller's block must leave straight after. */
 void ARMJITTimingChanged(struct ARMJIT* jit);

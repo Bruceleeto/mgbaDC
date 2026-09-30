@@ -41,6 +41,15 @@ static_assert(offsetof(struct ARMCore, prefetch[1]) == JIT_GBR_PREFETCH1 * 4, "A
 static_assert(offsetof(struct ARMCore, cpsr) + 3 == JIT_GBR_FLAGS, "cpsr flags byte moved");
 static_assert(offsetof(struct ARMCore, memory.activeSeqCycles16) == JIT_GBR_SEQ16 * 4, "ARMMemory moved");
 static_assert(offsetof(struct ARMCore, memory.activeNonseqCycles16) == JIT_GBR_NONSEQ16 * 4, "ARMMemory moved");
+static_assert(offsetof(struct ARMCore, jitBase) == JIT_GBR_BASE * 4, "ARMCore.jitBase moved");
+static_assert(offsetof(struct ARMCore, jitStubs) == JIT_GBR_STUBS * 4, "ARMCore.jitStubs moved");
+static_assert(sizeof(((struct ARMCore*) 0)->jitStubs) == 2 * JIT_MEM_OPS * 4, "ARMCore.jitStubs size");
+static_assert(offsetof(struct ARMCore, jitMask) == JIT_GBR_MASK * 4, "ARMCore.jitMask moved");
+static_assert(offsetof(struct ARMCore, jitCount) == JIT_GBR_COUNT * 4, "ARMCore.jitCount moved");
+static_assert(offsetof(struct ARMCore, jitTmp) == JIT_GBR_TMP * 4, "ARMCore.jitTmp moved");
+static_assert(offsetof(struct ARMCore, jitMemData) == JIT_GBR_MD(0) * 4, "ARMCore.jitMemData moved");
+static_assert(sizeof(((struct ARMCore*) 0)->jitMemData) == JIT_MD_MAX * 4, "ARMCore.jitMemData size");
+static_assert(JIT_GBR_MD(JIT_MD_MAX) <= 256, "GBR slots out of reach");
 
 #ifdef __sh__
 #define JIT_CODE_SIZE 0x80000
@@ -68,6 +77,7 @@ bool ARMJITInit(struct ARMCore* cpu) {
 		return false;
 	}
 	jit->cpu = cpu;
+	cpu->jitMask = 0x0FFFFFFF;
 	jit->codeSize = JIT_CODE_SIZE;
 #ifdef __sh__
 	jit->code = memalign(32, jit->codeSize);
@@ -101,9 +111,8 @@ bool ARMJITInit(struct ARMCore* cpu) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	ARMJITHostMap(jit, jit->hash, JIT_HASH_SIZE * sizeof(*jit->hash));
 	ARMJITHostMap(jit, &jit->exit, sizeof(jit->exit));
+	ARMJITHostMap(jit, jit->baseCache, sizeof(jit->baseCache));
 	ARMJITHostMap(jit, &gba->memory, sizeof(gba->memory));
-	ARMJITHostMap(jit, jit->memStubs, sizeof(jit->memStubs));
-	ARMJITHostMap(jit, jit->memData, sizeof(jit->memData));
 	ARMJITHostMap(jit, jit->chunks, sizeof(jit->chunks));
 	ARMJITHostMap(jit, gba->memory.wram, SIZE_WORKING_RAM);
 	ARMJITHostMap(jit, gba->memory.iwram, SIZE_WORKING_IRAM);
@@ -188,6 +197,7 @@ void ARMJITFlush(struct ARMCore* cpu) {
 	}
 	memset(jit->chunks, 0, sizeof(jit->chunks));
 	memset(jit->hash, 0, JIT_HASH_SIZE * sizeof(*jit->hash));
+	memset(jit->baseCache, 0, sizeof(jit->baseCache));
 	jit->nBlocks = 0;
 	jit->codeUsed = jit->codeBase;
 	++jit->stats.flushes;
@@ -212,6 +222,27 @@ void ARMJITTimingChanged(struct ARMJIT* jit) {
 	ARMJITFlush(jit->cpu);
 	jit->timingKey = ARMJITTimingKey(jit->cpu);
 	ARMJITUpdateMemory(jit);
+}
+
+/* Blocks are laid out in the order they were compiled: the last one that
+ * starts before ret. */
+uint32_t ARMJITGuestBase(struct ARMJIT* jit, uint32_t ret) {
+	uint32_t lo = 0;
+	uint32_t hi = jit->nBlocks;
+	while (hi - lo > 1) {
+		uint32_t mid = (lo + hi) / 2;
+		if ((uint32_t) (uintptr_t) jit->blocks[mid].code < ret) {
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	const struct JITBlock* block = &jit->blocks[lo];
+	uint32_t base = block->pc + (block->thumb ? 2 * WORD_SIZE_THUMB : 2 * WORD_SIZE_ARM);
+	uint32_t* entry = jit->baseCache[(ret >> 1) & 0xFF];
+	entry[0] = ret;
+	entry[1] = base;
+	return base;
 }
 
 void ARMJITRegisterCall(struct ARMJIT* jit, const void* fn) {
@@ -314,9 +345,7 @@ static void _release(struct ARMJIT* jit, int chunk) {
 #endif
 }
 
-/* Where guest code at pc lives on the host, and how many bytes of it can be
- * read before the region ends. NULL for regions we don't compile from. */
-static const uint8_t* _source(struct ARMJIT* jit, uint32_t pc, uint32_t* bytes) {
+const uint8_t* ARMJITSource(struct ARMJIT* jit, uint32_t pc, uint32_t* bytes) {
 	struct GBA* gba = (struct GBA*) jit->cpu->master;
 	struct GBAMemory* memory = &gba->memory;
 	uint32_t offset;
@@ -352,6 +381,12 @@ static const uint8_t* _source(struct ARMJIT* jit, uint32_t pc, uint32_t* bytes) 
 	}
 }
 
+uint32_t ARMJITStaleFlags(struct ARMCore* cpu) {
+	bool thumb = cpu->executionMode == MODE_THUMB;
+	uint32_t pc = cpu->gprs[ARM_PC] - (thumb ? WORD_SIZE_THUMB : WORD_SIZE_ARM);
+	return (~ARMJITFlagsIn(cpu->jit, pc, thumb) & 0xF) << 28;
+}
+
 static void _link(struct ARMJIT* jit, struct JITBlock* block) {
 	int first = _chunk(block->pc);
 	int last = _chunk(block->end - 1);
@@ -376,23 +411,34 @@ static void _hashInsert(struct ARMJIT* jit, const struct JITBlock* block) {
 		return;
 	}
 	uint32_t key = JIT_KEY(block->pc, block->thumb);
-	uint32_t* entry = jit->hash[(key >> 1) & (JIT_HASH_SIZE - 1)];
-	entry[0] = key;
-	entry[1] = (uint32_t) (uintptr_t) block->code;
+	uint32_t (*set)[2] = &jit->hash[JIT_HASH_SET(key) * 2];
+	uint32_t code = (uint32_t) (uintptr_t) block->code;
+	if (set[0][0] == key && set[0][1] == code) {
+		return;
+	}
+	if (set[0][0] != key) {
+		set[1][0] = set[0][0];
+		set[1][1] = set[0][1];
+	}
+	set[0][0] = key;
+	set[0][1] = code;
 }
 
 static void _hashRemove(struct ARMJIT* jit, const struct JITBlock* block) {
 	uint32_t key = JIT_KEY(block->pc, block->thumb);
-	uint32_t* entry = jit->hash[(key >> 1) & (JIT_HASH_SIZE - 1)];
-	if (entry[0] == key && entry[1] == (uint32_t) (uintptr_t) block->code) {
-		entry[0] = 0;
-		entry[1] = 0;
+	uint32_t (*set)[2] = &jit->hash[JIT_HASH_SET(key) * 2];
+	int way;
+	for (way = 0; way < 2; ++way) {
+		if (set[way][0] == key && set[way][1] == (uint32_t) (uintptr_t) block->code) {
+			set[way][0] = 0;
+			set[way][1] = 0;
+		}
 	}
 }
 
 static struct JITBlock* _compile(struct ARMJIT* jit, uint32_t pc, bool thumb, struct JITBlock** slot) {
 	uint32_t bytes;
-	const uint8_t* src = _source(jit, pc, &bytes);
+	const uint8_t* src = ARMJITSource(jit, pc, &bytes);
 	if (!src) {
 		return NULL;
 	}
@@ -441,6 +487,8 @@ static struct JITBlock* _find(struct ARMJIT* jit, uint32_t key) {
 	}
 	struct JITBlock* block = *slot;
 	if (block && !block->dead && block->pc == pc && block->thumb == thumb) {
+		/* It may have lost its hash entry to another block since */
+		_hashInsert(jit, block);
 		return block;
 	}
 	return _compile(jit, pc, thumb, slot);
@@ -471,8 +519,8 @@ static void _invalidate(struct ARMJIT* jit, int chunk, uint32_t address, uint32_
 	bool released = false;
 	while ((block = *link)) {
 		int i = block->chunk[0] == chunk ? 0 : 1;
-		uint32_t bstart = block->pc & mask;
-		uint32_t bend = bstart + (block->end - block->pc);
+		uint32_t bstart = block->lo & mask;
+		uint32_t bend = bstart + (block->hi - block->lo);
 		if (!block->dead && start < bend && start + size > bstart) {
 			_kill(jit, block);
 			if (block->chunk[!i] >= 0) {
@@ -558,11 +606,37 @@ static void _arrive(struct ARMCore* cpu, uint32_t key) {
 	cpu->gprs[ARM_PC] = pc;
 }
 
+/* A link site (jit-emit.c's _site) whose target is within reach of a bra
+ * becomes one, with the cycles it charges in the delay slot. */
+static void _linkNear(uint16_t* at, const uint8_t* target) {
+	int32_t disp = ((intptr_t) target - ((intptr_t) at + 4)) >> 1;
+	if (disp < -2048 || disp > 2047) {
+		return;
+	}
+	bool charges = (at[0] & 0xFF00) == 0x7D00; /* add #imm,r13 */
+	at[1] = charges ? at[0] : 0x0009;
+	at[0] = 0xA000 | (disp & 0xFFF);
+#ifdef __sh__
+	icache_sync_range((uintptr_t) at, 4);
+#endif
+}
+
+/* Whether a buffer ARMJITUpdateMemory gives generated code has moved; the
+ * rest of what it sets follows the timing key. */
+static bool _memoryMoved(struct ARMJIT* jit) {
+	const struct GBAMemory* memory = &((struct GBA*) jit->cpu->master)->memory;
+	const uint32_t* md = jit->cpu->jitMemData;
+	return md[JIT_MD_ROM] != (uint32_t) (uintptr_t) memory->rom ||
+	       md[JIT_MD_ROM_SIZE] != (memory->rom ? memory->romSize : 0) ||
+	       md[JIT_MD_WRAM] != (uint32_t) (uintptr_t) memory->wram ||
+	       md[JIT_MD_IWRAM] != (uint32_t) (uintptr_t) memory->iwram;
+}
+
 uint32_t ARMJITRun(struct ARMCore* cpu) {
 	struct ARMJIT* jit = cpu->jit;
 	if (ARMJITTimingKey(cpu) != jit->timingKey) {
 		ARMJITTimingChanged(jit);
-	} else {
+	} else if (_memoryMoved(jit)) {
 		/* Cheats and AGB print can move the ROM. */
 		ARMJITUpdateMemory(jit);
 	}
@@ -597,6 +671,7 @@ uint32_t ARMJITRun(struct ARMCore* cpu) {
 		block = _find(jit, site[1]);
 		if (block && jit->stats.flushes == flushes) {
 			site[0] = (uint32_t) (uintptr_t) block->code;
+			_linkNear((uint16_t*) (uintptr_t) site[2], block->code);
 		}
 		break;
 	case JIT_EXIT_BRANCH:

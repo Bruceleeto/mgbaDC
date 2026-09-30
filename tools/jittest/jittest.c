@@ -449,6 +449,11 @@ int main(int argc, char** argv) {
 					}
 					ARMRunInstruction(a.cpu);
 				}
+				/* Flags nothing reads before writing may be left stale */
+				if (a.cpu->gprs[ARM_PC] == b.cpu->gprs[ARM_PC] && a.cpu->executionMode == b.cpu->executionMode) {
+					uint32_t stale = ARMJITStaleFlags(b.cpu);
+					b.cpu->cpsr.packed = (b.cpu->cpsr.packed & ~stale) | (a.cpu->cpsr.packed & stale);
+				}
 			}
 			++slices;
 			if (getenv("JITTEST_MEM") && frame >= atoi(getenv("JITTEST_MEM"))) {
@@ -506,6 +511,13 @@ int main(int argc, char** argv) {
 				uint8_t rgb[3] = { (c >> 11) << 3, ((c >> 5) & 0x3F) << 2, (c & 0x1F) << 3 };
 				fwrite(rgb, 1, 3, f);
 			}
+			fclose(f);
+		}
+	}
+	if (getenv("JITTEST_IWRAM")) {
+		FILE* f = fopen(getenv("JITTEST_IWRAM"), "wb");
+		if (f) {
+			fwrite(a.gba->memory.iwram, 1, SIZE_WORKING_IRAM, f);
 			fclose(f);
 		}
 	}

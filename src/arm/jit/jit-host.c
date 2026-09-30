@@ -7,6 +7,12 @@
  * its windows is a fault, which aborts with the SH-4 PC. */
 #include "jit-private.h"
 
+/* STEPSHACK */
+unsigned long long sh4StepsTotal;
+unsigned long long sh4CountSeqs;
+__attribute__((destructor)) static void _stepsTotal(void) {
+	fprintf(stderr, "SH4STEPS %llu countseqs %llu\n", sh4StepsTotal, sh4CountSeqs);
+}
 #include "sh4-interp.h"
 
 #include <assert.h>
@@ -63,6 +69,30 @@ static void _profDump(struct ARMJIT* jit) {
 	uint64_t total = _profSum(jit, 0, jit->codeSize);
 	fprintf(f, "total %llu stubs %llu code_at %08X\n", (unsigned long long) total,
 	        (unsigned long long) _profSum(jit, 0, jit->codeBase), (uint32_t) (uintptr_t) jit->code);
+#define STUB(NAME, P) fprintf(f, "stub %s %u\n", NAME, (uint32_t) ((const uint8_t*) (P) - jit->code))
+	STUB("enter", jit->enter);
+	STUB("exits", jit->exits[0]);
+	STUB("lookup", jit->lookup);
+	STUB("dispatchSync", jit->dispatchSync);
+	STUB("handlerT", jit->handlers[1]);
+	STUB("handlerA", jit->handlers[0]);
+	STUB("stall", jit->stall);
+	{
+		static const char* const ops[8] = { "ld32", "ld16", "lds16", "ld8", "lds8", "st32", "st16", "st8" };
+		char name[32];
+		int i, j;
+		for (i = 0; i < 8; ++i) {
+			for (j = 0; j < 2; ++j) {
+				snprintf(name, sizeof(name), "%s%s", ops[i], j ? "S" : "");
+				STUB(name, jit->cpu->jitStubs[j][i]);
+			}
+		}
+		for (i = 0; i < 8; ++i) {
+			snprintf(name, sizeof(name), "multi%s%s%s", i & 1 ? "St" : "Ld", (i >> 1) & 1 ? "S" : "", i >> 2 ? "T" : "A");
+			STUB(name, jit->multipleStubs[(i >> 1) & 1][i & 1][i >> 2]);
+		}
+	}
+#undef STUB
 	uint32_t i;
 	for (i = 0; i < jit->nBlocks; ++i) {
 		const struct JITBlock* b = &jit->blocks[i];
@@ -288,7 +318,7 @@ uint32_t ARMJITHostRun(struct ARMJIT* jit, const void* code) {
 					}
 					++s->depth;
 					s->pr = s->pc + 2;
-					s->pc = (uint32_t) (uintptr_t) jit->memStubs[0][op];
+					s->pc = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][op];
 					continue;
 				}
 			}
@@ -297,6 +327,7 @@ uint32_t ARMJITHostRun(struct ARMJIT* jit, const void* code) {
 	} else {
 		sh4_run(s, HOST_BUDGET);
 	}
+	sh4StepsTotal += s->steps; /* STEPSHACK */
 	if (s->fault) {
 		fprintf(stderr, "JIT host: %s\n", s->fault_msg);
 		abort();

@@ -188,6 +188,20 @@ struct ARMCore {
 	/* Set by ARMJITInit: ARMRunLoop runs the recompiler instead. Always
 	 * present so the layout doesn't depend on the build. */
 	struct ARMJIT* jit;
+
+	/* The recompiler's slots, reached from generated code through GBR
+	 * (jit-private.h). */
+	uint32_t jitBase;
+	/* Memory stubs, [stall][JITMemOp] */
+	const void* jitStubs[2][8];
+	/* Fastmem: what keeps a guest address out of the host's half */
+	uint32_t jitMask;
+	/* Guest instructions run, for tools/jittest */
+	uint32_t jitCount;
+	/* The stall stub's r0 while it runs */
+	uint32_t jitTmp;
+	/* What the memory stubs need of mGBA's memory state (JIT_MD_*) */
+	uint32_t jitMemData[15];
 };
 #undef ARM_REGISTER_FILE
 

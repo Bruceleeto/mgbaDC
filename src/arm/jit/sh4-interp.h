@@ -979,7 +979,8 @@ static inline void sh4_step(struct sh4_state *s)
 			   * the integer core. */
 			s->r[0] = (uint32_t)(int16_t)sh4_rd(s, s->gbr + D8 * 2, 2);
 			goto done;
-		case 0x6: s->r[0] = sh4_rd32(s, s->gbr + D8 * 4); goto done;
+		case 0x6: if (D8 == 122) ++sh4CountSeqs; /* STEPSHACK */
+			s->r[0] = sh4_rd32(s, s->gbr + D8 * 4); goto done;
 		case 0x7: s->r[0] = ((s->pc + 4) & ~3u) + D8 * 4; goto done;
 		case 0x8: s->t = (s->r[0] & D8) == 0; goto done;	/* tst # */
 		case 0x9: s->r[0] &= D8; goto done;			/* and # */

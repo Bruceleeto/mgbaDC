@@ -25,7 +25,7 @@
 
 /* The vectors: exception entry for the direct accesses.
  * A fault at one of the six access instructions (address r4, value r5, offset
- * r6) becomes a call of the matching stub that returns after the access;
+ * r3) becomes a call of the matching stub that returns after the access;
  * anything else is KOS's.
  *
  * Each vector starts with a nop and its branch has a nop in the delay slot,
@@ -269,12 +269,12 @@ bool ARMJITFastmemInit(struct ARMJIT* jit) {
 void ARMJITFastmemInstall(struct ARMJIT* jit) {
 	fastmem_lo = (uint32_t) (uintptr_t) jit->code + jit->codeBase;
 	fastmem_hi = (uint32_t) (uintptr_t) jit->code + jit->codeSize;
-	fastmem_table[0] = (uint32_t) (uintptr_t) jit->memStubs[0][JIT_MEM_STORE8];
-	fastmem_table[1] = (uint32_t) (uintptr_t) jit->memStubs[0][JIT_MEM_STORE16];
-	fastmem_table[2] = (uint32_t) (uintptr_t) jit->memStubs[0][JIT_MEM_STORE32];
-	fastmem_table[4] = (uint32_t) (uintptr_t) jit->memStubs[0][JIT_MEM_LOADS8];
-	fastmem_table[5] = (uint32_t) (uintptr_t) jit->memStubs[0][JIT_MEM_LOADS16];
-	fastmem_table[6] = (uint32_t) (uintptr_t) jit->memStubs[0][JIT_MEM_LOAD32];
+	fastmem_table[0] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_STORE8];
+	fastmem_table[1] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_STORE16];
+	fastmem_table[2] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_STORE32];
+	fastmem_table[4] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_LOADS8];
+	fastmem_table[5] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_LOADS16];
+	fastmem_table[6] = (uint32_t) (uintptr_t) jit->cpu->jitStubs[0][JIT_MEM_LOAD32];
 	_map(jit);
 	int old = irq_disable();
 	uint32_t vbr;

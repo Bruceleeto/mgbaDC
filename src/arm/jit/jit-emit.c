@@ -1,24 +1,26 @@
 /* ARM/Thumb -> SH-4 translation.
  *
  * Register use in generated code:
- *   GBR  struct ARMCore* (cycles, cpsr, prefetch via @(disp,GBR))
- *   r14  struct ARMCore* too: gprs[0-15] are @(0-60,r14), reachable into any
- *        register in one instruction, and it is the first argument to every
- *        helper for the price of a mov
+ *   GBR  struct ARMCore*: gprs, cycles, cpsr, prefetch and the recompiler's
+ *        slots via @(disp,GBR) through r0; stc gbr gives helpers their first
+ *        argument
  *   r13  cycles - nextEvent: blocks add their cost, and a block's entry
  *        leaves for the event handler once it is >= 0. cpu->cycles is only
  *        written when C is about to look at it.
- *   r12  guest instructions executed since generated code was entered
- *   r0   GBR/immediate-logic operand
- *   r1-r7 scratch, clobbered by every call
- *   r11  gprs[PC] as the block's first instruction sees it; the memory stubs
- *        add the access's offset (index * length, r6) to get its own
- *   r8   jit->memStubs
+ *   r0   GBR/immediate-logic operand; every guest register access goes
+ *        through it
+ *   r1-r5 scratch, clobbered by every call
+ *   r8, r11, r12, r14, r6, r7  guest r0, r1, r2, sp, r4, r5 (_pinGuest)
  *   r9   N and Z: those of r9 taken as a result
  *   r10  C in bit 31, V in bit 30
  *
  * Guest registers live in the ARMCore between instructions, so anything
  * mGBA's code looks at is always current, except:
+ *   - the pinned ones: in their host registers while generated code runs,
+ *     written to the ARMCore by the exits and around handler calls (which
+ *     reload them after). The memory slow paths leave them where they are
+ *     (saving r6/r7 across the call): mGBA's memory code only looks at
+ *     gprs[PC].
  *   - the flags: r9/r10, written to the cpsr on the way out to C (exits,
  *     handler calls) and read back when coming in. The memory slow paths
  *     don't look at them.
@@ -27,6 +29,9 @@
  *     observe it (a call, leaving the block).
  *   - flags an instruction sets that no later instruction in the block reads
  *     before they are overwritten are not computed (liveness pass).
+ *   - cpu->jitBase: gprs[PC] as the block's first instruction sees it, set
+ *     on entry by blocks that call out; the stubs add the access's offset
+ *     (index * length, r3) to get its own.
  *   - gprs[PC] and the prefetch words are written by the helpers that can see
  *     them, and by the C side when generated code gives control back.
  *
@@ -55,14 +60,48 @@
 #include <kos/cache.h>
 #endif
 
-#define R_CPU 14
 #define R_CYCLES 13
-#define R_COUNT 12
-#define R_BASE 11
-#define R_STUBS 8
+/* Only the tooling reads how many guest instructions a run executed. */
+#ifndef __sh__
+#define JIT_COUNT
+#endif
 #define R_NZ 9
+
+/* Guest registers held in host registers wherever generated code runs, as
+ * example's pin_list: the ARMCore has them only while C does. The hottest in
+ * Mario Kart's race by accesses: r0 11.4M, r1 5.9M, r2 3.0M, sp 2.7M, r4
+ * 2.6M, r5 2.3M in 600 frames (r3 is next at 2.3M). r6/r7 are the C ABI's to
+ * clobber: the stubs that call C keep them. */
+#define JIT_PINS 6
+static const int _pinGuest[JIT_PINS] = { 0, 1, 2, ARM_SP, 4, 5 };
+static const int _pinHost[JIT_PINS] = { 8, 11, 12, 14, 6, 7 };
+
+/* The host register guest is pinned to, or 0 */
+static int _pinned(int guest) {
+	int i;
+	for (i = 0; i < JIT_PINS; ++i) {
+		if (_pinGuest[i] == guest) {
+			return _pinHost[i];
+		}
+	}
+	return 0;
+}
+
+/* Pinned registers to the ARMCore and back; cpu = a register holding it. */
+static void _pinsOut(sh4_codegen* cg, int cpu) {
+	int i;
+	for (i = 0; i < JIT_PINS; ++i) {
+		sh4_emit_mov_l_store_disp(cg, _pinHost[i], cpu, JIT_GBR_GPRS(_pinGuest[i]));
+	}
+}
+
+static void _pinsIn(sh4_codegen* cg, int cpu) {
+	int i;
+	for (i = 0; i < JIT_PINS; ++i) {
+		sh4_emit_mov_l_load_disp(cg, cpu, _pinHost[i], JIT_GBR_GPRS(_pinGuest[i]));
+	}
+}
 #define R_CV 10
-#define R_ACC 7
 
 #define F_V 1
 #define F_C 2
@@ -113,8 +152,18 @@ struct JITEmitter {
 
 	/* Memory accesses use the stall stubs (code in ROM, prefetch on). */
 	bool stall;
-	/* Something used r11 (the block sets it on entry). */
+	/* Something reads cpu->jitBase (the block sets it on entry). */
 	bool usesBase;
+
+	/* The condition (0-13) of the next instruction, the only thing to
+	 * read the flags this one sets, or -1: a compare can then leave just T
+	 * for it (fused, fusedIfT as _condition returns) and not the flags. */
+	int fuseCond;
+	bool fused;
+	bool fusedIfT;
+
+	/* Where the block's instructions start: _reload looks no further back. */
+	const uint8_t* body;
 
 	/* Cycles charged by instructions so far and not yet in r13. */
 	int32_t pending;
@@ -158,6 +207,9 @@ static void _imm(struct JITEmitter* e, uint32_t value, int reg) {
 	}
 }
 
+/* The latest branch target made (for the block being compiled). */
+static const uint8_t* _label;
+
 /* Place the pending literals here. Mid-block the pool is jumped over. */
 static void _flushPool(struct JITEmitter* e, bool jumpOver) {
 	if (!e->nFix) {
@@ -194,6 +246,7 @@ static void _flushPool(struct JITEmitter* e, bool jumpOver) {
 		int32_t d = sh4_branch_disp12((uintptr_t) bra, (uintptr_t) e->cg.ptr);
 		bra[0] = d & 0xFF;
 		bra[1] = 0xA0 | ((d >> 8) & 0xF);
+		_label = e->cg.ptr;
 	}
 	e->nLits = 0;
 	e->unique = 0;
@@ -245,9 +298,16 @@ static void _charge(struct JITEmitter* e) {
 	e->pending = 0;
 }
 
-/* r12 += executed */
+/* cpu->jitCount += executed, through r0 */
 static void _count(struct JITEmitter* e, int executed) {
-	sh4_emit_add_imm(&e->cg, executed, R_COUNT);
+#ifdef JIT_COUNT
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_COUNT);
+	sh4_emit_add_imm(&e->cg, executed, 0);
+	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_COUNT);
+#else
+	UNUSED(e);
+	UNUSED(executed);
+#endif
 }
 
 /* Jump to one of the fixed routines (ARMJITEmitStubs). */
@@ -256,15 +316,23 @@ static void _jumpTo(struct JITEmitter* e, const void* target) {
 	sh4_emit_jmp(&e->cg, 1);
 }
 
-/* Leave through a link site: a jump through a pool entry that starts out
- * pointing at a stub (placed at the end of the block) that exits to C, and
- * that C points at the target block once it is compiled. */
+/* Leave through a link site, charging what is pending: a jump through a
+ * pool entry that starts out pointing at a stub (placed at the end of the
+ * block) that exits to C, and that C points at the target block once it is
+ * compiled. The pool has { entry, key, site }; the site is
+ *   [add #pending,r13]  mov.l @(entry),r1  jmp @r1  nop
+ * and C makes a target within reach of a bra "bra target; add" (or nop). */
 static void _site(struct JITEmitter* e, uint32_t key, int type) {
+	if (e->pending < -128 || e->pending > 127) {
+		_charge(e);
+	}
 	int lit = _litUnique(e, 0);
 	_litUnique(e, key);
+	_litUnique(e, (uint32_t) (uintptr_t) e->cg.ptr);
 	e->sites[e->nSites].lit = lit;
 	e->sites[e->nSites].type = type;
 	++e->nSites;
+	_charge(e);
 	_fix(e, lit);
 	sh4_emit_mov_l_load_pc(&e->cg, 0, 1);
 	sh4_emit_jmp(&e->cg, 1);
@@ -288,16 +356,139 @@ static void _placeSites(struct JITEmitter* e) {
 /* Guest registers and flags                                         */
 /* ---------------------------------------------------------------- */
 
+/* Guest registers not pinned go through r0 (@(disp,GBR)): then both destroy
+ * it. */
+/* Unpinned guest is in r0 already: the last thing emitted stored it from
+ * there, and nothing branches in between. */
+static bool _reload(struct JITEmitter* e, int guest) {
+	const uint8_t* p = e->cg.ptr;
+	if (!e->body || p - 4 < e->body || _label >= p) {
+		return false;
+	}
+	uint16_t last = p[-2] | p[-1] << 8;
+	uint16_t before = p[-4] | p[-3] << 8;
+	if (last != (0xC200 | JIT_GBR_GPRS(guest))) {
+		return false;
+	}
+	/* not a delay slot */
+	switch (before >> 12) {
+	case 0xA: // bra
+	case 0xB: // bsr
+		return false;
+	case 0x8:
+		return (before & 0x0D00) != 0x0D00; // bt/s, bf/s
+	case 0x4:
+		return (before & 0xF0DF) != 0x400B; // jsr, jmp
+	case 0x0:
+		return (before & 0xF0DF) != 0x000B && (before & 0xF0DF) != 0x0003; // rts, rte; braf, bsrf
+	default:
+		return true;
+	}
+}
+
 static void _ld(struct JITEmitter* e, int guest, int host) {
 	if (guest == ARM_PC) {
 		_imm(e, _pcValue(e), host);
-	} else {
-		sh4_emit_mov_l_load_disp(&e->cg, R_CPU, host, guest);
+		return;
+	}
+	int pin = _pinned(guest);
+	if (pin) {
+		if (pin != host) {
+			sh4_emit_mov_reg(&e->cg, pin, host);
+		}
+		return;
+	}
+	if (!_reload(e, guest)) {
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_GPRS(guest));
+	}
+	if (host) {
+		sh4_emit_mov_reg(&e->cg, 0, host);
 	}
 }
 
 static void _st(struct JITEmitter* e, int host, int guest) {
-	sh4_emit_mov_l_store_disp(&e->cg, host, R_CPU, guest);
+	int pin = _pinned(guest);
+	if (pin) {
+		if (pin != host) {
+			sh4_emit_mov_reg(&e->cg, host, pin);
+		}
+		return;
+	}
+	if (host) {
+		sh4_emit_mov_reg(&e->cg, host, 0);
+	}
+	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_GPRS(guest));
+}
+
+/* The host register with guest's value: its pin, or scratch loaded. */
+static int _get(struct JITEmitter* e, int guest, int scratch) {
+	int pin = _pinned(guest);
+	if (pin) {
+		return pin;
+	}
+	_ld(e, guest, scratch);
+	return scratch;
+}
+
+/* The same, but left in r0 (returns 0) if it isn't pinned: for the last
+ * operand loaded, with nothing using r0 before it is read. */
+static int _getR0(struct JITEmitter* e, int guest) {
+	int pin = _pinned(guest);
+	if (pin || guest == ARM_PC) {
+		return _get(e, guest, 1);
+	}
+	if (!_reload(e, guest)) {
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_GPRS(guest));
+	}
+	return 0;
+}
+
+/* Where a result for guest rd (-1: none) is made: its pin, or r1. */
+static int _dst(int rd) {
+	int pin = rd >= 0 ? _pinned(rd) : 0;
+	return pin ? pin : 1;
+}
+
+/* Where rd = *a OP *b is computed, with *a moved there: rd's pin, or r0
+ * for an unpinned rd, unless that is *b alone (then r1, or for a
+ * commutative OP the operands swap).
+ * b is never r1 (or -1 for an immediate). */
+static int _into(struct JITEmitter* e, int rd, int* a, int* b, bool commutative) {
+	int w = _dst(rd);
+	if (w == 1 && rd >= 0 && rd != ARM_PC) {
+		/* rd isn't pinned: make it in r0, which _put stores from */
+		w = 0;
+	}
+	if (w != 1 && w == *b && w != *a) {
+		if (commutative) {
+			*b = *a;
+			*a = w;
+		} else {
+			w = 1;
+		}
+	}
+	if (*a != w) {
+		sh4_emit_mov_reg(&e->cg, *a, w);
+	}
+	return w;
+}
+
+/* The result in host to guest rd, unless it was made in rd's pin. */
+static void _put(struct JITEmitter* e, int host, int rd) {
+	int pin = _pinned(rd);
+	if (!pin || host != pin) {
+		_st(e, host, rd);
+	}
+}
+
+/* ADC/SBC/RSC and friends want their operands in r1/r2. */
+static void _toScratch(struct JITEmitter* e, int a, int b) {
+	if (a != 1) {
+		sh4_emit_mov_reg(&e->cg, a, 1);
+	}
+	if (b != 2) {
+		sh4_emit_mov_reg(&e->cg, b, 2);
+	}
 }
 
 /* T = bit 31 of r, r unchanged. */
@@ -311,15 +502,9 @@ static void _signToT(struct JITEmitter* e, int r) {
 
 /* N/Z from result r. */
 static void _flagsNZ(struct JITEmitter* e, int r) {
-	sh4_emit_mov_reg(&e->cg, r, R_NZ);
-}
-
-/* N/Z from r, C from bit 0 of rc (which is destroyed). */
-static void _flagsNZC(struct JITEmitter* e, int r, int rc) {
-	sh4_emit_mov_reg(&e->cg, r, R_NZ);
-	sh4_emit_rotl(&e->cg, R_CV);
-	sh4_emit_shlr(&e->cg, rc);
-	sh4_emit_rotcr(&e->cg, R_CV);
+	if (r != R_NZ) {
+		sh4_emit_mov_reg(&e->cg, r, R_NZ);
+	}
 }
 
 /* T = C */
@@ -328,31 +513,218 @@ static void _carryToT(struct JITEmitter* e) {
 	sh4_emit_rotr(&e->cg, R_CV);
 }
 
-/* ra + rb or ra - rb, into guest register rd (-1 for CMP/CMN). ra and rb are
- * r1/r2. */
-static void _addSub(struct JITEmitter* e, bool sub, int rd, bool flags) {
-	if (!flags) {
+/* C from bit 0 of rc (which is destroyed). */
+static void _flagsC(struct JITEmitter* e, int rc) {
+	sh4_emit_rotl(&e->cg, R_CV);
+	sh4_emit_shlr(&e->cg, rc);
+	sh4_emit_rotcr(&e->cg, R_CV);
+}
+
+/* C = T, for an instruction that writes C and not V. With V needed after
+ * (in flags) it is kept; otherwise it gets the old C, which is one
+ * instruction instead of four. r3 is scratch. */
+static void _flagsCFromT(struct JITEmitter* e, unsigned flags) {
+	if (flags & F_V) {
+		sh4_emit_movt(&e->cg, 3);
+		_flagsC(e, 3);
+		return;
+	}
+	sh4_emit_rotcr(&e->cg, R_CV);
+}
+
+/* CMP a,b for e->fuseCond straight into T, if an SH-4 compare does it. */
+static bool _fuseCmp(struct JITEmitter* e, int a, int b) {
+	int cond = e->fuseCond;
+	switch (cond & ~1) {
+	case 0x0: // EQ, NE
+		sh4_emit_cmpeq(&e->cg, b, a);
+		break;
+	case 0x2: // CS, CC
+		sh4_emit_cmphs(&e->cg, b, a);
+		break;
+	case 0x8: // HI, LS
+		sh4_emit_cmphi(&e->cg, b, a);
+		break;
+	case 0xA: // GE, LT
+		sh4_emit_cmpge(&e->cg, b, a);
+		break;
+	case 0xC: // GT, LE
+		sh4_emit_cmpgt(&e->cg, b, a);
+		break;
+	default:
+		return false;
+	}
+	e->fused = true;
+	e->fusedIfT = !(cond & 1);
+	e->fuseCond = -1;
+	return true;
+}
+
+/* CMP a,#imm the same way; against 0 the one-register forms. */
+static bool _fuseCmpImm(struct JITEmitter* e, int a, int32_t imm) {
+	int cond = e->fuseCond;
+	if (!imm) {
+		switch (cond & ~1) {
+		case 0x0: // EQ, NE
+			sh4_emit_tst(&e->cg, a, a);
+			break;
+		case 0xA: // GE, LT
+			sh4_emit_cmppz(&e->cg, a);
+			break;
+		case 0xC: // GT, LE
+			sh4_emit_cmppl(&e->cg, a);
+			break;
+		default:
+			goto general;
+		}
+		e->fused = true;
+		e->fusedIfT = !(cond & 1);
+		return true;
+	}
+	if (a == 0 && imm >= -128 && imm <= 127 && (cond & ~1) == 0x0) {
+		sh4_emit_cmpeq_imm(&e->cg, imm);
+		e->fused = true;
+		e->fusedIfT = !(cond & 1);
+		e->fuseCond = -1;
+		return true;
+	}
+general:
+	switch (cond & ~1) {
+	case 0x0:
+	case 0x2:
+	case 0x8:
+	case 0xA:
+	case 0xC:
+		break;
+	default:
+		return false;
+	}
+	int b = a == 3 ? 2 : 3;
+	_imm(e, imm, b);
+	return _fuseCmp(e, a, b);
+}
+
+/* TST a,b: only Z is the same as an SH-4 tst's. */
+static bool _fuseTst(struct JITEmitter* e, int a, int b) {
+	int cond = e->fuseCond;
+	if ((cond & ~1) != 0x0) {
+		return false;
+	}
+	sh4_emit_tst(&e->cg, b, a);
+	e->fused = true;
+	e->fusedIfT = !(cond & 1);
+	e->fuseCond = -1;
+	return true;
+}
+
+/* For e->fuseCond EQ/NE/MI/PL, from the result in w; returns if it did. */
+static bool _fuseResult(struct JITEmitter* e, int w) {
+	int cond = e->fuseCond;
+	switch (cond) {
+	case 0x0: // EQ
+	case 0x1: // NE
+		sh4_emit_tst(&e->cg, w, w);
+		e->fusedIfT = cond == 0x0;
+		break;
+	case 0x4: // MI
+	case 0x5: // PL
+		sh4_emit_cmppz(&e->cg, w);
+		e->fusedIfT = cond == 0x5;
+		break;
+	default:
+		return false;
+	}
+	e->fused = true;
+	e->fuseCond = -1;
+	return true;
+}
+
+static bool _fusesByResult(int cond) {
+	return cond >= 0 && (cond <= 0x1 || cond == 0x4 || cond == 0x5);
+}
+
+/* a + b or a - b (host registers, as _into), into guest register rd (-1
+ * for CMP/CMN). flags: those needed after (F_*), the only ones made. */
+static void _addSub(struct JITEmitter* e, bool sub, int rd, unsigned flags, int a, int b) {
+	bool byResult = false;
+	bool carryOut = false;
+	if (e->fuseCond >= 0) {
+		if (rd < 0) {
+			if (sub && _fuseCmp(e, a, b)) {
+				return;
+			}
+		} else if (_fusesByResult(e->fuseCond)) {
+			byResult = true;
+			flags = 0;
+		} else if (sub && _fuseCmp(e, a, b)) {
+			/* T first, from the operands: the result doesn't touch it */
+			flags = 0;
+		} else if (!sub && (e->fuseCond & ~1) == 0x2 && a != b) { // CS, CC
+			/* the carry out after: the sum is below an operand */
+			carryOut = true;
+			flags = 0;
+		}
+	}
+	if (!(flags & F_ALL)) {
 		if (rd < 0) {
 			return;
 		}
+		int oa = a;
+		int ob = b;
+		int w = _into(e, rd, &a, &b, !sub);
 		if (sub) {
-			sh4_emit_sub(&e->cg, 2, 1);
+			sh4_emit_sub(&e->cg, b, w);
 		} else {
-			sh4_emit_add_reg(&e->cg, 2, 1);
+			sh4_emit_add_reg(&e->cg, b, w);
 		}
-		_st(e, 1, rd);
+		if (carryOut) {
+			sh4_emit_cmphi(&e->cg, w, oa != w ? oa : ob);
+			e->fused = true;
+			e->fusedIfT = e->fuseCond == 0x2;
+			e->fuseCond = -1;
+		}
+		_put(e, w, rd);
+		if (byResult) {
+			_fuseResult(e, w);
+		}
 		return;
 	}
-	sh4_emit_mov_reg(&e->cg, 1, R_NZ);
+	if (!(flags & F_V)) {
+		/* C (if needed) goes in with the old C as V */
+		if (rd < 0 && !(flags & F_NZ) && sub) {
+			sh4_emit_cmphs(&e->cg, b, a);
+			sh4_emit_rotcr(&e->cg, R_CV);
+			return;
+		}
+		sh4_emit_mov_reg(&e->cg, a, R_NZ);
+		if (sub) {
+			sh4_emit_sub(&e->cg, b, R_NZ);
+		} else {
+			sh4_emit_add_reg(&e->cg, b, R_NZ);
+		}
+		if (flags & F_C) {
+			if (sub) {
+				sh4_emit_cmphs(&e->cg, b, a);
+			} else {
+				sh4_emit_cmphi(&e->cg, R_NZ, a);
+			}
+			sh4_emit_rotcr(&e->cg, R_CV);
+		}
+		if (rd >= 0) {
+			_st(e, R_NZ, rd);
+		}
+		return;
+	}
+	sh4_emit_mov_reg(&e->cg, a, R_NZ);
 	if (sub) {
-		sh4_emit_subv(&e->cg, 2, R_NZ);
+		sh4_emit_subv(&e->cg, b, R_NZ);
 		sh4_emit_rotcr(&e->cg, R_CV);
-		sh4_emit_cmphs(&e->cg, 2, 1);
+		sh4_emit_cmphs(&e->cg, b, a);
 	} else {
-		sh4_emit_addv(&e->cg, 2, R_NZ);
+		sh4_emit_addv(&e->cg, b, R_NZ);
 		sh4_emit_rotcr(&e->cg, R_CV);
 		/* carry iff the sum wrapped below an operand */
-		sh4_emit_cmphi(&e->cg, R_NZ, 1);
+		sh4_emit_cmphi(&e->cg, R_NZ, a);
 	}
 	sh4_emit_rotcr(&e->cg, R_CV);
 	if (rd >= 0) {
@@ -360,8 +732,54 @@ static void _addSub(struct JITEmitter* e, bool sub, int rd, bool flags) {
 	}
 }
 
+/* a + imm or a - imm into rd, as _addSub */
+static void _addSubImm(struct JITEmitter* e, bool sub, int rd, unsigned flags, int a, int32_t imm) {
+	bool byResult = false;
+	if (e->fuseCond >= 0) {
+		if (rd < 0) {
+			if (sub && _fuseCmpImm(e, a, imm)) {
+				return;
+			}
+		} else if (_fusesByResult(e->fuseCond)) {
+			byResult = true;
+			flags = 0;
+		} else if (sub && _fuseCmpImm(e, a, imm)) {
+			flags = 0;
+		}
+	}
+	int32_t value = sub ? -imm : imm;
+	if (!(flags & (F_C | F_V)) && value >= -128 && value <= 127) {
+		int w;
+		if (rd < 0) {
+			if (!(flags & F_NZ)) {
+				return;
+			}
+			w = R_NZ;
+			sh4_emit_mov_reg(&e->cg, a, w);
+		} else {
+			int b = -1;
+			w = _into(e, rd, &a, &b, false);
+		}
+		if (value) {
+			sh4_emit_add_imm(&e->cg, value, w);
+		}
+		if (rd >= 0) {
+			_put(e, w, rd);
+			if (flags & F_NZ) {
+				sh4_emit_mov_reg(&e->cg, w, R_NZ);
+			}
+		}
+		if (byResult) {
+			_fuseResult(e, w);
+		}
+		return;
+	}
+	_imm(e, imm, 2);
+	_addSub(e, sub, rd, flags, a, 2);
+}
+
 /* ADC/SBC: r1 + r2 + C, with r2 inverted first for SBC. */
-static void _addCarry(struct JITEmitter* e, bool sub, int rd, bool flags) {
+static void _addCarry(struct JITEmitter* e, bool sub, int rd, unsigned flags) {
 	if (sub) {
 		sh4_emit_not(&e->cg, 2, 2);
 	}
@@ -369,18 +787,24 @@ static void _addCarry(struct JITEmitter* e, bool sub, int rd, bool flags) {
 	sh4_emit_mov_reg(&e->cg, 1, 3);
 	sh4_emit_addc(&e->cg, 2, 3);
 	_st(e, 3, rd);
-	if (!flags) {
+	if (!(flags & F_V)) {
+		if (flags & F_C) {
+			sh4_emit_rotcr(&e->cg, R_CV);
+		}
+		if (flags & F_NZ) {
+			sh4_emit_mov_reg(&e->cg, 3, R_NZ);
+		}
 		return;
 	}
 	sh4_emit_movt(&e->cg, 5);
 	/* V = ~(a ^ b) & (a ^ result), sign bit */
-	sh4_emit_mov_reg(&e->cg, 1, 6);
-	sh4_emit_xor(&e->cg, 2, 6);
-	sh4_emit_not(&e->cg, 6, 6);
+	sh4_emit_mov_reg(&e->cg, 1, 0);
+	sh4_emit_xor(&e->cg, 2, 0);
+	sh4_emit_not(&e->cg, 0, 0);
 	sh4_emit_mov_reg(&e->cg, 1, 4);
 	sh4_emit_xor(&e->cg, 3, 4);
-	sh4_emit_and(&e->cg, 4, 6);
-	sh4_emit_shll(&e->cg, 6);
+	sh4_emit_and(&e->cg, 4, 0);
+	sh4_emit_shll(&e->cg, 0);
 	sh4_emit_rotcr(&e->cg, R_CV);
 	sh4_emit_shlr(&e->cg, 5);
 	sh4_emit_rotcr(&e->cg, R_CV);
@@ -560,12 +984,13 @@ static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd) {
 		_ld(e, rd, 5);
 	}
 	if (e->jit->fastmem) {
-		/* The access itself, at the guest's address (fastmem.c). r8 keeps
-		 * it out of the host's half of the address space; what isn't
+		/* The access itself, at the guest's address (fastmem.c). The mask
+		 * keeps it out of the host's half of the address space; what isn't
 		 * mapped faults into the stub, which returns after the access.
 		 * Not in a delay slot, and only these six instructions. */
-		sh4_emit_and(&e->cg, R_STUBS, 4);
-		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MASK);
+		sh4_emit_and(&e->cg, 0, 4);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 3);
 		switch (op) {
 		case JIT_MEM_LOAD32:
 			sh4_emit_mov_l_load(&e->cg, 4, 0);
@@ -601,14 +1026,14 @@ static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd) {
 		e->pending += store ? 1 : 2;
 #endif
 	} else {
-		sh4_emit_mov_l_load_disp(&e->cg, R_STUBS, 1, e->stall * JIT_MEM_OPS + op);
-		sh4_emit_jsr(&e->cg, 1);
-		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_STUBS + e->stall * JIT_MEM_OPS + op);
+		sh4_emit_jsr(&e->cg, 0);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 3);
 	}
 	if (!store) {
 		_st(e, 0, rd);
 	}
-	e->usesBase = true;
+	e->usesBase |= e->stall;
 	/* The prefetch's 1S becomes 1N: THUMB/ARM_PREFETCH_CYCLES +
 	 * *_LOAD/STORE_POST_BODY. */
 	e->pending += 1 + (e->thumb ? e->nonseq16 : e->nonseq32);
@@ -619,6 +1044,9 @@ static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd) {
 /* ---------------------------------------------------------------- */
 
 static void _patchBranch(uint8_t* at, uint8_t* to) {
+	if (to > _label) {
+		_label = to;
+	}
 	int32_t d = sh4_branch_disp12((uintptr_t) at, (uintptr_t) to);
 	if ((at[1] & 0xF0) == 0xA0) { /* bra */
 		at[0] = d & 0xFF;
@@ -652,24 +1080,84 @@ static void _btTo(struct JITEmitter* e, struct JITFixups* f) {
 	sh4_emit_bt(&e->cg, 0);
 }
 
+/* Around a C call from a stub: the pins C may clobber. */
+static void _pinsSave(struct JITEmitter* e) {
+	sh4_emit_mov_l_store_dec(&e->cg, 6, 15);
+	sh4_emit_mov_l_store_dec(&e->cg, 7, 15);
+}
+
+static void _pinsRestore(struct JITEmitter* e) {
+	sh4_emit_mov_l_load_inc(&e->cg, 15, 7);
+	sh4_emit_mov_l_load_inc(&e->cg, 15, 6);
+}
+
+/* r0 = the guest base of the block whose code called at r1 (a return
+ * address), from jit->baseCache or ARMJITGuestBase; r1 and r7 go. Blocks
+ * don't keep their base in cpu->jitBase unless the stall model needs it. */
+static void _emitGuestBase(struct JITEmitter* e) {
+	e->jit->guestBase = e->cg.ptr;
+	sh4_emit_mov_reg(&e->cg, 1, 0);
+	sh4_emit_shlr(&e->cg, 0);
+	sh4_emit_and_imm(&e->cg, 0xFF);
+	sh4_emit_shll2(&e->cg, 0);
+	sh4_emit_shll(&e->cg, 0);
+	_lit(e, (uint32_t) (uintptr_t) e->jit->baseCache, 7);
+	sh4_emit_add_reg(&e->cg, 0, 7);
+	sh4_emit_mov_l_load_inc(&e->cg, 7, 0);
+	sh4_emit_cmpeq(&e->cg, 1, 0);
+	uint8_t* miss = e->cg.ptr;
+	sh4_emit_bf(&e->cg, 0);
+	sh4_emit_rts(&e->cg);
+	sh4_emit_mov_l_load(&e->cg, 7, 0);
+	_patchBranch(miss, e->cg.ptr);
+	sh4_emit_sts_pr_dec(&e->cg, 15);
+	int r;
+	for (r = 2; r <= 6; ++r) {
+		sh4_emit_mov_l_store_dec(&e->cg, r, 15);
+	}
+	_lit(e, (uint32_t) (uintptr_t) e->jit, 4);
+	_lit(e, (uint32_t) (uintptr_t) ARMJITGuestBase, 0);
+	sh4_emit_jsr(&e->cg, 0);
+	sh4_emit_mov_reg(&e->cg, 1, 5);
+	for (r = 6; r >= 2; --r) {
+		sh4_emit_mov_l_load_inc(&e->cg, 15, r);
+	}
+	sh4_emit_lds_pr_inc(&e->cg, 15);
+	sh4_emit_rts(&e->cg);
+	sh4_emit_nop(&e->cg);
+	_flushPool(e, false);
+	ARMJITRegisterCall(e->jit, ARMJITGuestBase);
+}
+
+/* r0 = the guest base of the block the stub was called from (PR); bsr
+ * slot as given. */
+static void _guestBaseCall(struct JITEmitter* e) {
+	sh4_emit_sts_pr(&e->cg, 1);
+	sh4_emit_bsr(&e->cg, sh4_branch_disp12((uintptr_t) e->cg.ptr, (uintptr_t) e->jit->guestBase));
+}
+
 /* The slow paths: mGBA's own access through the wrappers above, with
- * cpu->cycles and PC as they expect. r3 = wrapper, r4 = address, r5 = value,
- * r6 = offset. Loads return the value in r0. A store that says stop leaves
+ * cpu->cycles and PC as they expect. r2 = wrapper, r3 = offset, r4 = address,
+ * r5 = value. Loads return the value in r0. A store that says stop leaves
  * for dispatchSync with this instruction counted. */
 static void _emitSlowLoad(struct JITEmitter* e) {
 	sh4_emit_sts_pr_dec(&e->cg, 15);
+	_pinsSave(e);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_add_reg(&e->cg, R_CYCLES, 0);
 	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_CYCLES);
 	sh4_emit_mov_reg(&e->cg, 4, 5);
-	sh4_emit_add_reg(&e->cg, R_BASE, 6);
-	sh4_emit_jsr(&e->cg, 3);
-	sh4_emit_mov_reg(&e->cg, R_CPU, 4);
+	_guestBaseCall(e);
+	sh4_emit_mov_reg(&e->cg, 3, 6);
+	sh4_emit_add_reg(&e->cg, 0, 6);
+	sh4_emit_jsr(&e->cg, 2);
+	sh4_emit_stc_gbr(&e->cg, 4);
 	sh4_emit_mov_reg(&e->cg, 0, 3);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CYCLES);
 	sh4_emit_mov_reg(&e->cg, 0, R_CYCLES);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_sub(&e->cg, 0, R_CYCLES);
+	_pinsRestore(e);
 	sh4_emit_lds_pr_inc(&e->cg, 15);
 	sh4_emit_rts(&e->cg);
 	sh4_emit_mov_reg(&e->cg, 3, 0);
@@ -677,55 +1165,65 @@ static void _emitSlowLoad(struct JITEmitter* e) {
 
 static void _emitSlowStore(struct JITEmitter* e) {
 	sh4_emit_sts_pr_dec(&e->cg, 15);
-	sh4_emit_mov_l_store_dec(&e->cg, 6, 15);
+	_pinsSave(e);
+	sh4_emit_mov_l_store_dec(&e->cg, 3, 15);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_add_reg(&e->cg, R_CYCLES, 0);
 	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_CYCLES);
-	sh4_emit_mov_reg(&e->cg, R_BASE, 7);
-	sh4_emit_add_reg(&e->cg, 6, 7);
+	_guestBaseCall(e);
+	sh4_emit_nop(&e->cg);
+	sh4_emit_mov_reg(&e->cg, 3, 7);
+	sh4_emit_add_reg(&e->cg, 0, 7);
 	sh4_emit_mov_reg(&e->cg, 5, 6);
 	sh4_emit_mov_reg(&e->cg, 4, 5);
-	sh4_emit_jsr(&e->cg, 3);
-	sh4_emit_mov_reg(&e->cg, R_CPU, 4);
-	sh4_emit_mov_l_load_inc(&e->cg, 15, 6);
-	sh4_emit_mov_reg(&e->cg, 0, 3);
+	sh4_emit_jsr(&e->cg, 2);
+	sh4_emit_stc_gbr(&e->cg, 4);
+	sh4_emit_mov_l_load_inc(&e->cg, 15, 3);
+	sh4_emit_mov_reg(&e->cg, 0, 2);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CYCLES);
 	sh4_emit_mov_reg(&e->cg, 0, R_CYCLES);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_sub(&e->cg, 0, R_CYCLES);
+	_pinsRestore(e);
 	sh4_emit_lds_pr_inc(&e->cg, 15);
-	sh4_emit_tst(&e->cg, 3, 3);
+	sh4_emit_tst(&e->cg, 2, 2);
 	uint8_t* stop = e->cg.ptr;
 	sh4_emit_bf(&e->cg, 0);
 	sh4_emit_rts(&e->cg);
 	sh4_emit_nop(&e->cg);
 	_patchBranch(stop, e->cg.ptr);
-	/* r12 += offset / length + 1; a store doesn't change the mode */
+#ifdef JIT_COUNT
+	/* jitCount += offset / length + 1; a store doesn't change the mode */
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CPSR);
-	sh4_emit_shlr(&e->cg, 6);
+	sh4_emit_shlr(&e->cg, 3);
 	sh4_emit_tst_imm(&e->cg, 0x20);
 	uint8_t* thumb = e->cg.ptr;
 	sh4_emit_bf(&e->cg, 0);
-	sh4_emit_shlr(&e->cg, 6);
+	sh4_emit_shlr(&e->cg, 3);
 	_patchBranch(thumb, e->cg.ptr);
-	sh4_emit_add_imm(&e->cg, 1, 6);
-	sh4_emit_add_reg(&e->cg, 6, R_COUNT);
+	sh4_emit_add_imm(&e->cg, 1, 3);
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_COUNT);
+	sh4_emit_add_reg(&e->cg, 3, 0);
+	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_COUNT);
+#endif
 	_jumpTo(e, e->jit->dispatchSync);
 	sh4_emit_nop(&e->cg);
 }
 
 /* GBAMemoryStall for code in ROM with the prefetch buffer on: r2 = the
- * access's wait, r6 = offset, r0 kept. Adds the result to r13 and returns.
- * The loop is mGBA's, counting loads down in r5 from maxLoads - 1, which
- * makes lastPrefetchedPc pc + 2 * (7 - r5) whatever previousLoads was. */
+ * access's wait, r3 = offset, r0 kept (in cpu->jitTmp meanwhile). Adds the
+ * result to r13 and returns T clear; r1-r5 go. The loop is mGBA's, counting
+ * loads down in r5 from maxLoads - 1, which makes lastPrefetchedPc
+ * pc + 2 * (7 - r5) whatever previousLoads was. */
 static void _emitStall(struct JITEmitter* e) {
 	struct GBA* gba = (struct GBA*) e->jit->cpu->master;
-	sh4_emit_mov_reg(&e->cg, R_BASE, 7);
-	sh4_emit_add_reg(&e->cg, 6, 7);
-	sh4_emit_mov_reg(&e->cg, 0, 6);
-	_lit(e, (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc, 3);
-	sh4_emit_mov_l_load(&e->cg, 3, 1);
-	sh4_emit_sub(&e->cg, 7, 1);
+	uint32_t last = (uint32_t) (uintptr_t) &gba->memory.lastPrefetchedPc;
+	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_TMP);
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_BASE);
+	sh4_emit_add_reg(&e->cg, 0, 3);
+	_lit(e, last, 1);
+	sh4_emit_mov_l_load(&e->cg, 1, 1);
+	sh4_emit_sub(&e->cg, 3, 1);
 	sh4_emit_mov_imm(&e->cg, 7, 5);
 	sh4_emit_mov_imm(&e->cg, 16, 0);
 	sh4_emit_cmphs(&e->cg, 0, 1);
@@ -755,7 +1253,8 @@ static void _emitStall(struct JITEmitter* e) {
 	sh4_emit_mov_imm(&e->cg, 7, 0);
 	sh4_emit_sub(&e->cg, 5, 0);
 	sh4_emit_add_reg(&e->cg, 0, 0);
-	sh4_emit_add_reg(&e->cg, 7, 0);
+	sh4_emit_add_reg(&e->cg, 3, 0);
+	_lit(e, last, 3);
 	sh4_emit_mov_l_store(&e->cg, 0, 3);
 	/* wait = max(wait, stall) - (n - s + 1) - (stall - 1) */
 	sh4_emit_cmpgt(&e->cg, 2, 4);
@@ -768,15 +1267,14 @@ static void _emitStall(struct JITEmitter* e) {
 	sh4_emit_add_reg(&e->cg, 1, 2);
 	sh4_emit_sub(&e->cg, 4, 2);
 	sh4_emit_add_reg(&e->cg, 2, R_CYCLES);
-	sh4_emit_clrt(&e->cg);
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_TMP);
 	sh4_emit_rts(&e->cg);
-	sh4_emit_mov_reg(&e->cg, 6, 0);
+	sh4_emit_clrt(&e->cg);
 }
 
-/* The access itself, r0 = offset into the region's buffer at @(md,r3), value
- * in/out as the op says. */
-static void _emitAccess(struct JITEmitter* e, enum JITMemOp op, int md) {
-	sh4_emit_mov_l_load_disp(&e->cg, 3, 1, md);
+/* The access itself, r0 = the region's buffer, r1 = offset into it, value
+ * in/out as the op says; r0 goes (or is the value). */
+static void _emitAccessOp(struct JITEmitter* e, enum JITMemOp op) {
 	switch (op) {
 	case JIT_MEM_LOAD32:
 		sh4_emit_mov_l_load_r0(&e->cg, 1, 0);
@@ -809,23 +1307,35 @@ static void _emitAccess(struct JITEmitter* e, enum JITMemOp op, int md) {
 	}
 }
 
-/* r0 = r4 & mask */
+/* The access, r1 = offset into region md's buffer */
+static void _emitAccess(struct JITEmitter* e, enum JITMemOp op, int md) {
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(md));
+	_emitAccessOp(e, op);
+}
+
+/* r1 = r4 & mask */
 static void _emitOffset(struct JITEmitter* e, uint32_t mask) {
 	_lit(e, mask, 1);
-	sh4_emit_mov_reg(&e->cg, 4, 0);
-	sh4_emit_and(&e->cg, 1, 0);
+	sh4_emit_and(&e->cg, 4, 1);
+}
+
+/* r2 = the memData word md */
+static void _emitMd(struct JITEmitter* e, int md) {
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(md));
+	sh4_emit_mov_reg(&e->cg, 0, 2);
 }
 
 /* A store into a chunk with compiled code in it goes the slow way, which
- * invalidates. r0 = offset, chunk list @(md,r3). */
-static void _emitSmcCheck(struct JITEmitter* e, int md, struct JITFixups* slow) {
-	sh4_emit_mov_reg(&e->cg, 0, 2);
-	sh4_emit_shlr8(&e->cg, 2);
-	sh4_emit_shll2(&e->cg, 2);
-	sh4_emit_mov_l_load_disp(&e->cg, 3, 1, md);
-	sh4_emit_add_reg(&e->cg, 1, 2);
-	sh4_emit_mov_l_load(&e->cg, 2, 2);
-	sh4_emit_tst(&e->cg, 2, 2);
+ * invalidates. Offset in reg, which goes, and r0 (md < 0: r0 is the chunk
+ * table already). */
+static void _emitSmcCheck(struct JITEmitter* e, int reg, int md, struct JITFixups* slow) {
+	sh4_emit_shlr8(&e->cg, reg);
+	sh4_emit_shll2(&e->cg, reg);
+	if (md >= 0) {
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(md));
+	}
+	sh4_emit_mov_l_load_r0(&e->cg, reg, reg);
+	sh4_emit_tst(&e->cg, reg, reg);
 	_bfTo(e, slow);
 }
 
@@ -842,6 +1352,20 @@ static void _emitWaitTail(struct JITEmitter* e, bool stall, uint8_t* stallCode) 
 	}
 }
 
+/* _emitWaitTail for a wait known here */
+static void _emitWaitTailConst(struct JITEmitter* e, bool stall, uint8_t* stallCode, int wait) {
+	if (stall) {
+		sh4_emit_mov_imm(&e->cg, wait, 2);
+		_emitWaitTail(e, stall, stallCode);
+	} else {
+		sh4_emit_rts(&e->cg);
+		sh4_emit_add_imm(&e->cg, wait, R_CYCLES);
+	}
+}
+
+/* cpu->jitStubs[stall][op]: r3 = offset, r4 = address, r5 = value to store;
+ * a load's value comes back in r0. The fast paths touch r0-r2 only (r3-r5
+ * are the slow path's), the stall model r0-r5. */
 static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, uint8_t* stallCode,
                             uint8_t* slowLoad, uint8_t* slowStore) {
 	static const void* const slow[JIT_MEM_OPS] = {
@@ -851,10 +1375,10 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 	int size = op == JIT_MEM_LOAD32 || op == JIT_MEM_STORE32 ? 4
 	         : op == JIT_MEM_LOAD8 || op == JIT_MEM_LOADS8 || op == JIT_MEM_STORE8 ? 1 : 2;
 	struct JITFixups toSlow = { .n = 0 };
-	struct JITFixups toIwram = { .n = 0 };
+	struct JITFixups notIwram = { .n = 0 };
 	struct JITFixups toRom = { .n = 0 };
 
-	e->jit->memStubs[stall][op] = e->cg.ptr;
+	e->jit->cpu->jitStubs[stall][op] = e->cg.ptr;
 	sh4_emit_mov_reg(&e->cg, 4, 0);
 	if (size > 1) {
 		sh4_emit_tst_imm(&e->cg, size - 1);
@@ -862,9 +1386,23 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 	}
 	sh4_emit_shlr16(&e->cg, 0);
 	sh4_emit_shlr8(&e->cg, 0);
-	_lit(e, (uint32_t) (uintptr_t) e->jit->memData, 3);
 	sh4_emit_cmpeq_imm(&e->cg, REGION_WORKING_IRAM);
-	_btTo(e, &toIwram);
+	_bfTo(e, &notIwram);
+
+	/* IWRAM, falling through: no wait states of its own */
+	if (store) {
+		_emitOffset(e, SIZE_WORKING_IRAM - 1);
+		sh4_emit_mov_reg(&e->cg, 1, 2);
+		_emitSmcCheck(e, 2, JIT_MD_CHUNKS_IWRAM, &toSlow);
+		_emitAccess(e, op, JIT_MD_IWRAM);
+	} else {
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_IWRAM));
+		_emitOffset(e, SIZE_WORKING_IRAM - 1);
+		_emitAccessOp(e, op);
+	}
+	_emitWaitTailConst(e, stall, stallCode, store ? 1 : 2);
+
+	_branchHere(&notIwram, e->cg.ptr);
 	if (!store) {
 		sh4_emit_cmpeq_imm(&e->cg, REGION_CART0);
 		_btTo(e, &toRom);
@@ -877,39 +1415,31 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 	/* EWRAM */
 	_emitOffset(e, SIZE_WORKING_RAM - 1);
 	if (store) {
-		_emitSmcCheck(e, JIT_MD_CHUNKS_EWRAM, &toSlow);
+		sh4_emit_mov_reg(&e->cg, 1, 2);
+		_emitSmcCheck(e, 2, JIT_MD_CHUNKS_EWRAM, &toSlow);
+		_emitAccess(e, op, JIT_MD_WRAM);
+		_emitMd(e, size == 4 ? JIT_MD_EWRAM_STORE32 : JIT_MD_EWRAM_STORE16);
+	} else {
+		_emitMd(e, size == 4 ? JIT_MD_EWRAM_LOAD32 : JIT_MD_EWRAM_LOAD16);
+		_emitAccess(e, op, JIT_MD_WRAM);
 	}
-	_emitAccess(e, op, JIT_MD_WRAM);
-	sh4_emit_mov_l_load_disp(&e->cg, 3, 2,
-	                         store ? (size == 4 ? JIT_MD_EWRAM_STORE32 : JIT_MD_EWRAM_STORE16)
-	                               : (size == 4 ? JIT_MD_EWRAM_LOAD32 : JIT_MD_EWRAM_LOAD16));
-	_emitWaitTail(e, stall, stallCode);
-
-	/* IWRAM: no wait states of its own */
-	_branchHere(&toIwram, e->cg.ptr);
-	_emitOffset(e, SIZE_WORKING_IRAM - 1);
-	if (store) {
-		_emitSmcCheck(e, JIT_MD_CHUNKS_IWRAM, &toSlow);
-	}
-	_emitAccess(e, op, JIT_MD_IWRAM);
-	sh4_emit_mov_imm(&e->cg, store ? 1 : 2, 2);
 	_emitWaitTail(e, stall, stallCode);
 
 	/* ROM (wait state 0 only), never stalls: above BASE_CART0 */
 	if (!store) {
 		_branchHere(&toRom, e->cg.ptr);
 		_emitOffset(e, SIZE_CART0 - 1);
-		sh4_emit_mov_l_load_disp(&e->cg, 3, 1, JIT_MD_ROM_SIZE);
-		sh4_emit_cmphs(&e->cg, 1, 0);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_ROM_SIZE));
+		sh4_emit_cmphs(&e->cg, 0, 1);
 		_btTo(e, &toSlow);
+		_emitMd(e, size == 4 ? JIT_MD_ROM_LOAD32 : JIT_MD_ROM_LOAD16);
 		_emitAccess(e, op, JIT_MD_ROM);
-		sh4_emit_mov_l_load_disp(&e->cg, 3, 2, size == 4 ? JIT_MD_ROM_LOAD32 : JIT_MD_ROM_LOAD16);
 		_emitWaitTail(e, false, NULL);
 	}
 
 	_branchHere(&toSlow, e->cg.ptr);
 	ARMJITRegisterCall(e->jit, slow[op]);
-	_lit(e, (uint32_t) (uintptr_t) slow[op], 3);
+	_lit(e, (uint32_t) (uintptr_t) slow[op], 2);
 	uint8_t* bra = e->cg.ptr;
 	sh4_emit_bra(&e->cg, 0);
 	sh4_emit_nop(&e->cg);
@@ -921,34 +1451,30 @@ static void _emitMemoryStub(struct JITEmitter* e, enum JITMemOp op, bool stall, 
 static void _emitMultipleRegion(struct JITEmitter* e, bool store, bool stall, uint8_t* stallCode, int md,
                                 int chunks, uint32_t size, struct JITFixups* slow) {
 	_emitOffset(e, size - 4);
-	sh4_emit_mov_reg(&e->cg, 7, 2);
-	sh4_emit_shll2(&e->cg, 2);
-	sh4_emit_add_reg(&e->cg, 0, 2);
-	_lit(e, size, 1);
-	sh4_emit_cmphi(&e->cg, 1, 2);
+	sh4_emit_mov_reg(&e->cg, 2, 4);
+	sh4_emit_shll2(&e->cg, 4);
+	sh4_emit_add_reg(&e->cg, 1, 4);
+	_lit(e, size, 0);
+	sh4_emit_cmphi(&e->cg, 0, 4);
 	_btTo(e, slow);
 	if (store) {
 		/* 64 bytes at most: the chunks of the first and last words */
-		sh4_emit_mov_reg(&e->cg, 2, 0);
-		sh4_emit_add_imm(&e->cg, -1, 0);
-		_emitSmcCheck(e, chunks, slow);
-		_emitOffset(e, size - 4);
-		_emitSmcCheck(e, chunks, slow);
+		sh4_emit_add_imm(&e->cg, -1, 4);
+		_emitSmcCheck(e, 4, chunks, slow);
+		sh4_emit_mov_reg(&e->cg, 1, 4);
+		_emitSmcCheck(e, 4, -1, slow);
 	}
-	sh4_emit_mov_l_load_disp(&e->cg, 3, 1, md);
-	sh4_emit_add_reg(&e->cg, 1, 0);
 	if (md == JIT_MD_WRAM) {
-		sh4_emit_mov_l_load_disp(&e->cg, 3, 2, JIT_MD_EWRAM_WORD);
-		sh4_emit_mul_l(&e->cg, 7, 2);
-		sh4_emit_mov_l_load_disp(&e->cg, 3, 1, store ? JIT_MD_EWRAM_STM : JIT_MD_EWRAM_LDM);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(JIT_MD_EWRAM_WORD));
+		sh4_emit_mul_l(&e->cg, 0, 2);
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(store ? JIT_MD_EWRAM_STM : JIT_MD_EWRAM_LDM));
 		sh4_emit_sts_macl(&e->cg, 2);
-		sh4_emit_add_reg(&e->cg, 1, 2);
-	} else {
-		sh4_emit_mov_reg(&e->cg, 7, 2);
-		if (!store) {
-			sh4_emit_add_imm(&e->cg, 1, 2);
-		}
+		sh4_emit_add_reg(&e->cg, 0, 2);
+	} else if (!store) {
+		sh4_emit_add_imm(&e->cg, 1, 2);
 	}
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_MD(md));
+	sh4_emit_add_reg(&e->cg, 1, 0);
 	if (stall) {
 		uint8_t* bra = e->cg.ptr;
 		sh4_emit_bra(&e->cg, 0);
@@ -961,12 +1487,13 @@ static void _emitMultipleRegion(struct JITEmitter* e, bool store, bool stall, ui
 	}
 }
 
-/* LDM/STM-like: r4 = the lowest address, r5 = the instruction as
- * _sysMultiple takes it, r6 = offset, r7 = the number of words. In IWRAM or EWRAM without wrapping (and for a store, no
- * code in the way): charges GBALoad/StoreMultiple's wait and returns T clear
- * with r0 = the host address for the caller to copy through. Otherwise
- * _sysMultiple does the whole instruction and it returns T set (or stops, as
- * jit->handlers). */
+/* LDM/STM-like: r2 = the number of words, r3 = offset, r4 = the lowest
+ * address, r5 = the instruction as _sysMultiple takes it. In IWRAM or EWRAM
+ * without wrapping (and for a store, no code in the way): charges
+ * GBALoad/StoreMultiple's wait and returns T clear with r0 = the host address
+ * for the caller to copy through. Otherwise _sysMultiple does the whole
+ * instruction and it returns T set (or stops, as jit->handlers). The fast
+ * path leaves r3 and r5 for the slow one. */
 static void _emitMultipleStub(struct JITEmitter* e, bool store, bool stall, bool thumb, uint8_t* stallCode) {
 	struct JITFixups toSlow = { .n = 0 };
 	struct JITFixups toIwram = { .n = 0 };
@@ -974,7 +1501,6 @@ static void _emitMultipleStub(struct JITEmitter* e, bool store, bool stall, bool
 	sh4_emit_mov_reg(&e->cg, 4, 0);
 	sh4_emit_shlr16(&e->cg, 0);
 	sh4_emit_shlr8(&e->cg, 0);
-	_lit(e, (uint32_t) (uintptr_t) e->jit->memData, 3);
 	sh4_emit_cmpeq_imm(&e->cg, REGION_WORKING_IRAM);
 	_btTo(e, &toIwram);
 	sh4_emit_cmpeq_imm(&e->cg, REGION_WORKING_RAM);
@@ -983,7 +1509,7 @@ static void _emitMultipleStub(struct JITEmitter* e, bool store, bool stall, bool
 	_branchHere(&toIwram, e->cg.ptr);
 	_emitMultipleRegion(e, store, stall, stallCode, JIT_MD_IWRAM, JIT_MD_CHUNKS_IWRAM, SIZE_WORKING_IRAM, &toSlow);
 	_branchHere(&toSlow, e->cg.ptr);
-	_lit(e, (uint32_t) (uintptr_t) _sysMultiple, 7);
+	_lit(e, (uint32_t) (uintptr_t) _sysMultiple, 2);
 	_jumpTo(e, e->jit->handlers[thumb]);
 	sh4_emit_nop(&e->cg);
 	_flushPool(e, false);
@@ -1012,44 +1538,53 @@ static void _emitMemoryStubs(struct JITEmitter* e) {
 
 static void _registerRoutines(struct ARMJIT* jit);
 
-/* jit->handlers[thumb]: r5 = argument, r6 = offset as for the memory stubs,
- * r7 = the C routine. The flags go to the cpsr and back around it. Returns if the
- * block can carry on; otherwise counts the instruction and leaves for
- * dispatchSync, or for C (commonRaw) if the flags can't be held. */
+/* jit->handlers[thumb]: r2 = the C routine, r3 = offset as for the memory
+ * stubs, r5 = argument. The flags and pins go to the cpu and back around it.
+ * Returns if the block can carry on; otherwise counts the instruction and
+ * leaves for dispatchSync, or for C (commonRaw) if the flags can't be held. */
 static void _emitHandlerStub(struct JITEmitter* e, bool thumb, uint8_t* commonRaw) {
 	e->jit->handlers[thumb] = e->cg.ptr;
 	sh4_emit_sts_pr_dec(&e->cg, 15);
-	sh4_emit_mov_l_store_dec(&e->cg, 6, 15);
+	sh4_emit_mov_l_store_dec(&e->cg, 3, 15);
 	_emitFlagsOut(e, 1);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_add_reg(&e->cg, R_CYCLES, 0);
 	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_CYCLES);
-	sh4_emit_add_reg(&e->cg, R_BASE, 6);
-	sh4_emit_jsr(&e->cg, 7);
-	sh4_emit_mov_reg(&e->cg, R_CPU, 4);
-	sh4_emit_mov_reg(&e->cg, 0, 3);
+	sh4_emit_stc_gbr(&e->cg, 4);
+	_pinsOut(&e->cg, 4);
+	_guestBaseCall(e);
+	sh4_emit_mov_reg(&e->cg, 3, 6);
+	sh4_emit_jsr(&e->cg, 2);
+	sh4_emit_add_reg(&e->cg, 0, 6);
+	sh4_emit_mov_reg(&e->cg, 0, 5);
+	sh4_emit_stc_gbr(&e->cg, 1);
+	_pinsIn(&e->cg, 1);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_CYCLES);
 	sh4_emit_mov_reg(&e->cg, 0, R_CYCLES);
 	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_sub(&e->cg, 0, R_CYCLES);
 	_emitFlagsIn(e);
-	sh4_emit_mov_l_load_inc(&e->cg, 15, 6);
+	sh4_emit_mov_l_load_inc(&e->cg, 15, 3);
 	sh4_emit_lds_pr_inc(&e->cg, 15);
-	sh4_emit_tst(&e->cg, 3, 3);
+	sh4_emit_tst(&e->cg, 5, 5);
 	uint8_t* stop = e->cg.ptr;
 	sh4_emit_bf(&e->cg, 0);
 	sh4_emit_rts(&e->cg);
 	sh4_emit_nop(&e->cg);
 	_patchBranch(stop, e->cg.ptr);
-	/* r12 += offset / length + 1 */
+#ifdef JIT_COUNT
+	/* jitCount += offset / length + 1 */
 	if (thumb) {
-		sh4_emit_shlr(&e->cg, 6);
+		sh4_emit_shlr(&e->cg, 3);
 	} else {
-		sh4_emit_shlr2(&e->cg, 6);
+		sh4_emit_shlr2(&e->cg, 3);
 	}
-	sh4_emit_add_imm(&e->cg, 1, 6);
-	sh4_emit_add_reg(&e->cg, 6, R_COUNT);
-	sh4_emit_mov_reg(&e->cg, 3, 0);
+	sh4_emit_add_imm(&e->cg, 1, 3);
+	sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_COUNT);
+	sh4_emit_add_reg(&e->cg, 3, 0);
+	sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_COUNT);
+#endif
+	sh4_emit_mov_reg(&e->cg, 5, 0);
 	sh4_emit_cmpeq_imm(&e->cg, 2);
 	uint8_t* raw = e->cg.ptr;
 	sh4_emit_bt(&e->cg, 0);
@@ -1066,7 +1601,7 @@ static void _emitHandlerStub(struct JITEmitter* e, bool thumb, uint8_t* commonRa
 void ARMJITUpdateMemory(struct ARMJIT* jit) {
 	struct GBA* gba = (struct GBA*) jit->cpu->master;
 	struct GBAMemory* memory = &gba->memory;
-	uint32_t* md = jit->memData;
+	uint32_t* md = jit->cpu->jitMemData;
 	md[JIT_MD_WRAM] = (uint32_t) (uintptr_t) memory->wram;
 	md[JIT_MD_IWRAM] = (uint32_t) (uintptr_t) memory->iwram;
 	md[JIT_MD_ROM] = (uint32_t) (uintptr_t) memory->rom;
@@ -1090,8 +1625,9 @@ void ARMJITUpdateMemory(struct ARMJIT* jit) {
 /* Once, at the start of the code buffer:
  *
  * enter(cpu, entry): saves what the C ABI says a callee keeps (r8-r14, PR)
- *   plus GBR, sets up GBR, r12-r14 and jumps to a block entry. Returns the
- *   number of guest instructions run, with jit->exit saying why it stopped.
+ *   plus GBR, sets up GBR, the pinned registers and r13 and jumps to a block
+ *   entry. Returns the number of guest instructions run (0 without
+ *   JIT_COUNT), with jit->exit saying why it stopped.
  * exits[type]: r0 = the exit's argument. Puts cpu->cycles back and returns
  *   from enter.
  * lookup: r4 = key, r5 = exit type if it isn't in the hash. Jumps to the
@@ -1101,6 +1637,7 @@ void ARMJITUpdateMemory(struct ARMJIT* jit) {
 void ARMJITEmitStubs(struct ARMJIT* jit) {
 	struct JITEmitter e;
 	memset(&e, 0, sizeof(e));
+	e.fuseCond = -1;
 	e.jit = jit;
 	e.cg.ptr = jit->code + jit->codeUsed;
 	e.cg.end = jit->code + jit->codeSize;
@@ -1114,13 +1651,15 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 	sh4_emit_stc_gbr(&e.cg, 1);
 	sh4_emit_mov_l_store_dec(&e.cg, 1, 15);
 	sh4_emit_ldc_gbr(&e.cg, 4);
-	sh4_emit_mov_reg(&e.cg, 4, R_CPU);
-	_lit(&e, jit->fastmem ? 0x0FFFFFFF : (uint32_t) (uintptr_t) jit->memStubs, R_STUBS);
+	_pinsIn(&e.cg, 4);
 	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_CYCLES);
 	sh4_emit_mov_reg(&e.cg, 0, R_CYCLES);
 	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_sub(&e.cg, 0, R_CYCLES);
-	sh4_emit_mov_imm(&e.cg, 0, R_COUNT);
+#ifdef JIT_COUNT
+	sh4_emit_mov_imm(&e.cg, 0, 0);
+	sh4_emit_mov_l_store_gbr(&e.cg, JIT_GBR_COUNT);
+#endif
 	_emitFlagsIn(&e);
 	sh4_emit_jmp(&e.cg, 5);
 	sh4_emit_nop(&e.cg);
@@ -1139,9 +1678,15 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_NEXT_EVENT);
 	sh4_emit_add_reg(&e.cg, R_CYCLES, 0);
 	sh4_emit_mov_l_store_gbr(&e.cg, JIT_GBR_CYCLES);
+	sh4_emit_stc_gbr(&e.cg, 2);
+	_pinsOut(&e.cg, 2);
+#ifdef JIT_COUNT
+	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_COUNT);
+#else
+	sh4_emit_mov_imm(&e.cg, 0, 0);
+#endif
 	sh4_emit_mov_l_load_inc(&e.cg, 15, 1);
 	sh4_emit_ldc_gbr(&e.cg, 1);
-	sh4_emit_mov_reg(&e.cg, R_COUNT, 0);
 	for (r = 14; r >= 8; --r) {
 		sh4_emit_mov_l_load_inc(&e.cg, 15, r);
 	}
@@ -1160,17 +1705,27 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 
 	/* r4 = key, r5 = exit type on a miss */
 	jit->lookup = e.cg.ptr;
+	/* r1 = the set: JIT_HASH_SET(key) * 16 */
 	sh4_emit_mov_reg(&e.cg, 4, 1);
 	sh4_emit_shll2(&e.cg, 1);
-	_imm(&e, (JIT_HASH_SIZE - 1) << 3, 2);
+	_imm(&e, ((1 << JIT_HASH_BITS) - 1) << 4, 2);
+	sh4_emit_shll(&e.cg, 1);
 	sh4_emit_and(&e.cg, 2, 1);
 	_lit(&e, (uint32_t) (uintptr_t) jit->hash, 2);
 	sh4_emit_add_reg(&e.cg, 2, 1);
 	sh4_emit_mov_l_load_inc(&e.cg, 1, 2);
 	sh4_emit_cmpeq(&e.cg, 4, 2);
-	uint8_t* miss = e.cg.ptr;
+	uint8_t* way1 = e.cg.ptr;
 	sh4_emit_bf(&e.cg, 0);
 	sh4_emit_mov_l_load(&e.cg, 1, 1);
+	sh4_emit_jmp(&e.cg, 1);
+	sh4_emit_nop(&e.cg);
+	_patchBranch(way1, e.cg.ptr);
+	sh4_emit_mov_l_load_disp(&e.cg, 1, 2, 1);
+	sh4_emit_cmpeq(&e.cg, 4, 2);
+	uint8_t* miss = e.cg.ptr;
+	sh4_emit_bf(&e.cg, 0);
+	sh4_emit_mov_l_load_disp(&e.cg, 1, 1, 2);
 	sh4_emit_jmp(&e.cg, 1);
 	sh4_emit_nop(&e.cg);
 	_patchBranch(miss, e.cg.ptr);
@@ -1181,7 +1736,8 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 	_patchBranch(bra, common);
 
 	jit->dispatchSync = e.cg.ptr;
-	sh4_emit_mov_l_load_disp(&e.cg, R_CPU, 4, ARM_PC);
+	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_GPRS(ARM_PC));
+	sh4_emit_mov_reg(&e.cg, 0, 4);
 	sh4_emit_mov_l_load_gbr(&e.cg, JIT_GBR_CPSR);
 	sh4_emit_tst_imm(&e.cg, 0x20);
 	uint8_t* arm = e.cg.ptr;
@@ -1199,6 +1755,7 @@ void ARMJITEmitStubs(struct ARMJIT* jit) {
 	_patchBranch(bra, (uint8_t*) jit->lookup);
 	_flushPool(&e, false);
 
+	_emitGuestBase(&e);
 	_registerRoutines(jit);
 	_emitHandlerStub(&e, true, commonRaw);
 	_emitHandlerStub(&e, false, commonRaw);
@@ -1239,7 +1796,7 @@ static uint32_t _handlerResult(struct ARMCore* cpu, uint32_t stop) {
 #define PSR_STATE_MASK 0x00000020
 
 static void _writePC(struct JITEmitter* e, int32_t cost, int executed);
-static void _armDataProcessing(struct JITEmitter* e, uint32_t op, bool flags);
+static void _armDataProcessing(struct JITEmitter* e, uint32_t op, unsigned flags);
 static void _armLoadStore(struct JITEmitter* e, uint32_t op, bool mode3);
 static void _armBX(struct JITEmitter* e, uint32_t op, int executed);
 static void _memory(struct JITEmitter* e, enum JITMemOp op, int rd);
@@ -1428,11 +1985,10 @@ static void _registerRoutines(struct ARMJIT* jit) {
  * carry on. */
 static void _sys(struct JITEmitter* e, const void* fn) {
 	_charge(e);
-	_lit(e, (uint32_t) (uintptr_t) fn, 7);
+	_lit(e, (uint32_t) (uintptr_t) fn, 2);
 	_lit(e, (uint32_t) (uintptr_t) e->jit->handlers[e->thumb], 1);
 	sh4_emit_jsr(&e->cg, 1);
-	sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
-	e->usesBase = true;
+	sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 3);
 }
 
 /* The instructions the block compiler doesn't take as native. Returns if
@@ -1590,7 +2146,8 @@ static void _handler(struct JITEmitter* e, uint32_t op) {
 			} else {
 				_armDataProcessing(e, op, false);
 				e->pending -= 1 + e->seq32;
-				sh4_emit_mov_l_load_disp(&e->cg, R_CPU, 4, ARM_PC);
+				sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_GPRS(ARM_PC));
+				sh4_emit_mov_reg(&e->cg, 0, 4);
 			}
 			if (op & 0x00100000) {
 				sh4_emit_mov_reg(&e->cg, 4, 5);
@@ -1652,24 +2209,20 @@ static bool _thumbEndsBlock(uint32_t op) {
 	return false;
 }
 
-/* Single stores, which end the block early if they pull an event in. */
-static bool _thumbIsStore(uint32_t op) {
-	switch (op >> 11) {
-	case 0x0A:
-	case 0x0B:
-		return ((op >> 9) & 7) < 3;
-	case 0x0C:
-	case 0x0E:
-	case 0x10:
-	case 0x12:
-		return true;
-	default:
-		return false;
-	}
+/* The flags condition cond (0-15) reads. */
+static unsigned _condFlags(unsigned cond) {
+	static const uint8_t flags[16] = {
+		F_Z, F_Z, F_C, F_C, F_N, F_N, F_V, F_V,
+		F_C | F_Z, F_C | F_Z, F_N | F_V, F_N | F_V, F_NZ | F_V, F_NZ | F_V, 0, F_ALL
+	};
+	return flags[cond & 0xF];
 }
 
 /* Whether op is translated natively, and the flags it writes and reads.
- * Handler calls count as reading every flag. */
+ * Handler calls count as reading every flag. A block can stop after any
+ * instruction and carry on in another from the next; what that one reads
+ * is the same as this one would, so no instruction has to count as reading
+ * every flag for that. */
 static bool _thumbAnalyze(uint32_t op, unsigned* written, unsigned* read) {
 	*written = 0;
 	*read = 0;
@@ -1758,78 +2311,87 @@ static bool _thumbAnalyze(uint32_t op, unsigned* written, unsigned* read) {
 	case 0x17:
 	case 0x18:
 	case 0x19:
-		/* PUSH/POP/STMIA/LDMIA with a list; may end the block */
+		/* PUSH/POP/STMIA/LDMIA with a list */
+		if (((op & 0xF600) == 0xB400 || (op & 0xF000) == 0xC000) && (op & 0x1FF) &&
+		    ((op & 0xF000) == 0xB000 || (op & 0xFF))) {
+			return true;
+		}
 		*read = F_ALL;
-		return ((op & 0xF600) == 0xB400 || (op & 0xF000) == 0xC000) && (op & 0x1FF) &&
-		       ((op & 0xF000) == 0xB000 || (op & 0xFF));
+		return false;
 	default:
 		*read = F_ALL;
 		return false;
 	}
 }
 
-static void _thumbShiftImmediate(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _shiftConst(struct JITEmitter* e, int r, int n, int kind);
+
+static void _thumbShiftImmediate(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int immediate = (op >> 6) & 0x1F;
 	int rm = (op >> 3) & 7;
 	int rd = op & 7;
-	_ld(e, rm, 1);
+	int w = _pinned(rd);
+	_ld(e, rm, w);
+	if (immediate && !(flags & F_C)) {
+		_shiftConst(e, w, immediate, op >> 11);
+		_put(e, w, rd);
+		if (flags & F_NZ) {
+			_flagsNZ(e, w);
+		}
+		return;
+	}
 	switch (op >> 11) {
 	case 0x00: // LSL
 		if (!immediate) {
-			_st(e, 1, rd);
-			if (flags) {
-				_flagsNZ(e, 1);
+			_put(e, w, rd);
+			if (flags & F_NZ) {
+				_flagsNZ(e, w);
 			}
 			return;
 		}
 		if (immediate > 1) {
 			sh4_emit_mov_imm(&e->cg, immediate - 1, 2);
-			sh4_emit_shld(&e->cg, 2, 1);
+			sh4_emit_shld(&e->cg, 2, w);
 		}
-		sh4_emit_shll(&e->cg, 1);
+		sh4_emit_shll(&e->cg, w);
 		break;
 	case 0x01: // LSR
 		if (!immediate) {
-			sh4_emit_shll(&e->cg, 1);
-			sh4_emit_mov_imm(&e->cg, 0, 1);
+			sh4_emit_shll(&e->cg, w);
+			sh4_emit_mov_imm(&e->cg, 0, w);
 			break;
 		}
 		if (immediate > 1) {
 			sh4_emit_mov_imm(&e->cg, 1 - immediate, 2);
-			sh4_emit_shld(&e->cg, 2, 1);
+			sh4_emit_shld(&e->cg, 2, w);
 		}
-		sh4_emit_shlr(&e->cg, 1);
+		sh4_emit_shlr(&e->cg, w);
 		break;
 	default: // ASR
 		if (!immediate) {
-			/* T = sign; r1 - r1 - T is then 0 or -1 and leaves T alone */
-			sh4_emit_shll(&e->cg, 1);
-			sh4_emit_subc(&e->cg, 1, 1);
+			/* T = sign; w - w - T is then 0 or -1 and leaves T alone */
+			sh4_emit_shll(&e->cg, w);
+			sh4_emit_subc(&e->cg, w, w);
 			break;
 		}
 		if (immediate > 1) {
 			sh4_emit_mov_imm(&e->cg, 1 - immediate, 2);
-			sh4_emit_shad(&e->cg, 2, 1);
+			sh4_emit_shad(&e->cg, 2, w);
 		}
-		sh4_emit_shar(&e->cg, 1);
+		sh4_emit_shar(&e->cg, w);
 		break;
 	}
-	_st(e, 1, rd);
-	if (flags) {
-		sh4_emit_movt(&e->cg, 3);
-		_flagsNZC(e, 1, 3);
+	if (flags & F_C) {
+		_flagsCFromT(e, flags);
 	}
-}
-
-/* C from bit 0 of rc (which is destroyed). */
-static void _flagsC(struct JITEmitter* e, int rc) {
-	sh4_emit_rotl(&e->cg, R_CV);
-	sh4_emit_shlr(&e->cg, rc);
-	sh4_emit_rotcr(&e->cg, R_CV);
+	_put(e, w, rd);
+	if (flags & F_NZ) {
+		_flagsNZ(e, w);
+	}
 }
 
 /* LSL/LSR/ASR/ROR by the low byte of a register: r1 by r2. */
-static void _thumbShiftRegister(struct JITEmitter* e, int alu, int rd, bool flags) {
+static void _thumbShiftRegister(struct JITEmitter* e, int alu, int rd, unsigned flags) {
 	sh4_emit_extu_b(&e->cg, 2, 2);
 	sh4_emit_tst(&e->cg, 2, 2);
 	uint8_t* none = e->cg.ptr;
@@ -1843,11 +2405,10 @@ static void _thumbShiftRegister(struct JITEmitter* e, int alu, int rd, bool flag
 		sh4_emit_add_imm(&e->cg, 32, 0);
 		sh4_emit_shld(&e->cg, 0, 3);
 		sh4_emit_or(&e->cg, 3, 1);
-		if (flags) {
+		if (flags & F_C) {
 			/* C is the result's top bit, also for a multiple of 32 */
-			sh4_emit_mov_reg(&e->cg, 1, 3);
-			sh4_emit_rotl(&e->cg, 3);
-			_flagsC(e, 3);
+			_signToT(e, 1);
+			_flagsCFromT(e, flags);
 		}
 	} else {
 		/* By one less and then by one, which leaves C in T. Above 32 is 32
@@ -1878,121 +2439,178 @@ static void _thumbShiftRegister(struct JITEmitter* e, int alu, int rd, bool flag
 			sh4_emit_shar(&e->cg, 1);
 			break;
 		}
-		if (flags) {
-			sh4_emit_movt(&e->cg, 3);
-			_flagsC(e, 3);
+		if (flags & F_C) {
+			_flagsCFromT(e, flags);
 		}
 	}
 	_patchBranch(none, e->cg.ptr);
 	_st(e, 1, rd);
-	if (flags) {
+	if (flags & F_NZ) {
 		_flagsNZ(e, 1);
 	}
 	e->pending += 1;
 }
 
-/* r1 * r2. The wait is ARM_WAIT_SMUL of what was in rd. */
-static void _thumbMultiply(struct JITEmitter* e, int rd, bool flags) {
-	sh4_emit_mov_reg(&e->cg, 1, 0);
-	sh4_emit_mul_l(&e->cg, 2, 1);
-	sh4_emit_sts_macl(&e->cg, 1);
-	_st(e, 1, rd);
-	if (flags) {
-		_flagsNZ(e, 1);
+/* ARM_WAIT_SMUL/UMUL of the value in a: r1 = its top bytes that are more
+ * than sign (or zero) as they are, the rest zeroed by the fold. r3 goes. */
+/* r1 = a >> 1 (arithmetic for sign) for _multiplyWait, which then has
+ * what it needs of a: the low bit never counts. */
+static void _multiplyFold(struct JITEmitter* e, bool sign, int a) {
+	sh4_emit_mov_reg(&e->cg, a, 1);
+	if (sign) {
+		sh4_emit_shar(&e->cg, 1);
+	} else {
+		sh4_emit_shlr(&e->cg, 1);
 	}
-	sh4_emit_mov_reg(&e->cg, 0, 2);
-	sh4_emit_shll(&e->cg, 0);
-	sh4_emit_subc(&e->cg, 3, 3);
-	sh4_emit_xor(&e->cg, 3, 2);
-	sh4_emit_mov_imm(&e->cg, 1, 3);
-	uint8_t* done[3];
-	int i;
-	for (i = 0; i < 3; ++i) {
-		sh4_emit_shlr8(&e->cg, 2);
-		sh4_emit_tst(&e->cg, 2, 2);
-		done[i] = e->cg.ptr;
-		sh4_emit_bt(&e->cg, 0);
-		sh4_emit_add_imm(&e->cg, 1, 3);
+}
+
+/* base + 1-4 by how many bytes of f above the lowest are nonzero, f the
+ * operand (a ^ (a >> 31) for sign), from r1 = a >> 1. Most operands are
+ * small: f < 256 is r1 fitting in a signed byte. Bigger ones add each
+ * byte's T in with addc. r1-r3 go; r0 is kept (the stall model keeps
+ * it too). */
+static void _multiplyWait(struct JITEmitter* e, int base, bool sign) {
+	int acc = e->stall ? 2 : R_CYCLES;
+	sh4_emit_exts_b(&e->cg, 1, 3);
+	sh4_emit_cmpeq(&e->cg, 1, 3);
+	uint8_t* done = e->cg.ptr;
+	sh4_emit_bt_s(&e->cg, 0);
+	if (e->stall) {
+		sh4_emit_mov_imm(&e->cg, base + 1, 2);
+	} else {
+		sh4_emit_mov_imm(&e->cg, 0, 3);
+		e->pending += base + 1;
 	}
-	for (i = 0; i < 3; ++i) {
-		_patchBranch(done[i], e->cg.ptr);
+	if (sign) {
+		/* r1 = f >> 1 */
+		sh4_emit_cmppz(&e->cg, 1);
+		sh4_emit_subc(&e->cg, 3, 3);
+		sh4_emit_not(&e->cg, 1, 1);
+		sh4_emit_xor(&e->cg, 3, 1);
 	}
+	sh4_emit_shll(&e->cg, 1);
+	sh4_emit_mov_imm(&e->cg, 0, 3);
+	sh4_emit_add_imm(&e->cg, 1, acc);
+	sh4_emit_shlr16(&e->cg, 1);
+	sh4_emit_cmppl(&e->cg, 1);
+	sh4_emit_addc(&e->cg, 3, acc);
+	sh4_emit_shlr8(&e->cg, 1);
+	sh4_emit_cmppl(&e->cg, 1);
+	sh4_emit_addc(&e->cg, 3, acc);
+	_patchBranch(done, e->cg.ptr);
 	if (e->stall) {
 		_lit(e, (uint32_t) (uintptr_t) e->jit->stall, 1);
-		sh4_emit_mov_reg(&e->cg, 3, 2);
 		sh4_emit_jsr(&e->cg, 1);
-		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
+		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 3);
 		e->usesBase = true;
-	} else {
-		sh4_emit_add_reg(&e->cg, 3, R_CYCLES);
 	}
+}
+
+/* a * b into rd. The wait is ARM_WAIT_SMUL of what was in rd (a). */
+static void _thumbMultiply(struct JITEmitter* e, int rd, int a, int b, unsigned flags) {
+	sh4_emit_mul_l(&e->cg, b, a);
+	_multiplyFold(e, true, a);
+	int dst = _pinned(rd);
+	sh4_emit_sts_macl(&e->cg, dst);
+	if (flags & F_NZ) {
+		_flagsNZ(e, dst);
+	}
+	_multiplyWait(e, 0, true);
+	_st(e, dst, rd);
 	e->pending += e->nonseq16 - e->seq16;
 }
 
-static void _thumbAlu(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _thumbAlu(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int rd = op & 7;
 	int rn = (op >> 3) & 7;
 	int alu = (op >> 6) & 0xF;
 	if (alu == 0x9) { // NEG
+		if (!(flags & (F_C | F_V)) && !(e->fuseCond >= 0 && !_fusesByResult(e->fuseCond))) {
+			int w = _pinned(rd);
+			sh4_emit_neg(&e->cg, _getR0(e, rn), w);
+			_put(e, w, rd);
+			if (e->fuseCond >= 0) {
+				_fuseResult(e, w);
+			} else if (flags & F_NZ) {
+				_flagsNZ(e, w);
+			}
+			return;
+		}
 		sh4_emit_mov_imm(&e->cg, 0, 1);
-		_ld(e, rn, 2);
-		_addSub(e, true, rd, flags);
+		_addSub(e, true, rd, flags, 1, _getR0(e, rn));
 		return;
 	}
-	_ld(e, rd, 1);
-	_ld(e, rn, 2);
+	/* whichever of them isn't pinned last, in r0 */
+	int b = _pinned(rd) || alu == 0xF ? _getR0(e, rn) : _get(e, rn, 2);
+	int a = alu == 0xF ? 1 : _getR0(e, rd);
+	int w;
 	switch (alu) {
 	case 0x0: // AND
-		sh4_emit_and(&e->cg, 2, 1);
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_and(&e->cg, b, w);
 		break;
 	case 0x1: // EOR
-		sh4_emit_xor(&e->cg, 2, 1);
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_xor(&e->cg, b, w);
 		break;
 	case 0x2: // LSL
 	case 0x3: // LSR
 	case 0x4: // ASR
 	case 0x7: // ROR
+		_toScratch(e, a, b);
 		_thumbShiftRegister(e, alu, rd, flags);
 		return;
 	case 0x5: // ADC
+		_toScratch(e, a, b);
 		_addCarry(e, false, rd, flags);
 		return;
 	case 0x6: // SBC
+		_toScratch(e, a, b);
 		_addCarry(e, true, rd, flags);
 		return;
 	case 0xD: // MUL
-		_thumbMultiply(e, rd, flags);
+		_thumbMultiply(e, rd, a, b, flags);
 		return;
 	case 0x8: // TST
-		if (flags) {
-			sh4_emit_and(&e->cg, 2, 1);
-			_flagsNZ(e, 1);
+		if (e->fuseCond >= 0 && _fuseTst(e, a, b)) {
+			return;
+		}
+		if (flags & F_NZ) {
+			sh4_emit_mov_reg(&e->cg, a, R_NZ);
+			sh4_emit_and(&e->cg, b, R_NZ);
 		}
 		return;
 	case 0xA: // CMP
-		_addSub(e, true, -1, flags);
+		_addSub(e, true, -1, flags, a, b);
 		return;
 	case 0xB: // CMN
-		_addSub(e, false, -1, flags);
+		_addSub(e, false, -1, flags, a, b);
 		return;
 	case 0xC: // ORR
-		sh4_emit_or(&e->cg, 2, 1);
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_or(&e->cg, b, w);
 		break;
 	case 0xE: // BIC
-		sh4_emit_not(&e->cg, 2, 2);
-		sh4_emit_and(&e->cg, 2, 1);
+		sh4_emit_not(&e->cg, b, 2);
+		b = 2;
+		w = _into(e, rd, &a, &b, false);
+		sh4_emit_and(&e->cg, 2, w);
 		break;
-	case 0xF: // MVN
-		sh4_emit_not(&e->cg, 2, 1);
+	default: // MVN
+		w = _dst(rd);
+		sh4_emit_not(&e->cg, b, w);
 		break;
 	}
-	_st(e, 1, rd);
-	if (flags) {
-		_flagsNZ(e, 1);
+	_put(e, w, rd);
+	if (e->fuseCond >= 0 && _fuseResult(e, w)) {
+		return;
+	}
+	if (flags & F_NZ) {
+		_flagsNZ(e, w);
 	}
 }
 
-static void _thumbTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _thumbTranslate(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int rd;
 	switch (op >> 11) {
 	case 0x00:
@@ -2000,30 +2618,30 @@ static void _thumbTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
 	case 0x02:
 		_thumbShiftImmediate(e, op, flags);
 		break;
-	case 0x03: // ADD/SUB register or 3-bit immediate
-		_ld(e, (op >> 3) & 7, 1);
+	case 0x03: { // ADD/SUB register or 3-bit immediate
 		if (op & 0x0400) {
-			sh4_emit_mov_imm(&e->cg, (op >> 6) & 7, 2);
+			_addSubImm(e, op & 0x0200, op & 7, flags, _getR0(e, (op >> 3) & 7), (op >> 6) & 7);
 		} else {
-			_ld(e, (op >> 6) & 7, 2);
+			int b = _get(e, (op >> 6) & 7, 2);
+			_addSub(e, op & 0x0200, op & 7, flags, _getR0(e, (op >> 3) & 7), b);
 		}
-		_addSub(e, op & 0x0200, op & 7, flags);
 		break;
-	case 0x04: // MOV immediate
+	}
+	case 0x04: { // MOV immediate
 		rd = (op >> 8) & 7;
-		_imm(e, op & 0xFF, 1);
-		_st(e, 1, rd);
-		if (flags) {
-			_flagsNZ(e, 1);
+		int w = _dst(rd);
+		_imm(e, op & 0xFF, w);
+		_put(e, w, rd);
+		if (flags & F_NZ) {
+			_flagsNZ(e, w);
 		}
 		break;
+	}
 	case 0x05: // CMP immediate
 	case 0x06: // ADD immediate
 	case 0x07: // SUB immediate
 		rd = (op >> 8) & 7;
-		_ld(e, rd, 1);
-		_imm(e, op & 0xFF, 2);
-		_addSub(e, (op >> 11) != 0x06, (op >> 11) == 0x05 ? -1 : rd, flags);
+		_addSubImm(e, (op >> 11) != 0x06, (op >> 11) == 0x05 ? -1 : rd, flags, _getR0(e, rd), op & 0xFF);
 		break;
 	case 0x08:
 		if (!(op & 0x0400)) {
@@ -2032,20 +2650,22 @@ static void _thumbTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
 		}
 		rd = (op & 7) | ((op >> 4) & 8);
 		switch ((op >> 8) & 3) {
-		case 0: // ADD, no flags
-			_ld(e, rd, 1);
-			_ld(e, (op >> 3) & 0xF, 2);
-			sh4_emit_add_reg(&e->cg, 2, 1);
-			_st(e, 1, rd);
+		case 0: { // ADD, no flags
+			int b = _get(e, (op >> 3) & 0xF, 2);
+			_addSub(e, false, rd, 0, _getR0(e, rd), b);
 			break;
-		case 1: // CMP
-			_ld(e, rd, 1);
-			_ld(e, (op >> 3) & 0xF, 2);
-			_addSub(e, true, -1, flags);
+		}
+		case 1: { // CMP
+			int b = _get(e, (op >> 3) & 0xF, 2);
+			_addSub(e, true, -1, flags, _getR0(e, rd), b);
 			break;
+		}
 		case 2: // MOV, no flags
-			_ld(e, (op >> 3) & 0xF, 1);
-			_st(e, 1, rd);
+			if (_pinned(rd)) {
+				_ld(e, (op >> 3) & 0xF, _pinned(rd));
+			} else {
+				_st(e, _getR0(e, (op >> 3) & 0xF), rd);
+			}
 			break;
 		}
 		break;
@@ -2104,21 +2724,18 @@ static void _thumbTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
 		_addImmediate(e, (op & 0xFF) << 2, 4);
 		_memory(e, (op & 0x0800) ? JIT_MEM_LOAD32 : JIT_MEM_STORE32, (op >> 8) & 7);
 		break;
-	case 0x14: // ADD Rd, PC, #imm
-		_imm(e, (_pcValue(e) & ~3) + ((op & 0xFF) << 2), 1);
-		_st(e, 1, (op >> 8) & 7);
+	case 0x14: { // ADD Rd, PC, #imm
+		rd = (op >> 8) & 7;
+		int w = _dst(rd);
+		_imm(e, (_pcValue(e) & ~3) + ((op & 0xFF) << 2), w);
+		_put(e, w, rd);
 		break;
+	}
 	case 0x15: // ADD Rd, SP, #imm
-		_ld(e, ARM_SP, 1);
-		_imm(e, (op & 0xFF) << 2, 2);
-		sh4_emit_add_reg(&e->cg, 2, 1);
-		_st(e, 1, (op >> 8) & 7);
+		_addSubImm(e, false, (op >> 8) & 7, 0, _get(e, ARM_SP, 1), (op & 0xFF) << 2);
 		break;
 	case 0x16: // ADD/SUB SP, #imm
-		_ld(e, ARM_SP, 1);
-		_imm(e, (op & 0x0080) ? -((op & 0x7F) << 2) : (op & 0x7F) << 2, 2);
-		sh4_emit_add_reg(&e->cg, 2, 1);
-		_st(e, 1, ARM_SP);
+		_addSubImm(e, op & 0x0080, ARM_SP, 0, _get(e, ARM_SP, 1), (op & 0x7F) << 2);
 		break;
 	case 0x1E: { // BL prefix: LR = PC + (offset << 12)
 		int32_t offset = (int32_t) ((op & 0x07FF) << 21) >> 9;
@@ -2214,7 +2831,6 @@ static void _branch(struct JITEmitter* e, uint32_t target, int executed) {
 	uint32_t key = JIT_KEY(target, e->thumb);
 	if (_linkable(e, target)) {
 		e->pending += _writePCCycles(e);
-		_charge(e);
 		_branchForgetsPrefetch(e);
 		_count(e, executed);
 		_site(e, key, JIT_EXIT_SITE_BRANCH);
@@ -2229,7 +2845,6 @@ static void _branch(struct JITEmitter* e, uint32_t target, int executed) {
 
 /* Running off the end of the block into the next instruction. */
 static void _fallThrough(struct JITEmitter* e, uint32_t next, int executed) {
-	_charge(e);
 	_count(e, executed);
 	_site(e, JIT_KEY(next, e->thumb), JIT_EXIT_SITE_FALL);
 }
@@ -2237,6 +2852,10 @@ static void _fallThrough(struct JITEmitter* e, uint32_t next, int executed) {
 /* T from the flags for Thumb/ARM condition cond (0-13). Returns whether the
  * condition holds when T is set (otherwise when it is clear). */
 static bool _condition(struct JITEmitter* e, int cond) {
+	if (e->fused) {
+		e->fused = false;
+		return e->fusedIfT;
+	}
 	switch (cond) {
 	case 0x0: // EQ
 	case 0x1: // NE
@@ -2285,8 +2904,8 @@ static void _thumbB(struct JITEmitter* e, uint32_t op, int executed) {
 
 static void _thumbBcc(struct JITEmitter* e, uint32_t op, int executed) {
 	int32_t offset = (int8_t) op * 2;
-	e->pending += 1 + e->seq16;
-	_charge(e);
+	/* charged on each way out, in the link's delay slot */
+	int32_t pending = e->pending += 1 + e->seq16;
 	bool takenIfT = _condition(e, (op >> 8) & 0xF);
 	uint8_t* skip = e->cg.ptr;
 	if (takenIfT) {
@@ -2296,6 +2915,7 @@ static void _thumbBcc(struct JITEmitter* e, uint32_t op, int executed) {
 	}
 	_fallThrough(e, e->address + WORD_SIZE_THUMB, executed);
 	_patchBranch(skip, e->cg.ptr);
+	e->pending = pending;
 	_branch(e, _pcValue(e) + offset, executed);
 }
 
@@ -2418,35 +3038,38 @@ static void _multiple(struct JITEmitter* e, uint32_t op, int rn, unsigned mask, 
 	_addImmediate(e, lowest, 4);
 	_imm(e, 0x08000000 | (before << 24) | (up << 23) | (writeback << 21) | (!store << 20) | (rn << 16) | mask |
 	        (e->thumb && rn == ARM_SP ? MULTIPLE_STACK : 0), 5);
-	sh4_emit_mov_imm(&e->cg, n, 7);
+	sh4_emit_mov_imm(&e->cg, n, 2);
 	_lit(e, (uint32_t) (uintptr_t) e->jit->multipleStubs[e->stall][store][e->thumb], 1);
 	sh4_emit_jsr(&e->cg, 1);
-	sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
-	e->usesBase = true;
+	sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 3);
+	e->usesBase |= e->stall;
 	uint8_t* slow = e->cg.ptr;
 	sh4_emit_bt(&e->cg, 0);
+	/* out of r0, which the guest registers go through */
+	sh4_emit_mov_reg(&e->cg, 0, 2);
 	if (store) {
-		sh4_emit_add_imm(&e->cg, 4 * n, 0);
+		sh4_emit_add_imm(&e->cg, 4 * n, 2);
 		for (r = 15; r >= 0; --r) {
 			if (mask & (1 << r)) {
-				_ld(e, r, 1);
-				sh4_emit_mov_l_store_dec(&e->cg, 1, 0);
+				sh4_emit_mov_l_store_dec(&e->cg, _getR0(e, r), 2);
 			}
 		}
 	} else {
 		for (r = 0; r < 16; ++r) {
 			if (mask & (1 << r)) {
-				sh4_emit_mov_l_load_inc(&e->cg, 0, r == ARM_PC ? 4 : 1);
+				int h = r == ARM_PC ? 4 : _pinned(r);
+				sh4_emit_mov_l_load_inc(&e->cg, 2, h);
 				if (r != ARM_PC) {
-					_st(e, 1, r);
+					_put(e, h, r);
 				}
 			}
 		}
 	}
 	if (writeback && (store || !(mask & (1 << rn)))) {
-		_ld(e, rn, 1);
-		_addImmediate(e, up ? 4 * n : -4 * n, 1);
-		_st(e, 1, rn);
+		int w = _dst(rn);
+		_ld(e, rn, w);
+		_addImmediate(e, up ? 4 * n : -4 * n, w);
+		_put(e, w, rn);
 	}
 	/* the prefetch's 1S becomes 1N, as _memory */
 	int32_t cost = 1 + (e->thumb ? e->nonseq16 : e->nonseq32);
@@ -2548,8 +3171,10 @@ enum {
 	CARRY_R3
 };
 
-/* r <<= n, r >>= n (logical or arithmetic) for 1 <= n <= 31; r0 is scratch. */
+/* r <<= n, r >>= n (logical or arithmetic) for 1 <= n <= 31; r0 is
+ * scratch, or r3 when r is r0. */
 static void _shiftConst(struct JITEmitter* e, int r, int n, int kind) {
+	int count = r ? 0 : 3;
 	switch (kind) {
 	case 0:
 		switch (n) {
@@ -2558,8 +3183,8 @@ static void _shiftConst(struct JITEmitter* e, int r, int n, int kind) {
 		case 8: sh4_emit_shll8(&e->cg, r); return;
 		case 16: sh4_emit_shll16(&e->cg, r); return;
 		}
-		sh4_emit_mov_imm(&e->cg, n, 0);
-		sh4_emit_shld(&e->cg, 0, r);
+		sh4_emit_mov_imm(&e->cg, n, count);
+		sh4_emit_shld(&e->cg, count, r);
 		return;
 	case 1:
 		switch (n) {
@@ -2568,16 +3193,16 @@ static void _shiftConst(struct JITEmitter* e, int r, int n, int kind) {
 		case 8: sh4_emit_shlr8(&e->cg, r); return;
 		case 16: sh4_emit_shlr16(&e->cg, r); return;
 		}
-		sh4_emit_mov_imm(&e->cg, -n, 0);
-		sh4_emit_shld(&e->cg, 0, r);
+		sh4_emit_mov_imm(&e->cg, -n, count);
+		sh4_emit_shld(&e->cg, count, r);
 		return;
 	default:
 		if (n == 1) {
 			sh4_emit_shar(&e->cg, r);
 			return;
 		}
-		sh4_emit_mov_imm(&e->cg, -n, 0);
-		sh4_emit_shad(&e->cg, 0, r);
+		sh4_emit_mov_imm(&e->cg, -n, count);
+		sh4_emit_shad(&e->cg, count, r);
 		return;
 	}
 }
@@ -2585,7 +3210,7 @@ static void _shiftConst(struct JITEmitter* e, int r, int n, int kind) {
 /* The shift-by-immediate forms (addressing modes 1 and 2) of guest rm into
  * host dst, as mGBA's _shift* and ADDR_MODE_2_* compute them. With carry,
  * says where the shifter carry-out is (CARRY_T: in T). r0 and r3 are
- * scratch. */
+ * scratch; dst may be r0 but not for ROR. */
 static int _armShiftImmediate(struct JITEmitter* e, uint32_t op, int dst, bool carry) {
 	int shift = (op >> 7) & 0x1F;
 	_ld(e, op & 0xF, dst);
@@ -2735,7 +3360,7 @@ static bool _armIsLogical(int alu) {
 	}
 }
 
-static void _armDataProcessing(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _armDataProcessing(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int alu = (op >> 21) & 0xF;
 	int rd = (op >> 12) & 0xF;
 	int rn = (op >> 16) & 0xF;
@@ -2743,85 +3368,201 @@ static void _armDataProcessing(struct JITEmitter* e, uint32_t op, bool flags) {
 	bool reverse = alu == 0x3 || alu == 0x7; // RSB, RSC
 	int dst = reverse ? 1 : 2;
 	int src = reverse ? 2 : 1;
-	flags = flags && (op & 0x00100000);
+	if (!(op & 0x00100000)) {
+		flags = 0;
+	}
+	bool shifterC = logical && (flags & F_C);
 	int carry;
+	/* operand 2's host register */
+	int b = dst;
+	/* BIC/MVN of an immediate: b already holds it inverted */
+	bool inverted = false;
+	/* ADD/SUB/CMP/CMN of an immediate: _addSubImm has it, b is -1 */
+	bool immediate = false;
+	uint32_t value = 0;
 	if (op & 0x02000000) {
 		int rotate = (op >> 7) & 0x1E;
-		uint32_t value = ROR(op & 0xFF, rotate);
-		_imm(e, value, dst);
+		value = ROR(op & 0xFF, rotate);
+		inverted = alu == 0xE || alu == 0xF;
+		immediate = alu == 0x2 || alu == 0x4 || alu == 0xA || alu == 0xB;
+		if (immediate) {
+			b = -1;
+		} else if (reverse) {
+			_imm(e, value, dst);
+		}
 		carry = !rotate ? CARRY_KEEP : value >> 31 ? CARRY_1 : CARRY_0;
 	} else if (op & 0x00000010) {
-		carry = _armShiftRegister(e, op, dst, flags && logical);
+		carry = _armShiftRegister(e, op, dst, shifterC);
+	} else if (!(op & 0x00000FF0)) {
+		/* in r0 if rn won't be loaded after it */
+		if (!reverse && (alu == 0xD || alu == 0xF || _pinned(rn))) {
+			b = _getR0(e, op & 0xF);
+		} else {
+			b = _get(e, op & 0xF, dst);
+		}
+		carry = CARRY_KEEP;
 	} else {
-		carry = _armShiftImmediate(e, op, dst, flags && logical);
+		/* straight into rd's pin for MOV; else in r0 if rn won't be
+		 * loaded after it and it doesn't cost a move */
+		bool ror = ((op >> 5) & 3) == 3;
+		if (alu == 0xD) {
+			b = _pinned(rd);
+		} else if (!reverse && !ror && _pinned(rn) && alu != 0x5 && alu != 0x6 && alu != 0x7 &&
+		           (alu != 0x2 || _pinned(rd))) {
+			b = 0;
+		}
+		if (b == 0 && ror) {
+			b = dst;
+		}
+		carry = _armShiftImmediate(e, op, b, shifterC);
 	}
-	if (flags && logical) {
-		if (carry == CARRY_T) {
+	if (shifterC && carry != CARRY_KEEP) {
+		/* C now: straight in with V dead, else by way of r3 at the end */
+		if (!(flags & F_V)) {
+			switch (carry) {
+			case CARRY_T:
+				break;
+			case CARRY_0:
+				sh4_emit_clrt(&e->cg);
+				break;
+			case CARRY_1:
+				sh4_emit_sett(&e->cg);
+				break;
+			default:
+				sh4_emit_shlr(&e->cg, 3);
+				break;
+			}
+			sh4_emit_rotcr(&e->cg, R_CV);
+			carry = CARRY_KEEP;
+		} else if (carry == CARRY_T) {
 			sh4_emit_movt(&e->cg, 3);
 		} else if (carry == CARRY_0 || carry == CARRY_1) {
 			sh4_emit_mov_imm(&e->cg, carry == CARRY_1, 3);
 		}
+	} else {
+		carry = CARRY_KEEP;
 	}
+	/* rn's host register */
+	int a = src;
 	if (alu != 0xD && alu != 0xF) {
 		if (rn == ARM_PC && (op & 0x02000010) == 0x00000010) {
 			_imm(e, _pcValue(e) + WORD_SIZE_ARM, src);
+		} else if (reverse) {
+			a = _get(e, rn, src);
 		} else {
-			_ld(e, rn, src);
+			a = _getR0(e, rn);
 		}
 	}
+	/* an immediate after rn, so rn can come straight from a store */
+	if ((op & 0x02000000) && !immediate && !reverse) {
+		_imm(e, inverted ? ~value : value, dst);
+	}
+	/* where a logical result is */
+	int w = 1;
 	switch (alu) {
 	case 0x0: // AND
-	case 0x8: // TST
-		sh4_emit_and(&e->cg, 2, 1);
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_and(&e->cg, b, w);
 		break;
 	case 0x1: // EOR
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_xor(&e->cg, b, w);
+		break;
+	case 0x8: // TST
 	case 0x9: // TEQ
-		sh4_emit_xor(&e->cg, 2, 1);
+		if (alu == 0x8 && e->fuseCond >= 0 && _fuseTst(e, a, b)) {
+			break;
+		}
+		if (!(flags & F_NZ)) {
+			break;
+		}
+		w = R_NZ;
+		sh4_emit_mov_reg(&e->cg, a, w);
+		if (alu == 0x8) {
+			sh4_emit_and(&e->cg, b, w);
+		} else {
+			sh4_emit_xor(&e->cg, b, w);
+		}
 		break;
 	case 0x2: // SUB
+		if (immediate) {
+			_addSubImm(e, true, rd, flags, a, value);
+			break;
+		}
+		_addSub(e, true, rd, flags, a, b);
+		break;
 	case 0x3: // RSB
-		_addSub(e, true, rd, flags);
+		_addSub(e, true, rd, flags, b, a);
 		break;
 	case 0x4: // ADD
-		_addSub(e, false, rd, flags);
+		if (immediate) {
+			_addSubImm(e, false, rd, flags, a, value);
+			break;
+		}
+		_addSub(e, false, rd, flags, a, b);
 		break;
 	case 0x5: // ADC
+		_toScratch(e, a, b);
 		_addCarry(e, false, rd, flags);
 		break;
 	case 0x6: // SBC
+		_toScratch(e, a, b);
+		_addCarry(e, true, rd, flags);
+		break;
 	case 0x7: // RSC
+		_toScratch(e, b, a);
 		_addCarry(e, true, rd, flags);
 		break;
 	case 0xA: // CMP
-		_addSub(e, true, -1, flags);
-		break;
 	case 0xB: // CMN
-		_addSub(e, false, -1, flags);
+		if (immediate) {
+			_addSubImm(e, alu == 0xA, -1, flags, a, value);
+			break;
+		}
+		_addSub(e, alu == 0xA, -1, flags, a, b);
 		break;
 	case 0xC: // ORR
-		sh4_emit_or(&e->cg, 2, 1);
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_or(&e->cg, b, w);
 		break;
 	case 0xD: // MOV
-		sh4_emit_mov_reg(&e->cg, 2, 1);
+		w = _pinned(rd) ? _pinned(rd) : b;
+		if (w != b) {
+			sh4_emit_mov_reg(&e->cg, b, w);
+		}
 		break;
 	case 0xE: // BIC
-		sh4_emit_not(&e->cg, 2, 2);
-		sh4_emit_and(&e->cg, 2, 1);
+		if (!inverted) {
+			sh4_emit_not(&e->cg, b, 2);
+			b = 2;
+		}
+		w = _into(e, rd, &a, &b, true);
+		sh4_emit_and(&e->cg, b, w);
 		break;
 	case 0xF: // MVN
-		sh4_emit_not(&e->cg, 2, 1);
+		if (inverted) {
+			w = _pinned(rd) ? _pinned(rd) : b;
+			if (w != b) {
+				sh4_emit_mov_reg(&e->cg, b, w);
+			}
+			break;
+		}
+		w = _dst(rd);
+		sh4_emit_not(&e->cg, b, w);
 		break;
 	}
 	if (logical) {
 		if (alu < 0x8 || alu > 0xB) {
-			_st(e, 1, rd);
+			_put(e, w, rd);
 		}
-		if (flags) {
-			if (carry == CARRY_KEEP) {
-				_flagsNZ(e, 1);
-			} else {
-				_flagsNZC(e, 1, 3);
-			}
+		if (carry != CARRY_KEEP) {
+			_flagsC(e, 3);
+		}
+		if (e->fuseCond >= 0 && _fuseResult(e, w)) {
+			flags &= ~F_NZ;
+		}
+		if (flags & F_NZ) {
+			_flagsNZ(e, w);
 		}
 	}
 	e->pending += 1 + e->seq32;
@@ -2839,6 +3580,24 @@ static void _armOffset(struct JITEmitter* e, uint32_t op, bool mode3) {
 		_imm(e, op & 0xFFF, 1);
 	} else {
 		_armShiftImmediate(e, op, 1, false);
+	}
+}
+
+/* r += or -= the offset in r1 */
+static void _addOffset(struct JITEmitter* e, bool up, int r) {
+	if (up) {
+		sh4_emit_add_reg(&e->cg, 1, r);
+	} else {
+		sh4_emit_sub(&e->cg, 1, r);
+	}
+}
+
+/* r += the offset: small, the immediate itself, else in r1 */
+static void _addOffsetTo(struct JITEmitter* e, bool small, int32_t offset, bool up, int r) {
+	if (!small) {
+		_addOffset(e, up, r);
+	} else if (offset) {
+		sh4_emit_add_imm(&e->cg, offset, r);
 	}
 }
 
@@ -2877,88 +3636,96 @@ static void _armLoadStore(struct JITEmitter* e, uint32_t op, bool mode3) {
 			_ld(e, rd, 5);
 		}
 	}
-	_armOffset(e, op, mode3);
-	_ld(e, rn, 4);
+	/* An immediate offset that fits goes in with add #imm */
+	bool immediate = mode3 ? op & 0x00400000 : !(op & 0x02000000);
+	int32_t offset = 0;
+	bool small = false;
+	if (immediate) {
+		offset = mode3 ? ((op >> 4) & 0xF0) | (op & 0xF) : op & 0xFFF;
+		if (!up) {
+			offset = -offset;
+		}
+		small = offset >= -128 && offset <= 127;
+	}
+	if (!small) {
+		_armOffset(e, op, mode3);
+	}
 	/* The PC isn't written back to */
-	if (pre) {
-		if (up) {
-			sh4_emit_add_reg(&e->cg, 1, 4);
+	if (rn == ARM_PC) {
+		if (small) {
+			_imm(e, _pcValue(e) + (pre ? offset : 0), 4);
 		} else {
-			sh4_emit_sub(&e->cg, 1, 4);
+			_imm(e, _pcValue(e), 4);
+			if (pre) {
+				_addOffset(e, up, 4);
+			}
 		}
-		if (writeback && rn != ARM_PC) {
-			_st(e, 4, rn);
-		}
-	} else if (rn != ARM_PC) {
-		sh4_emit_mov_reg(&e->cg, 4, 2);
-		if (up) {
-			sh4_emit_add_reg(&e->cg, 1, 2);
+	} else if (_pinned(rn)) {
+		int pin = _pinned(rn);
+		if (pre && !writeback) {
+			sh4_emit_mov_reg(&e->cg, pin, 4);
+			_addOffsetTo(e, small, offset, up, 4);
+		} else if (pre) {
+			_addOffsetTo(e, small, offset, up, pin);
+			sh4_emit_mov_reg(&e->cg, pin, 4);
 		} else {
-			sh4_emit_sub(&e->cg, 1, 2);
+			sh4_emit_mov_reg(&e->cg, pin, 4);
+			_addOffsetTo(e, small, offset, up, pin);
 		}
-		_st(e, 2, rn);
+	} else {
+		sh4_emit_mov_l_load_gbr(&e->cg, JIT_GBR_GPRS(rn));
+		if (pre) {
+			_addOffsetTo(e, small, offset, up, 0);
+			if (writeback) {
+				sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_GPRS(rn));
+			}
+			sh4_emit_mov_reg(&e->cg, 0, 4);
+		} else {
+			sh4_emit_mov_reg(&e->cg, 0, 4);
+			if (!small || offset) {
+				_addOffsetTo(e, small, offset, up, 0);
+				sh4_emit_mov_l_store_gbr(&e->cg, JIT_GBR_GPRS(rn));
+			}
+		}
 	}
 	_memory(e, mop, load ? rd : -1);
 }
 
-/* ARM_WAIT_SMUL/UMUL of the value in r2, which is destroyed: base + 1-4 by
- * how many of its top bytes are nothing but sign (or zero). */
-static void _multiplyWait(struct JITEmitter* e, bool sign, int base) {
-	if (sign) {
-		sh4_emit_mov_reg(&e->cg, 2, 0);
-		sh4_emit_shll(&e->cg, 0);
-		sh4_emit_subc(&e->cg, 3, 3);
-		sh4_emit_xor(&e->cg, 3, 2);
-	}
-	sh4_emit_mov_imm(&e->cg, base + 1, 3);
-	uint8_t* done[3];
-	int i;
-	for (i = 0; i < 3; ++i) {
-		sh4_emit_shlr8(&e->cg, 2);
-		sh4_emit_tst(&e->cg, 2, 2);
-		done[i] = e->cg.ptr;
-		sh4_emit_bt(&e->cg, 0);
-		sh4_emit_add_imm(&e->cg, 1, 3);
-	}
-	for (i = 0; i < 3; ++i) {
-		_patchBranch(done[i], e->cg.ptr);
-	}
-	if (e->stall) {
-		_lit(e, (uint32_t) (uintptr_t) e->jit->stall, 1);
-		sh4_emit_mov_reg(&e->cg, 3, 2);
-		sh4_emit_jsr(&e->cg, 1);
-		sh4_emit_mov_imm(&e->cg, e->index * _insnLength(e), 6);
-		e->usesBase = true;
-	} else {
-		sh4_emit_add_reg(&e->cg, 3, R_CYCLES);
-	}
-}
-
 /* MUL/MLA. With S the C flag is left as it is. */
-static void _armMultiply(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _armMultiply(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int rd = (op >> 16) & 0xF;
 	bool accumulate = op & 0x00200000;
 	e->pending += 1 + e->nonseq32;
 	if (rd == ARM_PC) {
 		return;
 	}
-	_ld(e, op & 0xF, 1);
-	_ld(e, (op >> 8) & 0xF, 2);
-	sh4_emit_mul_l(&e->cg, 2, 1);
-	sh4_emit_sts_macl(&e->cg, 1);
+	/* mul.l leaves its operands alone: a can be in r0 if b won't be */
+	int a = _pinned((op >> 8) & 0xF) ? _getR0(e, op & 0xF) : _get(e, op & 0xF, 1);
+	int b = _getR0(e, (op >> 8) & 0xF);
+	sh4_emit_mul_l(&e->cg, b, a);
+	_multiplyFold(e, true, b);
+	int dst = _pinned(rd);
 	if (accumulate) {
-		_ld(e, (op >> 12) & 0xF, 3);
-		sh4_emit_add_reg(&e->cg, 3, 1);
+		int c = _get(e, (op >> 12) & 0xF, 4);
+		if (c == dst) {
+			sh4_emit_sts_macl(&e->cg, 5);
+			sh4_emit_add_reg(&e->cg, 5, dst);
+		} else {
+			sh4_emit_sts_macl(&e->cg, dst);
+			sh4_emit_add_reg(&e->cg, c, dst);
+		}
+	} else {
+		sh4_emit_sts_macl(&e->cg, dst);
 	}
-	_st(e, 1, rd);
-	if (flags && (op & 0x00100000)) {
-		_flagsNZ(e, 1);
+	if ((flags & F_NZ) && (op & 0x00100000)) {
+		_flagsNZ(e, dst);
 	}
-	_multiplyWait(e, true, accumulate ? 1 : 0);
+	_multiplyWait(e, accumulate ? 1 : 0, true);
+	_st(e, dst, rd);
 }
 
 /* UMULL, UMLAL, SMULL, SMLAL */
-static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	int rdHi = (op >> 16) & 0xF;
 	int rdLo = (op >> 12) & 0xF;
 	bool accumulate = op & 0x00200000;
@@ -2967,35 +3734,36 @@ static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, bool flags) {
 	if (rdHi == ARM_PC || rdLo == ARM_PC) {
 		return;
 	}
-	_ld(e, op & 0xF, 1);
-	_ld(e, (op >> 8) & 0xF, 2);
+	int a = _get(e, op & 0xF, 1);
+	int b = _get(e, (op >> 8) & 0xF, 2);
 	if (sign) {
-		sh4_emit_dmuls_l(&e->cg, 2, 1);
+		sh4_emit_dmuls_l(&e->cg, b, a);
 	} else {
-		sh4_emit_dmulu_l(&e->cg, 2, 1);
+		sh4_emit_dmulu_l(&e->cg, b, a);
 	}
-	sh4_emit_sts_macl(&e->cg, 1);
-	sh4_emit_sts_mach(&e->cg, 3);
+	_multiplyFold(e, sign, b);
+	sh4_emit_sts_macl(&e->cg, 5);
+	sh4_emit_sts_mach(&e->cg, 2);
 	if (accumulate) {
-		_ld(e, rdLo, 0);
 		_ld(e, rdHi, 4);
+		_ld(e, rdLo, 0);
 		sh4_emit_clrt(&e->cg);
-		sh4_emit_addc(&e->cg, 0, 1);
-		sh4_emit_addc(&e->cg, 4, 3);
+		sh4_emit_addc(&e->cg, 0, 5);
+		sh4_emit_addc(&e->cg, 4, 2);
 	}
-	_st(e, 1, rdLo);
-	_st(e, 3, rdHi);
-	if (flags && (op & 0x00100000)) {
+	_st(e, 5, rdLo);
+	_st(e, 2, rdHi);
+	if ((flags & F_NZ) && (op & 0x00100000)) {
 		/* N is the top word's, Z is for the two */
-		sh4_emit_mov_reg(&e->cg, 3, 0);
-		sh4_emit_tst(&e->cg, 1, 1);
+		sh4_emit_mov_reg(&e->cg, 2, 0);
+		sh4_emit_tst(&e->cg, 5, 5);
 		uint8_t* zero = e->cg.ptr;
 		sh4_emit_bt(&e->cg, 0);
 		sh4_emit_or_imm(&e->cg, 1);
 		_patchBranch(zero, e->cg.ptr);
 		sh4_emit_mov_reg(&e->cg, 0, R_NZ);
 	}
-	_multiplyWait(e, sign, accumulate ? 2 : 1);
+	_multiplyWait(e, accumulate ? 2 : 1, sign);
 }
 
 /* Whether op is translated natively (B/BL/BX are handled by the block
@@ -3003,7 +3771,7 @@ static void _armMultiplyLong(struct JITEmitter* e, uint32_t op, bool flags) {
 static bool _armAnalyze(uint32_t op, bool stall, unsigned* written, unsigned* read) {
 	unsigned cond = op >> 28;
 	*written = 0;
-	*read = cond != 0xE ? F_ALL : 0;
+	*read = _condFlags(cond);
 	if (cond == 0xF) {
 		*read = F_ALL;
 		return false;
@@ -3081,8 +3849,11 @@ static bool _armAnalyze(uint32_t op, bool stall, unsigned* written, unsigned* re
 		}
 		return true;
 	}
+	if (_armMultipleNative(op)) {
+		return true;
+	}
 	*read = F_ALL;
-	return _armMultipleNative(op);
+	return false;
 }
 
 static bool _armIsMemory(uint32_t op) {
@@ -3090,7 +3861,7 @@ static bool _armIsMemory(uint32_t op) {
 	       ((op & 0x0E000090) == 0x00000090 && (op & 0x60));
 }
 
-static void _armTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
+static void _armTranslate(struct JITEmitter* e, uint32_t op, unsigned flags) {
 	if ((op & 0x0E000000) == 0x08000000) {
 		_armMultiple(e, op, e->index + 1);
 	} else if ((op & 0x0FC000F0) == 0x00000090) {
@@ -3109,7 +3880,7 @@ static void _armTranslate(struct JITEmitter* e, uint32_t op, bool flags) {
 /* A conditional instruction: the condition-failed cost (ARM_PREFETCH_CYCLES)
  * is charged up front and the body charges the difference, so both ways
  * fall through to the same place. */
-static void _armConditional(struct JITEmitter* e, uint32_t op, bool native, bool flags) {
+static void _armConditional(struct JITEmitter* e, uint32_t op, bool native, unsigned flags) {
 	int cond = op >> 28;
 	if (cond >= 0xE) {
 		if (native) {
@@ -3148,7 +3919,7 @@ static void _armB(struct JITEmitter* e, uint32_t op, int executed) {
 	int cond = op >> 28;
 	e->pending += 1 + e->seq32;
 	if (cond != 0xE) {
-		_charge(e);
+		int32_t pending = e->pending;
 		bool takenIfT = _condition(e, cond);
 		uint8_t* skip = e->cg.ptr;
 		if (takenIfT) {
@@ -3158,6 +3929,7 @@ static void _armB(struct JITEmitter* e, uint32_t op, int executed) {
 		}
 		_fallThrough(e, e->address + WORD_SIZE_ARM, executed);
 		_patchBranch(skip, e->cg.ptr);
+		e->pending = pending;
 	}
 	if (link) {
 		_imm(e, e->address + WORD_SIZE_ARM, 1);
@@ -3186,6 +3958,158 @@ static void _armBX(struct JITEmitter* e, uint32_t op, int executed) {
 	_patchBranch(slow, e->cg.ptr);
 	e->pending = 1 + e->seq32;
 	_exitAnywhere(e, executed);
+}
+
+/* ---------------------------------------------------------------- */
+/* Flags across blocks                                               */
+/* ---------------------------------------------------------------- */
+
+/* How far a block looks past its end for what reads its flags: guest
+ * instructions along each path, and branches followed. */
+#define JIT_SCAN_BUDGET 24
+#define JIT_SCAN_DEPTH 3
+
+/* Code a scan may look at: ROM and the BIOS, which don't change, and RAM
+ * only within [lo, hi), the chunks of the block it is for. [min, max) is
+ * what it looked at there, which the block's SMC range then covers. */
+struct JITScan {
+	struct ARMJIT* jit;
+	uint32_t lo;
+	uint32_t hi;
+	uint32_t min;
+	uint32_t max;
+};
+
+static bool _isRAM(uint32_t address) {
+	return (address >> BASE_OFFSET) == REGION_WORKING_RAM || (address >> BASE_OFFSET) == REGION_WORKING_IRAM;
+}
+
+static bool _scanFetch(struct JITScan* s, uint32_t address, bool thumb, uint32_t* op) {
+	uint32_t len = thumb ? WORD_SIZE_THUMB : WORD_SIZE_ARM;
+	if (_isRAM(address)) {
+		if (address < s->lo || address + len > s->hi) {
+			return false;
+		}
+		if (address < s->min) {
+			s->min = address;
+		}
+		if (address + len > s->max) {
+			s->max = address + len;
+		}
+	}
+	uint32_t bytes;
+	const uint8_t* p = ARMJITSource(s->jit, address, &bytes);
+	if (!p || bytes < len) {
+		return false;
+	}
+	*op = _read(p, thumb);
+	return true;
+}
+
+/* The bx lr of mGBA's HLE BIOS StallCall (subs r11, #4; bhi StallCall;
+ * bx lr): only swiBase calls it, and puts the cpsr back after, so nothing
+ * reads the flags it leaves. */
+static bool _hleStallReturn(struct JITScan* s, uint32_t pc, uint32_t op) {
+	uint32_t sub, loop;
+	return pc < SIZE_BIOS && op == 0xE12FFF1E && _scanFetch(s, pc - 8, false, &sub) && sub == 0xE25BB004 &&
+	       _scanFetch(s, pc - 4, false, &loop) && loop == 0x8AFFFFFD;
+}
+
+/* The flags code from pc on may read before it writes them, on any path;
+ * where a path can't be followed (an indirect branch, a handler, out of
+ * budget or depth) every flag not yet written counts. */
+static unsigned _flagsIn(struct JITScan* s, uint32_t pc, bool thumb, int budget, int depth) {
+	unsigned live = 0;
+	/* not yet read or written along this path */
+	unsigned open = F_ALL;
+	uint32_t lr = 0;
+	bool prefix = false;
+	while (open) {
+		uint32_t op;
+		if (--budget < 0 || !_scanFetch(s, pc, thumb, &op)) {
+			return live | open;
+		}
+		unsigned written, read;
+		uint32_t next = pc + (thumb ? WORD_SIZE_THUMB : WORD_SIZE_ARM);
+		uint32_t target;
+		unsigned cond = 0xE;
+		if (thumb) {
+			bool afterPrefix = prefix;
+			prefix = false;
+			if ((op & 0xF800) == 0xE000) { // B
+				target = pc + 4 + ((int32_t) ((op & 0x07FF) << 21) >> 20);
+			} else if ((op & 0xF000) == 0xD000 && ((op >> 8) & 0xF) < 0xE) { // Bcc
+				cond = (op >> 8) & 0xF;
+				target = pc + 4 + (int8_t) op * 2;
+			} else if ((op & 0xF800) == 0xF000) { // BL prefix
+				lr = pc + 4 + ((int32_t) ((op & 0x07FF) << 21) >> 9);
+				prefix = true;
+				pc = next;
+				continue;
+			} else if ((op & 0xF800) == 0xF800 && afterPrefix) { // BL
+				target = lr + ((op & 0x07FF) << 1);
+			} else if (_thumbEndsBlock(op)) {
+				return live | open;
+			} else {
+				_thumbAnalyze(op, &written, &read);
+				live |= read & open;
+				open &= ~(read | written);
+				pc = next;
+				continue;
+			}
+		} else {
+			cond = op >> 28;
+			if ((op & 0x0E000000) == 0x0A000000 && cond != 0xF) { // B, BL
+				target = pc + 8 + ((int32_t) (op << 8) >> 6);
+			} else if ((op & 0x0DB0F000) == 0x0120F000 && ((op & 0x02000000) || !(op & 0x00000FF0)) &&
+			           cond == 0xE) { // MSR
+				if (!(op & 0x00400000) && (op & 0x00080000)) {
+					/* the cpsr's flags, from the operand */
+					return live;
+				}
+				pc = next;
+				continue;
+			} else if (_armEndsBlock(op)) {
+				/* the BIOS's exception returns put the spsr in the cpsr */
+				if (pc < SIZE_BIOS && (op == 0xE1B0F00E || op == 0xE25EF004)) {
+					return live;
+				}
+				return _hleStallReturn(s, pc, op) ? live : live | open;
+			} else {
+				_armAnalyze(op, false, &written, &read);
+				live |= read & open;
+				open &= ~read;
+				if (cond == 0xE) {
+					open &= ~written;
+				}
+				pc = next;
+				continue;
+			}
+		}
+		/* a branch to target if cond holds */
+		unsigned r = _condFlags(cond) & open;
+		live |= r;
+		open &= ~r;
+		if (!open) {
+			break;
+		}
+		if (!depth) {
+			return live | open;
+		}
+		unsigned after = _flagsIn(s, target, thumb, budget, depth - 1);
+		if (cond != 0xE) {
+			after |= _flagsIn(s, next, thumb, budget, depth - 1);
+		}
+		return live | (after & open);
+	}
+	return live;
+}
+
+/* For jittest: the flags code at pc may read, as a block ending anywhere
+ * before it would have worked it out (or fewer). */
+unsigned ARMJITFlagsIn(struct ARMJIT* jit, uint32_t pc, bool thumb) {
+	struct JITScan scan = { jit, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0 };
+	return _flagsIn(&scan, pc, thumb, JIT_SCAN_BUDGET + JIT_MAX_BLOCK_INSNS, JIT_SCAN_DEPTH);
 }
 
 struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint32_t pc, bool thumb,
@@ -3219,71 +4143,111 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 	struct GBA* gba = (struct GBA*) jit->cpu->master;
 	bool stall = (pc >> BASE_OFFSET) >= REGION_CART0 && gba->memory.prefetch;
 
-	/* Pass 1: extent, and which instructions' flags anything reads. */
+	/* Pass 1: extent, and which flags anything reads after each
+	 * instruction. */
 	uint32_t ops[JIT_MAX_BLOCK_INSNS];
 	bool native[JIT_MAX_BLOCK_INSNS];
 	unsigned written[JIT_MAX_BLOCK_INSNS];
 	unsigned read[JIT_MAX_BLOCK_INSNS];
-	bool flagsLive[JIT_MAX_BLOCK_INSNS];
+	unsigned flagsLive[JIT_MAX_BLOCK_INSNS];
 	uint32_t n;
 	for (n = 0; n < avail; ++n) {
 		ops[n] = _read(&src[n * len], thumb);
 		if (thumb) {
 			native[n] = _thumbAnalyze(ops[n], &written[n], &read[n]);
-			if (_thumbIsStore(ops[n])) {
-				/* It may end the block, and then its flags are what the
-				 * next block sees. */
-				read[n] = F_ALL;
-			}
 		} else {
 			native[n] = _armAnalyze(ops[n], stall, &written[n], &read[n]);
-			if (native[n] && (ops[n] & 0x0C100000) == 0x04000000) {
-				read[n] = F_ALL; // a store may end the block
-			} else if (native[n] && (ops[n] & 0x0E100090) == 0x00000090 && (ops[n] & 0x60)) {
-				read[n] = F_ALL;
-			}
 		}
 		if (thumb ? _thumbEndsBlock(ops[n]) : _armEndsBlock(ops[n])) {
 			++n;
 			break;
 		}
 	}
+	/* Only the stall model reads cpu->jitBase: C gets the block from the
+	 * return address (_emitGuestBase). */
 	bool usesBase = false;
 	int i;
-	for (i = 0; i < (int) n; ++i) {
+	for (i = 0; stall && i < (int) n; ++i) {
 		uint32_t op = ops[i];
 		if (native[i] && (thumb ? (op >> 11) >= 0x09 && (op >> 11) <= 0x19 : _armIsMemory(op))) {
 			usesBase = true;
 		}
-		if (stall && (thumb ? (op & 0xFFC0) == 0x4340 : (op & 0x0F0000F0) == 0x00000090)) { // a multiply's wait
-			usesBase = true;
-		}
-		/* handler calls, except for the branches translated whole */
-		if (!native[i]) {
-			if (thumb) {
-				if ((op & 0xF800) == 0xE000 || ((op & 0xF000) == 0xD000 && ((op >> 8) & 0xF) < 0xE)) {
-					continue;
-				}
-				if ((op & 0xFF87) == 0x4700 || (op & 0xFD87) == 0x4487) {
-					continue;
-				}
-				if ((op & 0xF800) == 0xF000 && i + 1 < (int) n && (ops[i + 1] & 0xF800) == 0xF800) {
-					break;
-				}
-			} else if ((op & 0x0E000000) == 0x0A000000 && (op >> 28) != 0xF) {
-				continue;
-			}
+		if (thumb ? (op & 0xFFC0) == 0x4340 : (op & 0x0F0000F0) == 0x00000090) { // a multiply's wait
 			usesBase = true;
 		}
 	}
-	unsigned needed = F_ALL;
-	for (i = n - 1; i >= 0; --i) {
-		flagsLive[i] = (written[i] & needed) != 0;
-		needed = (needed & ~written[i]) | read[i];
+	/* What the code after the block reads, from the branch that ends it
+	 * (or the next instruction) on; then back through the block. A
+	 * conditional ARM instruction may not write its flags, so they still
+	 * count as needed from before it. */
+	uint32_t end = pc + n * len;
+	struct JITScan scan = { jit, 0, 0, 0xFFFFFFFF, 0 };
+	if (_isRAM(pc)) {
+		scan.lo = pc & ~((1 << JIT_CHUNK_SHIFT) - 1);
+		scan.hi = ((end - 1) | ((1 << JIT_CHUNK_SHIFT) - 1)) + 1;
+	}
+	int last = n;
+	if (thumb ? _thumbEndsBlock(ops[n - 1]) : _armEndsBlock(ops[n - 1])) {
+		last = n - 1;
+		if (thumb && last > 0 && (ops[last] & 0xF800) == 0xF800 && (ops[last - 1] & 0xF800) == 0xF000) {
+			--last;
+		}
+	}
+	unsigned needed = _flagsIn(&scan, pc + last * len, thumb, JIT_SCAN_BUDGET, JIT_SCAN_DEPTH);
+	for (i = n - 1; i >= last; --i) {
+		flagsLive[i] = F_ALL;
+	}
+	for (i = last - 1; i >= 0; --i) {
+		flagsLive[i] = needed;
+		unsigned kill = thumb || (ops[i] >> 28) == 0xE ? written[i] : 0;
+		needed = (needed & ~kill) | read[i];
+	}
+	/* A compare whose flags only the next instruction's condition reads
+	 * (a branch ending the block: nothing after it either way) */
+	int fuse[JIT_MAX_BLOCK_INSNS];
+	for (i = 0; i < (int) n; ++i) {
+		fuse[i] = -1;
+		if (i + 1 >= (int) n || !native[i] || (!thumb && (ops[i] >> 28) != 0xE)) {
+			continue;
+		}
+		uint32_t next = ops[i + 1];
+		uint32_t at = pc + (i + 1) * len;
+		int cond;
+		uint32_t target;
+		if (thumb) {
+			if ((next & 0xF000) != 0xD000 || ((next >> 8) & 0xF) >= 0xE) {
+				continue;
+			}
+			cond = (next >> 8) & 0xF;
+			if ((written[i] & _condFlags(cond)) != _condFlags(cond)) {
+				continue;
+			}
+			target = at + 4 + (int8_t) next * 2;
+		} else {
+			cond = next >> 28;
+			if (cond >= 0xE || (written[i] & _condFlags(cond)) != _condFlags(cond)) {
+				continue;
+			}
+			if ((next & 0x0E000000) == 0x0A000000) {
+				target = at + 8 + ((int32_t) (next << 8) >> 6);
+			} else {
+				if (!native[i + 1] || i + 1 >= last || flagsLive[i + 1] || flagsLive[i] != _condFlags(cond)) {
+					continue;
+				}
+				fuse[i] = cond;
+				continue;
+			}
+		}
+		if (_flagsIn(&scan, target, thumb, JIT_SCAN_BUDGET, JIT_SCAN_DEPTH) ||
+		    _flagsIn(&scan, at + len, thumb, JIT_SCAN_BUDGET, JIT_SCAN_DEPTH)) {
+			continue;
+		}
+		fuse[i] = cond;
 	}
 
 	struct JITEmitter e;
 	memset(&e, 0, sizeof(e));
+	e.fuseCond = -1;
 	e.jit = jit;
 	e.thumb = thumb;
 	e.region = pc >> BASE_OFFSET;
@@ -3308,14 +4272,17 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 	sh4_word(&e.cg, event & 0xFFFF);
 	sh4_word(&e.cg, event >> 16);
 	uint8_t* entry = e.cg.ptr;
+	_label = entry;
 	sh4_emit_cmppz(&e.cg, R_CYCLES);
 	sh4_emit_bt(&e.cg, sh4_branch_disp8((uintptr_t) e.cg.ptr, (uintptr_t) start));
 	if (usesBase) {
-		_imm(&e, pc + 2 * len, R_BASE);
+		_imm(&e, pc + 2 * len, 0);
+		sh4_emit_mov_l_store_gbr(&e.cg, JIT_GBR_BASE);
 	}
 
 	bool ended = false;
 	e.executed = n;
+	e.body = e.cg.ptr;
 	for (i = 0; i < (int) n; ++i) {
 		uint32_t op = ops[i];
 		e.index = i;
@@ -3360,6 +4327,7 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 				break;
 			}
 		}
+		e.fuseCond = fuse[i];
 		if (!thumb) {
 			_armConditional(&e, op, native[i], flagsLive[i]);
 		} else if (native[i]) {
@@ -3368,6 +4336,10 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 			}
 		} else {
 			_handler(&e, op);
+		}
+		e.fuseCond = -1;
+		if (e.fused && fuse[i] < 0) {
+			abort();
 		}
 	}
 	if (!ended) {
@@ -3383,7 +4355,9 @@ struct JITBlock* ARMJITCompile(struct ARMJIT* jit, struct JITBlock* block, uint3
 	}
 
 	block->pc = pc;
-	block->end = pc + n * len;
+	block->end = end;
+	block->lo = scan.min < pc ? scan.min : pc;
+	block->hi = scan.max > end ? scan.max : end;
 	block->nInsns = n;
 	block->thumb = thumb;
 	block->code = entry;
