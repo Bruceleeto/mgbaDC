@@ -211,6 +211,9 @@ void ARMJITHostDeinit(struct ARMJIT* jit) {
 	jit->host = NULL;
 }
 
+uint32_t jitFaultHist[2][16][2];
+uint32_t jitFaultKind[4];
+
 uint32_t ARMJITHostRun(struct ARMJIT* jit, const void* code) {
 	struct sh4_state* s = &jit->host->s;
 	s->stopped = 0;
@@ -244,6 +247,44 @@ uint32_t ARMJITHostRun(struct ARMJIT* jit, const void* code) {
 					if (op < 0) {
 						sh4_fault(s, "fastmem: not an access", insn);
 						break;
+					}
+					{
+						/* What would fault on the Dreamcast, by kind */
+						extern uint32_t jitFaultHist[2][16][2];
+						uint32_t addr = s->r[4] & 0x0FFFFFFF;
+						int region = addr >> 24;
+						int st = op >= JIT_MEM_STORE32;
+						int prot = 0;
+						if (region == 2 || region == 3) {
+							/* page with code in it: 64K pages in EWRAM, 1K in IWRAM */
+							uint32_t size = region == 2 ? 0x10000 : 0x400;
+							uint32_t base = region == 2 ? 0 : JIT_EWRAM_CHUNKS;
+							uint32_t off = addr & (region == 2 ? 0x3FFFF : 0x7FFF) & ~(size - 1);
+							extern uint8_t jitProtected[JIT_CHUNKS];
+							(void) size;
+							prot = jitProtected[base + (off >> 8)];
+							if (!st) {
+								prot = -1;
+							}
+						}
+						{
+							extern uint32_t jitFaultKind[4];
+							int size = (op == JIT_MEM_LOAD32 || op == JIT_MEM_STORE32) ? 4
+							         : (op == JIT_MEM_LOADS8 || op == JIT_MEM_STORE8) ? 1 : 2;
+							if (addr & (size - 1)) {
+								++jitFaultKind[0];
+							} else if ((region == 3 && (addr & 0xFFFFFF) >= 0x8000) ||
+							           (region == 2 && (addr & 0xFFFFFF) >= 0x40000)) {
+								++jitFaultKind[1];
+							} else if (region >= 8 && region < 14 && st) {
+								++jitFaultKind[2];
+							} else if (region >= 8 && (addr & 0x1FFFFFF) >= 0x400000) {
+								++jitFaultKind[3];
+							}
+						}
+						if (prot >= 0 && !(region >= 8 && !st)) {
+							++jitFaultHist[st][region][prot];
+						}
 					}
 					++s->depth;
 					s->pr = s->pc + 2;

@@ -196,6 +196,7 @@ void ARMJITFastmemDeinit(struct ARMJIT* jit);
 void ARMJITFastmemUpdate(struct ARMJIT* jit);
 void ARMJITFastmemProtect(struct ARMJIT* jit, uint32_t start, uint32_t end);
 void ARMJITFastmemUnprotect(struct ARMJIT* jit);
+void ARMJITFastmemUnprotectPage(struct ARMJIT* jit, uint32_t address);
 uint32_t ARMJITFastmemFaults(void);
 #endif
 

@@ -174,6 +174,24 @@ static void _printStats(struct ARMCore* cpu) {
 	       s.fallbackSteps, (unsigned long long) s.blockRuns);
 	{
 		extern uint32_t jitLoadHist[2][16];
+		{
+			extern uint32_t jitFaultHist[2][16][2];
+			extern uint32_t jitFaultKind[4];
+			printf("would fault too: misaligned %u, RAM mirror %u, store to ROM %u, past ROM end %u\n", jitFaultKind[0], jitFaultKind[1], jitFaultKind[2], jitFaultKind[3]);
+			int st, rg;
+			for (st = 0; st < 2; ++st) {
+				printf("would fault, %s:", st ? "stores" : "loads");
+				for (rg = 0; rg < 16; ++rg) {
+					if (jitFaultHist[st][rg][0] || jitFaultHist[st][rg][1]) {
+						printf(" %X:%u", rg, jitFaultHist[st][rg][0]);
+						if (rg == 2 || rg == 3) {
+							printf("(+%u code page)", jitFaultHist[st][rg][1]);
+						}
+					}
+				}
+				printf("\n");
+			}
+		}
 		int k, r;
 		for (k = 0; k < 2; ++k) {
 			printf("loads %s:", k ? "from ROM+prefetch code" : "other code");

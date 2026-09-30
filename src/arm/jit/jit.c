@@ -27,6 +27,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef JIT_FASTMEM
+/* The host's model of the pages fastmem.c write protects, for the counts */
+uint8_t jitProtected[JIT_CHUNKS];
+#endif
+
 static_assert(offsetof(struct ARMCore, gprs) == JIT_GBR_GPRS(0) * 4, "ARMCore.gprs moved");
 static_assert(offsetof(struct ARMCore, cpsr) == JIT_GBR_CPSR * 4, "ARMCore.cpsr moved");
 static_assert(offsetof(struct ARMCore, cycles) == JIT_GBR_CYCLES * 4, "ARMCore.cycles moved");
@@ -188,6 +193,8 @@ void ARMJITFlush(struct ARMCore* cpu) {
 	++jit->stats.flushes;
 #ifdef JIT_FASTMEM
 	ARMJITFastmemUnprotect(jit);
+#else
+	memset(jitProtected, 0, sizeof(jitProtected));
 #endif
 }
 
@@ -254,6 +261,59 @@ static int _chunk(uint32_t address) {
 	}
 }
 
+/* The MMU page a chunk is in (fastmem.c): its first chunk and how many. */
+static int _pageOf(int chunk, int* count) {
+	if (chunk < JIT_EWRAM_CHUNKS) {
+		*count = 0x10000 >> JIT_CHUNK_SHIFT;
+		return chunk & ~(*count - 1);
+	}
+	*count = 0x400 >> JIT_CHUNK_SHIFT;
+	return JIT_EWRAM_CHUNKS + ((chunk - JIT_EWRAM_CHUNKS) & ~(*count - 1));
+}
+
+static void _protect(struct ARMJIT* jit, uint32_t start, uint32_t end) {
+#ifdef JIT_FASTMEM
+	ARMJITFastmemProtect(jit, start, end);
+#else
+	UNUSED(jit);
+	int chunk[2] = { _chunk(start), _chunk(end - 1) };
+	int i;
+	for (i = 0; i < 2; ++i) {
+		if (chunk[i] >= 0) {
+			int count;
+			int first = _pageOf(chunk[i], &count);
+			memset(&jitProtected[first], 1, count);
+		}
+	}
+#endif
+}
+
+/* A block in the chunk's page is gone: without any left, stores to the page
+ * have nothing to check and go direct again. */
+static void _release(struct ARMJIT* jit, int chunk) {
+	int count;
+	int first = _pageOf(chunk, &count);
+	int c;
+	for (c = first; c < first + count; ++c) {
+		const struct JITBlock* block = jit->chunks[c];
+		while (block) {
+			if (!block->dead) {
+				return;
+			}
+			block = block->next[block->chunk[0] == c ? 0 : 1];
+		}
+	}
+#ifdef JIT_FASTMEM
+	ARMJITFastmemUnprotectPage(jit, first < JIT_EWRAM_CHUNKS
+	                                    ? BASE_WORKING_RAM + (first << JIT_CHUNK_SHIFT)
+	                                    : BASE_WORKING_IRAM + ((first - JIT_EWRAM_CHUNKS) << JIT_CHUNK_SHIFT));
+#else
+	if (!getenv("JIT_NORELEASE")) {
+		memset(&jitProtected[first], 0, count);
+	}
+#endif
+}
+
 /* Where guest code at pc lives on the host, and how many bytes of it can be
  * read before the region ends. NULL for regions we don't compile from. */
 static const uint8_t* _source(struct ARMJIT* jit, uint32_t pc, uint32_t* bytes) {
@@ -305,9 +365,7 @@ static void _link(struct ARMJIT* jit, struct JITBlock* block) {
 		block->next[i] = jit->chunks[block->chunk[i]];
 		jit->chunks[block->chunk[i]] = block;
 	}
-#ifdef JIT_FASTMEM
-	ARMJITFastmemProtect(jit, block->pc, block->end);
-#endif
+	_protect(jit, block->pc, block->end);
 }
 
 static void _hashInsert(struct ARMJIT* jit, const struct JITBlock* block) {
@@ -410,18 +468,26 @@ static void _invalidate(struct ARMJIT* jit, int chunk, uint32_t address, uint32_
 	uint32_t start = address & mask;
 	struct JITBlock** link = &jit->chunks[chunk];
 	struct JITBlock* block;
+	bool released = false;
 	while ((block = *link)) {
 		int i = block->chunk[0] == chunk ? 0 : 1;
 		uint32_t bstart = block->pc & mask;
 		uint32_t bend = bstart + (block->end - block->pc);
 		if (!block->dead && start < bend && start + size > bstart) {
 			_kill(jit, block);
+			if (block->chunk[!i] >= 0) {
+				_release(jit, block->chunk[!i]);
+			}
+			released = true;
 		}
 		if (block->dead) {
 			*link = block->next[i];
 		} else {
 			link = &block->next[i];
 		}
+	}
+	if (released) {
+		_release(jit, chunk);
 	}
 }
 

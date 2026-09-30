@@ -337,6 +337,17 @@ void ARMJITFastmemProtect(struct ARMJIT* jit, uint32_t start, uint32_t end) {
 	}
 }
 
+void ARMJITFastmemUnprotectPage(struct ARMJIT* jit, uint32_t address) {
+	UNUSED(jit);
+	if (!fm.on || !fm.ram) {
+		return;
+	}
+	int page = _page(address);
+	if (page >= 0) {
+		UTLB_DATA(page) |= PTE_RW;
+	}
+}
+
 void ARMJITFastmemUnprotect(struct ARMJIT* jit) {
 	UNUSED(jit);
 	if (!fm.on || !fm.ram) {
